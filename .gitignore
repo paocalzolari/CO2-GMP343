@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+dist/
+build/
+*.spec
+co2-logger
+co2-monitor
+*.tar.gz
+*.egg-info/
+.eggs/
