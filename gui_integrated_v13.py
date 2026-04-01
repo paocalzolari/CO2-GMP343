@@ -886,14 +886,9 @@ class GMP343Monitor(QMainWindow):
 
     def _update_monitor(self):
         # Timestamp
-        # Seriale — comports() aggiornata ogni 3 tick (~15s) per non bloccare GUI (SER-007)
+        # Seriale — controlla esistenza device (supporta symlink udev come /dev/gmp343)
         port = self.cfg.get("serial","port",fallback="/dev/ttyUSB0")
-        self._ports_cache_age += 1
-        if self._ports_cache_age >= 3:
-            self._ports_cache_age = 0
-            self._ports_cache = [p.device for p in serial.tools.list_ports.comports()]
-        avail = self._ports_cache
-        if port in avail:
+        if os.path.exists(port):
             self.lbl_dot.setStyleSheet("font-size:18px;color:#090")
             self.lbl_stat.setText("Connesso"); self.lbl_stat.setStyleSheet("font-weight:bold;color:#090;font-size:10px")
             self.lbl_port.setText(port)

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=CO2 Monitor
+Comment=GMP343 Monitor - GUI visualizzazione CO2
+Exec=bash -c "cd /home/misura/programs/CO2 && python3 gui_integrated_v13.py"
+Icon=/home/misura/programs/CO2/gmp343_sensor.png
+Terminal=false
+StartupNotify=false
+Categories=Science;

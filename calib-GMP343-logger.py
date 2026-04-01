@@ -304,7 +304,7 @@ class AcqThread(threading.Thread):
             for p in line.split():
                 if p.replace(".", "", 1).lstrip("-").isdigit():
                     v = float(p)
-                    if 0 < v < 10000:   # range plausibile CO₂
+                    if -999 < v < 10000:   # range plausibile CO₂ (negativo ammesso in calibrazione)
                         return v
         except Exception:
             pass
