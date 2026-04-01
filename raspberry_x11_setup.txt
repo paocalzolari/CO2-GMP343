@@ -1,0 +1,41 @@
+Passaggio da Wayland a X11 su Raspberry Pi 5 (Raspberry Pi OS Bookworm)
+========================================================================
+
+Il file da modificare e': /etc/lightdm/lightdm.conf
+
+Le 3 righe da cambiare nella sezione [Seat:*]:
+
+  PER X11:
+    greeter-session=pi-greeter
+    user-session=LXDE-pi-x
+    autologin-session=LXDE-pi-x
+
+  PER WAYLAND (labwc):
+    greeter-session=pi-greeter-labwc
+    user-session=LXDE-pi-labwc
+    autologin-session=LXDE-pi-labwc
+
+  PER WAYLAND (wayfire):
+    greeter-session=pi-greeter-wayfire
+    user-session=LXDE-pi-wayfire
+    autologin-session=LXDE-pi-wayfire
+
+COMANDI PER PASSARE A X11:
+  sudo sed -i 's/greeter-session=pi-greeter-labwc/greeter-session=pi-greeter/' /etc/lightdm/lightdm.conf
+  sudo sed -i 's/user-session=LXDE-pi-labwc/user-session=LXDE-pi-x/' /etc/lightdm/lightdm.conf
+  sudo sed -i 's/autologin-session=LXDE-pi-labwc/autologin-session=LXDE-pi-x/' /etc/lightdm/lightdm.conf
+  sudo reboot
+
+COMANDI PER TORNARE A WAYLAND (labwc):
+  sudo sed -i 's/greeter-session=pi-greeter/greeter-session=pi-greeter-labwc/' /etc/lightdm/lightdm.conf
+  sudo sed -i 's/user-session=LXDE-pi-x/user-session=LXDE-pi-labwc/' /etc/lightdm/lightdm.conf
+  sudo sed -i 's/autologin-session=LXDE-pi-x/autologin-session=LXDE-pi-labwc/' /etc/lightdm/lightdm.conf
+  sudo reboot
+
+NOTE:
+- RustDesk funziona con X11, NON con Wayland (versione 1.2.7)
+- Raspberry Pi Connect screen sharing funziona con Wayland, NON con X11
+  (la remote shell di Raspberry Pi Connect funziona con entrambi)
+- Se wayfire crasha (errore "failed to get layout box"), usare labwc o X11
+- Verificare lo stato di lightdm: systemctl status lightdm --no-pager
+- Verificare il display: DISPLAY=:0 xrandr
