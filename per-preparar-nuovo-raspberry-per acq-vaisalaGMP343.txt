@@ -1,0 +1,15 @@
+nel repo contiene tutto il necessario per riconfigurare un nuovo Raspberry Pi:
+File	Cosa fa
+Vaisala-logger.desktop	Avvia il logger CO2 al boot
+Monitor-GMP343.desktop	Avvia il monitor grafico al boot
+crontab.txt	Rsync ogni 5 minuti
+rsync-co2.sh	Script di sincronizzazione dati
+README_autoexec.md	Istruzioni per ripristino
+Per installare tutto su un nuovo Pi basta:
+
+
+git clone https://github.com/paocalzolari/CO2-GMP343
+cd CO2-GMP343
+bash install_libraries.sh
+cp autoexec/*.desktop ~/.config/autostart/
+crontab autoexec/crontab.txt
