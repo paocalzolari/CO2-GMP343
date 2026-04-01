@@ -1,5 +1,21 @@
 # Configurazione Autostart - Raspberry Pi
 
+## Avvio automatico al boot (autostart desktop)
+
+I programmi partono automaticamente al login tramite i file `.desktop`
+in `~/.config/autostart/`. Per ripristinarli su un nuovo Raspberry Pi:
+
+```bash
+cp autoexec/Vaisala-logger.desktop ~/.config/autostart/
+cp autoexec/Monitor-GMP343.desktop ~/.config/autostart/
+chmod +x ~/.config/autostart/Vaisala-logger.desktop
+chmod +x ~/.config/autostart/Monitor-GMP343.desktop
+```
+
+Programmi avviati automaticamente:
+- **Vaisala-logger.desktop** — `calib-GMP343-logger.py` (acquisizione dati)
+- **Monitor-GMP343.desktop** — `gui_integrated_v13.py` (monitor grafico)
+
 ## Cron (crontab.txt)
 Il file `crontab.txt` contiene la configurazione cron dell'utente `misura`.
 Per ripristinarla: `crontab crontab.txt`
@@ -16,15 +32,6 @@ chmod +x ~/bin/rsync-co2.sh
 Sincronizza `~/data/` verso `cimone@ozone.bo.isac.cnr.it:/home/cimone/data/gmp343`
 Usa un touchfile per evitare esecuzioni concorrenti.
 
-## Avvio manuale del sistema
-Il logger e il monitor non hanno un servizio systemd configurato.
-Per avviarli manualmente:
-```bash
-cd ~/programs/CO2
-python3 gmp343_logger-9.py &
-python3 gui_integrated_v13.py
-```
-
 ## Hardware (Raspberry Pi 5)
-- UART abilitata: `dtparam=uart0=on` in `/boot/firmware/config.txt`
-- Sensore GMP343 collegato su `/dev/ttyUSB0` (adattatore USB-seriale)
+- Sensore GMP343 collegato su `/dev/gmp343` (symlink udev persistente → ttyUSB0)
+- Regola udev: `/etc/udev/rules.d/60-gmp343.rules`

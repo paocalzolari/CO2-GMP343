@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Monitor CO2 - GMP343 Vaisala
+Exec=bash -c "/home/misura/programs/CO2/gui_integrated_v13.py"
+Terminal=false
+Type=Application
+X-GNOME-Autostart-enabled=true
+Hidden=false
