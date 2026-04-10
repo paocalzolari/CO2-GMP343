@@ -1,7 +1,12 @@
 [Desktop Entry]
-Name=Acquisizione Vaisala GMP343
-Exec=bash -c "/home/misura/programs/CO2/calib-GMP343-logger.py"
-Terminal=false
+Version=1.0
 Type=Application
+Name=Acquisizione Vaisala GMP343
+Comment=Logger calibrazione GMP343 con GUI (calib-GMP343-logger.py)
+Exec=bash -c "cd /home/misura/programs/CO2 && python3 calib-GMP343-logger.py > /tmp/co2logger.log 2>&1"
+Icon=/home/misura/programs/CO2/gmp343_sensor.png
+Terminal=false
+StartupNotify=false
+Categories=Science;
 X-GNOME-Autostart-enabled=true
 Hidden=false

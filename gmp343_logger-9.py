@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-gmp343_logger-8.py
+gmp343_logger-9.py
 Acquisizione seriale GMP343 → file raw e _min giornalieri.
 File ini letti da ~/programs/CO2/config/
 data_path letto da name.ini (default: ~/data)

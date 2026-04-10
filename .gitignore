@@ -6,6 +6,7 @@ build/
 *.spec
 co2-logger
 co2-monitor
+co2-calib
 *.tar.gz
 *.egg-info/
 .eggs/
