@@ -1,0 +1,37 @@
+[Unit]
+Description=GMP343 CO2 Backend Logger (headless, with watchdog)
+Documentation=file:///home/misura/programs/CO2/PROGRAMS.md
+After=network.target
+# NB: nessun ConditionPathExists su /dev/gmp343 — il logger fa retry/reconnect
+# interno con backoff esponenziale, quindi può partire anche prima che udev
+# crei il symlink al boot.
+
+[Service]
+Type=simple
+User=misura
+Group=dialout
+WorkingDirectory=/home/misura/programs/CO2
+ExecStart=/usr/bin/python3 /home/misura/programs/CO2/gmp343_logger-9.py
+
+# Watchdog: riavvia sempre, anche su exit pulito (un logger non deve mai uscire)
+Restart=always
+RestartSec=10
+
+# Limite: max 10 restart in 10 minuti, poi systemd considera il service "failed"
+# (evita restart loop infinito su bug persistenti)
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+# Logging via journald — guarda i log con: journalctl -u co2-logger -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=co2-logger
+
+# Hardening leggero (compatibile con scrittura su ~/data/)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+
+[Install]
+WantedBy=multi-user.target
