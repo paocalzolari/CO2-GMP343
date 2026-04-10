@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=PCManFM Desktop Manager
+Comment=Garantisce che pcmanfm --desktop sia in esecuzione (mostra le icone in ~/Desktop/). Backup dell'entry @pcmanfm in /etc/xdg/lxsession/LXDE-pi/autostart, che a volte non riparte dopo aver esaurito i respawn di lxsession.
+Exec=pcmanfm --desktop --profile LXDE-pi
+OnlyShowIn=LXDE;
+X-GNOME-Autostart-enabled=true
+NoDisplay=false
+Hidden=false

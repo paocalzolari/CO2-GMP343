@@ -70,9 +70,18 @@ Il monitor parte automaticamente al login grafico tramite il `.desktop` in
 `~/.config/autostart/`. Per ripristinarlo su un nuovo Raspberry Pi:
 
 ```bash
-cp autoexec/Monitor-GMP343.desktop ~/.config/autostart/
+cp autoexec/Monitor-GMP343.desktop  ~/.config/autostart/
+cp autoexec/pcmanfm-desktop.desktop ~/.config/autostart/
 chmod +x ~/.config/autostart/Monitor-GMP343.desktop
+chmod +x ~/.config/autostart/pcmanfm-desktop.desktop
 ```
+
+> **Nota su `pcmanfm-desktop.desktop`**: non è specifico CO2 ma è un fix di
+> sistema. LXDE-pi su Raspberry Pi avvia `pcmanfm --desktop` tramite
+> `/etc/xdg/lxsession/LXDE-pi/autostart` con il prefisso `@` (respawn), ma
+> dopo qualche crash lxsession smette di rispawnarlo e le icone sul desktop
+> spariscono finché non riavvii. Questa entry XDG è un backup che lo rilancia
+> a ogni login, indipendente dal contatore di respawn lxsession.
 
 Il file in questa cartella è il **sorgente versionato** del `.desktop`. La
 copia attiva deve restare allineata — se modifichi qui, ricopia in
