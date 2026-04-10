@@ -92,13 +92,34 @@ manualmente. Non è critico perché legge solo file e non scrive dati.
 Cron utente esegue ogni 5 minuti `~/bin/rsync-co2.sh` per sincronizzare
 `~/data/` verso `cimone@ozone.bo.isac.cnr.it:/home/cimone/data/gmp343`.
 
+### Icone sul Desktop
+
+Tre lanciatori grafici in `~/Desktop/` (sorgenti versionati nella radice
+`programs/CO2/`):
+
+| Icona | Cosa fa | Script invocato |
+|---|---|---|
+| **CO2 Monitor** | Apre la GUI di visualizzazione | `gui_integrated_v13.py` |
+| **CO2 Calibration** | Procedura calibrazione completa: stop service → GUI calib → restart service | `bin/co2-calib-mode.sh` |
+| **CO2 Status** | Apre un terminale con stato + log live del service | `bin/co2-status.sh` |
+
+`CO2 Calibration` e `CO2 Status` aprono un terminale (`Terminal=true`) in
+modo che l'utente veda cosa succede e possa digitare la password sudo
+quando necessario. `CO2 Monitor` non apre terminale (è solo una GUI Qt).
+
 ---
 
 ## Procedura calibrazione
 
 Il backend systemd e `calib-GMP343-logger.py` **non possono girare insieme**:
-entrambi vogliono `/dev/gmp343` e scrivono sugli stessi file giornalieri. Per
-fare una calibrazione:
+entrambi vogliono `/dev/gmp343` e scrivono sugli stessi file giornalieri.
+
+**Modo consigliato (icona desktop):** doppio click su **CO2 Calibration** sul
+desktop → si apre un terminale che esegue `bin/co2-calib-mode.sh`. Lo script
+ferma il service, lancia la GUI di calibrazione, e quando chiudi la finestra
+riavvia automaticamente il service. Ti chiede solo la password sudo (due volte).
+
+**Modo manuale a riga di comando:**
 
 ```bash
 sudo systemctl stop co2-logger                          # 1. ferma il backend

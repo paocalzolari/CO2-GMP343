@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=CO2 Status
+GenericName=GMP343 service status
+Comment=Mostra lo stato del systemd service co2-logger e i log live (journalctl -f)
+Exec=/home/misura/programs/CO2/bin/co2-status.sh
+Icon=/home/misura/programs/CO2/gmp343_sensor.png
+Terminal=true
+StartupNotify=false
+Categories=Science;

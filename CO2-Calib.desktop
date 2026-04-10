@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=CO2 Calibration
+GenericName=GMP343 calibration mode
+Comment=Procedura calibrazione GMP343 — ferma il backend systemd, apre la GUI calib, riavvia il backend al termine
+Exec=/home/misura/programs/CO2/bin/co2-calib-mode.sh
+Icon=/home/misura/programs/CO2/gmp343_sensor.png
+Terminal=true
+StartupNotify=false
+Categories=Science;

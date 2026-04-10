@@ -6,6 +6,12 @@ After=network.target
 # interno con backoff esponenziale, quindi può partire anche prima che udev
 # crei il symlink al boot.
 
+# Limite restart: max 10 in 10 minuti, poi systemd marca il service "failed"
+# (evita restart loop infinito su bug persistenti). Vanno qui in [Unit], non
+# in [Service] — versioni recenti di systemd ignorano StartLimit* in [Service].
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
 [Service]
 Type=simple
 User=misura
@@ -16,11 +22,6 @@ ExecStart=/usr/bin/python3 /home/misura/programs/CO2/gmp343_logger-9.py
 # Watchdog: riavvia sempre, anche su exit pulito (un logger non deve mai uscire)
 Restart=always
 RestartSec=10
-
-# Limite: max 10 restart in 10 minuti, poi systemd considera il service "failed"
-# (evita restart loop infinito su bug persistenti)
-StartLimitIntervalSec=600
-StartLimitBurst=10
 
 # Logging via journald — guarda i log con: journalctl -u co2-logger -f
 StandardOutput=journal
