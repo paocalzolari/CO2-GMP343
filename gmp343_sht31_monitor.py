@@ -232,17 +232,21 @@ def day_xlim(d: date_type):
     return x0, x1
 
 
-def smart_ylim(values):
-    """Calcola ylim con margine, ignorando i valori MISSING."""
+def smart_ylim(values, min_range=MIN_Y_RANGE, fallback=(0.0, 500.0)):
+    """
+    Calcola ylim con margine, ignorando MISSING e NaN.
+    min_range: range Y minimo (ppm per CO2). Su T/RH passare valore più piccolo.
+    fallback: (lo, hi) se nessun dato valido (default adatto a CO2).
+    """
     arr = np.asarray(values, dtype=float)
     arr = arr[(arr != MISSING) & ~np.isnan(arr)]
     if len(arr) == 0:
-        return 0.0, 500.0
+        return fallback
     lo, hi = float(np.min(arr)), float(np.max(arr))
     span = hi - lo
-    if span < MIN_Y_RANGE:
+    if span < min_range:
         mid = (lo + hi) / 2
-        lo, hi = mid - MIN_Y_RANGE / 2, mid + MIN_Y_RANGE / 2
+        lo, hi = mid - min_range / 2, mid + min_range / 2
     else:
         lo -= span * Y_MARGIN_FACTOR
         hi += span * Y_MARGIN_FACTOR
@@ -374,9 +378,17 @@ class GraphWidget(QWidget):
         root.addWidget(self.canvas)
 
     def _init_axes(self):
-        self.ax = self.fig.add_subplot(111)
+        # 2 subplots con asse X condiviso: CO2 (grande sopra), T+RH (piccolo sotto)
+        gs = self.fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.08)
+        self.ax    = self.fig.add_subplot(gs[0])
+        self.ax_t  = self.fig.add_subplot(gs[1], sharex=self.ax)
+        # Asse Y secondario (a destra) per RH sul pannello di T
+        self.ax_rh = self.ax_t.twinx()
 
-        # Linea continua (tutti i punti, senza marker)
+        # Nasconde i tick label X sul pannello CO2 (ax_t è l'asse X attivo)
+        self.ax.tick_params(labelbottom=False)
+
+        # ── CO2 (pannello principale) ─────────────────────────────────────
         self.line, = self.ax.plot(
             [], [], "-",
             linewidth=1.0,
@@ -391,6 +403,26 @@ class GraphWidget(QWidget):
             [], [], s=28, color="#e06000",
             zorder=4, marker="D", label="calib"
         )
+
+        # ── T e RH (pannello piccolo sotto, twin Y) ──────────────────────
+        # T sull'asse Y sinistro (arancione)
+        self.line_t, = self.ax_t.plot(
+            [], [], "-",
+            linewidth=1.0,
+            color="#c05000", zorder=2, label="T"
+        )
+        self.ax_t.set_ylabel("T (°C)", fontsize=9, color="#c05000")
+        self.ax_t.tick_params(axis="y", labelcolor="#c05000", labelsize=8)
+        self.ax_t.grid(True, linestyle="--", linewidth=0.3, alpha=0.6)
+
+        # RH sull'asse Y destro (verde-teal)
+        self.line_rh, = self.ax_rh.plot(
+            [], [], "-",
+            linewidth=1.0,
+            color="#007060", zorder=2, label="RH"
+        )
+        self.ax_rh.set_ylabel("RH (%)", fontsize=9, color="#007060")
+        self.ax_rh.tick_params(axis="y", labelcolor="#007060", labelsize=8)
         # Punto hover
         self.hl_pt, = self.ax.plot(
             [], [], "o",
@@ -426,8 +458,9 @@ class GraphWidget(QWidget):
         )
 
         self.ax.set_ylabel("CO₂  1-min avg (ppm)", fontsize=10)
-        self.ax.set_xlabel("Ora (UTC)", fontsize=10)
         self.ax.grid(True, linestyle="--", linewidth=0.3, alpha=0.6)
+        # xlabel va sul pannello inferiore (ax_t è il bottom visibile)
+        self.ax_t.set_xlabel("Ora (UTC)", fontsize=10)
 
         # Connetti eventi
         self.canvas.mpl_connect("motion_notify_event", self._on_motion)
@@ -484,6 +517,8 @@ class GraphWidget(QWidget):
 
         if result is None:
             self.line.set_data([], [])
+            self.line_t.set_data([], [])
+            self.line_rh.set_data([], [])
             self.sc_measure.set_offsets(np.empty((0, 2)))
             self.sc_calib.set_offsets(np.empty((0, 2)))
             self.flag_label.set_text("MEASURE")
@@ -495,13 +530,20 @@ class GraphWidget(QWidget):
             self._ignore_lim_change = False
             return
 
-        times, values, stds, counts, flags, _t, _tstd, _rh, _rhstd = result
+        times, values, stds, counts, flags, t_arr, _tstd, rh_arr, _rhstd = result
         xt = mdates.date2num(times)
-        # Sostituisci MISSING con NaN per il plot (break nella linea, no Y axis esteso)
+        # Sostituisci MISSING con NaN per i plot (break nella linea, no Y axis esteso)
         values_plot = np.where(values == MISSING, np.nan, values)
+        t_plot      = np.where(t_arr  == MISSING, np.nan, t_arr)
+        rh_plot     = np.where(rh_arr == MISSING, np.nan, rh_arr)
+        # Salva per accesso dal tooltip
+        self._t_plot  = t_plot
+        self._rh_plot = rh_plot
 
-        # ── Linea continua (tutti i punti) ────────────────────────────────
+        # ── Linee continue ────────────────────────────────────────────────
         self.line.set_data(xt, values_plot)
+        self.line_t.set_data(xt, t_plot)
+        self.line_rh.set_data(xt, rh_plot)
 
         # ── Scatter per flag (solo punti validi, MISSING esclusi) ─────────
         mask_valid = values != MISSING
@@ -536,21 +578,25 @@ class GraphWidget(QWidget):
             for i, (dawn_n, dusk_n) in enumerate(night_spans(self.cfg, days_list)):
                 # Inizio e fine del singolo giorno i (CORR-001/GUI-004: fix multiday)
                 day_num = mdates.date2num(datetime.combine(days_list[i], datetime.min.time()))
-                # notte pre-alba
-                p1 = self.ax.axvspan(day_num,       dawn_n,        color="steelblue", alpha=0.10, zorder=0)
-                # notte post-tramonto
-                p2 = self.ax.axvspan(dusk_n,        day_num + 1.0, color="steelblue", alpha=0.10, zorder=0)
-                self._night_poly.extend([p1, p2])
+                # Zone notturne su entrambi i pannelli (CO2 e T/RH)
+                for axis in (self.ax, self.ax_t):
+                    p1 = axis.axvspan(day_num, dawn_n,        color="steelblue", alpha=0.10, zorder=0)
+                    p2 = axis.axvspan(dusk_n,  day_num + 1.0, color="steelblue", alpha=0.10, zorder=0)
+                    self._night_poly.extend([p1, p2])
 
         # ── Asse X fisso (intera giornata / periodo) ───────────────────────
         self._set_x_axis(start, n_days)
 
-        # ── Asse Y ────────────────────────────────────────────────────────
+        # ── Assi Y ────────────────────────────────────────────────────────
+        # CO2: rispetta zoom manuale se presente
         if self._zoom_ylim is None:
             lo, hi = smart_ylim(values)
             self.ax.set_ylim(lo, hi)
         else:
             self.ax.set_ylim(self._zoom_ylim)
+        # T e RH: sempre autoscale con min_range ridotto, ignorano lo zoom CO2
+        self.ax_t.set_ylim(*smart_ylim(t_arr,   min_range=2.0,  fallback=(15.0, 30.0)))
+        self.ax_rh.set_ylim(*smart_ylim(rh_arr, min_range=10.0, fallback=(0.0, 100.0)))
 
         # ── Titolo e label flag sulla stessa riga ─────────────────────────
         site  = self.cfg.get("location", "name", fallback="")
@@ -578,7 +624,7 @@ class GraphWidget(QWidget):
         # Tick basati sulla finestra visibile corrente
         self._update_x_ticks()
 
-        self.ax.set_xlabel(
+        self.ax_t.set_xlabel(
             "Ora (UTC)" if n_days == 1 else "Data / Ora (UTC)",
             fontsize=10
         )
@@ -687,9 +733,18 @@ class GraphWidget(QWidget):
         self.hl_pt.set_data([xv], [yv])
         self.hl_pt.set_visible(True)
 
-        # Testo tooltip
+        # Testo tooltip: CO2 + T + RH allo stesso idx
         t_str = mdates.num2date(xv).strftime("%H:%M:%S")
-        self.annot.set_text(f"Ora:  {t_str}\nCO₂: {yv:.2f} ppm")
+        lines = [f"Ora:  {t_str}", f"CO₂: {yv:.2f} ppm"]
+        if hasattr(self, "_t_plot") and idx < len(self._t_plot):
+            tv = self._t_plot[idx]
+            if not np.isnan(tv):
+                lines.append(f"T:   {tv:.2f} °C")
+        if hasattr(self, "_rh_plot") and idx < len(self._rh_plot):
+            rv = self._rh_plot[idx]
+            if not np.isnan(rv):
+                lines.append(f"RH:  {rv:.2f} %")
+        self.annot.set_text("\n".join(lines))
         self.annot.xy = (xv, yv)   # freccia punta al dato
 
         # Posizione tooltip in fraction degli assi (0-1)
