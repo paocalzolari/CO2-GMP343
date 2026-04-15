@@ -106,8 +106,29 @@ manualmente. Non è critico perché legge solo file e non scrive dati.
 
 ### Cron utente
 
-Cron utente esegue ogni 5 minuti `~/bin/rsync-co2.sh` per sincronizzare
-`~/data/` verso `cimone@ozone.bo.isac.cnr.it:/home/cimone/data/gmp343`.
+Due job, definiti in [`autoexec/crontab.txt`](autoexec/crontab.txt):
+
+1. **Sync dati** (ogni 5 min): `rsync-tailscale.sh` sincronizza `~/data/`
+   verso `cimone@ozone.bo.isac.cnr.it:/home/cimone/data/gmp343` con
+   auto-recovery Tailscale (se DNS/rsync fallisce riavvia `tailscaled`
+   e ritenta una volta).
+2. **Watchdog Tailscale** (ogni 10 min): `tailscale-health.sh --fix`
+   verifica la risoluzione DNS di GitHub, ozone, naslame1 e riavvia
+   `tailscaled` se necessario. Il restart viene **posposto** se c'è un
+   `git push/pull/fetch/rsync/scp` in corso (evita di troncare TCP).
+
+Entrambi gli script vivono in [`~/programs/services/tools/`](../services/tools/)
+(repo `paocalzolari/services`, clonata sul Raspberry). La logica
+Tailscale è centralizzata lì: un unico punto di aggiornamento per tutti
+i PC di acquisizione del network.
+
+Richiesta sudoers (una volta sola, vedi header degli script):
+
+```bash
+echo 'misura ALL=(root) NOPASSWD: /bin/systemctl restart tailscaled' | \
+    sudo tee /etc/sudoers.d/misura-tailscale
+sudo chmod 440 /etc/sudoers.d/misura-tailscale
+```
 
 ### Icone sul Desktop
 

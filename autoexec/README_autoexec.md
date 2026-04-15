@@ -107,18 +107,36 @@ Attività pianificate:
 - Ogni 5 minuti: sincronizzazione dati CO2 verso server remoto
   (`ozone.bo.isac.cnr.it`) tramite `~/bin/rsync-co2.sh`
 
-## 4. Rsync backup (rsync-co2.sh)
+## 4. Rsync backup — via `paocalzolari/services`
 
-Script `rsync-co2.sh` da copiare in `~/bin/` e rendere eseguibile:
+Il sync dati e il watchdog Tailscale sono gestiti dagli script canonici in
+`~/programs/services/tools/` (repo `paocalzolari/services`), non più da uno
+script specifico di questa repo:
+
+- `rsync-tailscale.sh` — sync con auto-recovery Tailscale (sostituisce
+  il vecchio `rsync-co2.sh`).
+- `tailscale-health.sh` — watchdog DNS: se Tailscale smette di risolvere,
+  lo riavvia (ma **non** se un `git push`/`rsync`/`scp` è in corso).
+
+Setup su un nuovo Pi:
 
 ```bash
-mkdir -p ~/bin
-cp rsync-co2.sh ~/bin/rsync-co2.sh
-chmod +x ~/bin/rsync-co2.sh
+# 1. Clonare la repo services accanto a CO2
+cd ~/programs
+git clone https://github.com/paocalzolari/services.git
+
+# 2. Sudoers per restart tailscaled senza password
+echo "$(whoami) ALL=(root) NOPASSWD: /bin/systemctl restart tailscaled" | \
+    sudo tee /etc/sudoers.d/$(whoami)-tailscale
+sudo chmod 440 /etc/sudoers.d/$(whoami)-tailscale
+
+# 3. Installare il crontab
+crontab autoexec/crontab.txt
 ```
 
-Sincronizza `~/data/` → `cimone@ozone.bo.isac.cnr.it:/home/cimone/data/gmp343`.
-Usa un touchfile per evitare esecuzioni concorrenti.
+Il crontab di questa repo ([`autoexec/crontab.txt`](crontab.txt)) è già
+configurato per invocare gli script da `~/programs/services/tools/` con i
+parametri giusti (src/dest/tag).
 
 ## Hardware (Raspberry Pi 5)
 

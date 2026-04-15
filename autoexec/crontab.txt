@@ -22,4 +22,10 @@
 # 
 # m h  dom mon dow   command
 
-*/5 * * * * $HOME/bin/rsync-co2.sh
+# Sync ~/data/ verso ozone.bo.isac.cnr.it ogni 5 minuti via Tailscale.
+# Usa lo script canonico da programs/services (con auto-recovery tailscaled).
+*/5 * * * * /home/misura/programs/services/tools/rsync-tailscale.sh --src /home/misura/data/ --dest cimone@ozone.bo.isac.cnr.it:/home/cimone/data/gmp343 --tag co2
+
+# Watchdog Tailscale: ogni 10 minuti verifica DNS; se KO riavvia tailscaled
+# (ma NON interrompe push/rsync/scp in corso).
+*/10 * * * * /home/misura/programs/services/tools/tailscale-health.sh --fix --quiet --log /tmp/tailscale-health.log
