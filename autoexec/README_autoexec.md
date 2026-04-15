@@ -9,8 +9,8 @@ Due meccanismi diversi a seconda del programma:
 
 | Programma | Meccanismo | File |
 |---|---|---|
-| Backend logger (`gmp343_logger-9.py`) | **systemd system service** | `co2-logger.service` |
-| Monitor GUI (`gui_integrated_v13.py`) | **autostart desktop X** | `Monitor-GMP343.desktop` |
+| Backend logger (`gmp343_sht31_logger.py`) | **systemd system service** | `co2-logger.service` |
+| Monitor GUI (`gmp343_sht31_monitor.py`) | **autostart desktop X** | `Monitor-GMP343.desktop` |
 
 Il backend ha bisogno di girare sempre, anche senza login grafico, e di essere
 riavviato automaticamente in caso di crash → systemd. Il monitor GUI invece
@@ -30,7 +30,7 @@ Lo script:
 2. Esegue `systemctl daemon-reload`
 3. Disabilita l'eventuale autostart `Vaisala-logger.desktop` (rinominato
    `.disabled`) per evitare conflitti sulla porta seriale
-4. Stoppa eventuale `calib-GMP343-logger.py` in esecuzione
+4. Stoppa eventuale `gmp343_sht31_calib.py` in esecuzione
 5. Esegue `systemctl enable --now co2-logger.service`
 
 ### Comandi utili
@@ -53,12 +53,12 @@ sudo systemctl start co2-logger         # ripartenza
 
 ### Procedura calibrazione
 
-Backend systemd e `calib-GMP343-logger.py` non possono coesistere — entrambi
+Backend systemd e `gmp343_sht31_calib.py` non possono coesistere — entrambi
 vogliono `/dev/gmp343`. Per fare una calibrazione:
 
 ```bash
 sudo systemctl stop co2-logger
-cd /home/misura/programs/CO2 && python3 calib-GMP343-logger.py
+cd /home/misura/programs/CO2 && python3 gmp343_sht31_calib.py
 # ... usa la GUI per togglare flag measure/calib durante la sessione ...
 # ... chiudi la GUI quando hai finito ...
 sudo systemctl start co2-logger
@@ -132,7 +132,7 @@ Usa un touchfile per evitare esecuzioni concorrenti.
 ls /dev/gmp343                       # symlink udev presente?
 systemctl status co2-logger          # backend systemd attivo?
 journalctl -u co2-logger -n 30       # ultimi log del backend
-pgrep -af gui_integrated             # monitor GUI attivo?
+pgrep -af gmp343_sht31_monitor       # monitor GUI attivo?
 tail /tmp/co2monitor.log             # log del monitor
 ls ~/data/$(date +%Y%m%d)*.raw 2>/dev/null  # file giornalieri scritti?
 ```

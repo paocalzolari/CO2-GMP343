@@ -17,7 +17,7 @@ Type=simple
 User=misura
 Group=dialout
 WorkingDirectory=/home/misura/programs/CO2
-ExecStart=/usr/bin/python3 /home/misura/programs/CO2/gmp343_logger-9.py
+ExecStart=/usr/bin/python3 /home/misura/programs/CO2/gmp343_sht31_logger.py
 
 # Watchdog: riavvia sempre, anche su exit pulito (un logger non deve mai uscire)
 Restart=always

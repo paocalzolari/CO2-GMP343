@@ -7,7 +7,7 @@
 #   3. Disabilita l'autostart di Vaisala-logger.desktop (per evitare conflitto
 #      sulla porta seriale: il backend e il logger di calibrazione non possono
 #      girare insieme — entrambi tengono /dev/gmp343 e scrivono sugli stessi file)
-#   4. Stoppa eventuale calib-GMP343-logger.py in esecuzione
+#   4. Stoppa eventuale gmp343_sht31_calib.py in esecuzione
 #   5. systemctl enable --now co2-logger.service
 #
 # Richiede sudo. Eseguire da: programs/CO2/
@@ -45,14 +45,14 @@ else
     echo "==> Autostart calibrazione già assente, ok"
 fi
 
-# Stop di eventuale processo calib-GMP343-logger.py in esecuzione
-if pgrep -f "calib-GMP343-logger.py" > /dev/null; then
-    echo "==> Stop processo calib-GMP343-logger.py corrente"
-    pkill -TERM -f "calib-GMP343-logger.py" || true
+# Stop di eventuale processo gmp343_sht31_calib.py in esecuzione
+if pgrep -f "gmp343_sht31_calib.py" > /dev/null; then
+    echo "==> Stop processo gmp343_sht31_calib.py corrente"
+    pkill -TERM -f "gmp343_sht31_calib.py" || true
     sleep 2
-    if pgrep -f "calib-GMP343-logger.py" > /dev/null; then
+    if pgrep -f "gmp343_sht31_calib.py" > /dev/null; then
         echo "    (forzo SIGKILL)"
-        pkill -KILL -f "calib-GMP343-logger.py" || true
+        pkill -KILL -f "gmp343_sht31_calib.py" || true
         sleep 1
     fi
 fi
@@ -74,5 +74,5 @@ echo "  sudo systemctl restart co2-logger    # restart manuale"
 echo
 echo "Per una sessione di calibrazione:"
 echo "  sudo systemctl stop co2-logger"
-echo "  cd /home/misura/programs/CO2 && python3 calib-GMP343-logger.py"
+echo "  cd /home/misura/programs/CO2 && python3 gmp343_sht31_calib.py"
 echo "  sudo systemctl start co2-logger"

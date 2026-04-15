@@ -2,7 +2,7 @@
 # co2-calib-mode.sh
 # Procedura calibrazione GMP343:
 #   1. ferma il systemd service co2-logger (richiede sudo)
-#   2. avvia calib-GMP343-logger.py (GUI per togglare flag measure/calib)
+#   2. avvia gmp343_sht31_calib.py (GUI per togglare flag measure/calib)
 #   3. quando l'utente chiude la GUI, riavvia il systemd service
 #
 # Eseguito tipicamente da CO2-Calib.desktop (con Terminal=true).
@@ -10,7 +10,7 @@
 set -e
 
 CO2_DIR="/home/misura/programs/CO2"
-CALIB_PY="$CO2_DIR/calib-GMP343-logger.py"
+CALIB_PY="$CO2_DIR/gmp343_sht31_calib.py"
 
 echo "==============================================="
 echo "  CO2 / GMP343 — Modalità calibrazione"

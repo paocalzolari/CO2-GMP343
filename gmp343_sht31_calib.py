@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-calib-GMP343-logger.py
-Logger GMP343 con GUI per sessioni di calibrazione.
+gmp343_sht31_calib.py
+Logger GMP343 (CO2, seriale) + SHT31-D (T/RH, I2C) con GUI per sessioni di calibrazione.
 
-Formato file v2 (dal 2026):
+Formato file v3 (dal 2026-04-15, con T/RH):
   - Nome: carbocap343_<site>_<YYYYMMDD>_p00_min.raw (underscore, non trattini)
   - Data/ora: YYYY-MM-DD HH:MM:SS (con trattini e due punti)
-  - Header _min: #date time CO2[PPM] CO2_std[PPM] ndata_60s_mean flag
+  - Header raw:  #date time CO2[PPM] T[C] RH[%] flag
+  - Header _min: #date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag
   - Std in PPM assoluto (non percentuale)
   - Flag: measure o calib (modificabile da GUI)
+  - Dato mancante (SHT31 errore/assente, minuto vuoto) → -999.99
 """
 
 import sys
@@ -20,6 +22,12 @@ import time
 import statistics
 import configparser
 from datetime import datetime
+
+try:
+    import smbus2
+    _HAS_SMBUS = True
+except ImportError:
+    _HAS_SMBUS = False
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget,
@@ -43,6 +51,60 @@ FLAG_CALIB   = "calib"
 
 _RECONNECT_DELAY_INIT = 5    # secondi, delay iniziale riconnessione
 _RECONNECT_DELAY_MAX  = 60   # secondi, cap backoff esponenziale
+
+# Sentinel unico per dato mancante (CO2, T, RH, std)
+MISSING = -999.99
+
+# ── SHT31-D (T/RH via I2C) ────────────────────────────────────────────────────
+SHT31_BUS      = 1
+SHT31_ADDR     = 0x44
+SHT31_CMD_MSB  = 0x24        # single-shot high repeatability
+SHT31_CMD_LSB  = 0x00
+SHT31_WAIT_S   = 0.02
+
+
+def open_sht31_bus():
+    """Apre SMBus(1). Ritorna oggetto o None se I2C non disponibile."""
+    if not _HAS_SMBUS:
+        print("WARN: smbus2 non installato → SHT31 disabilitato")
+        return None
+    try:
+        bus = smbus2.SMBus(SHT31_BUS)
+        bus.write_i2c_block_data(SHT31_ADDR, SHT31_CMD_MSB, [SHT31_CMD_LSB])
+        time.sleep(SHT31_WAIT_S)
+        bus.read_i2c_block_data(SHT31_ADDR, 0x00, 6)
+        return bus
+    except Exception as e:
+        print(f"WARN: SHT31-D non raggiungibile ({e}) → T/RH = {MISSING}")
+        return None
+
+
+def read_sht31(bus):
+    """Ritorna (T, RH) in °C e %, oppure (MISSING, MISSING) su errore."""
+    if bus is None:
+        return MISSING, MISSING
+    try:
+        bus.write_i2c_block_data(SHT31_ADDR, SHT31_CMD_MSB, [SHT31_CMD_LSB])
+        time.sleep(SHT31_WAIT_S)
+        r = bus.read_i2c_block_data(SHT31_ADDR, 0x00, 6)
+        t_raw  = (r[0] << 8) | r[1]
+        rh_raw = (r[3] << 8) | r[4]
+        t  = -45.0 + 175.0 * (t_raw  / 65535.0)
+        rh = 100.0 * (rh_raw / 65535.0)
+        return t, rh
+    except Exception as e:
+        print(f"[acq] read_sht31: {e}")
+        return MISSING, MISSING
+
+
+def _mean_std_missing(values):
+    """Media e stdev ignorando MISSING. Se nessun valido: (MISSING, MISSING)."""
+    clean = [v for v in values if v != MISSING]
+    if not clean:
+        return MISSING, MISSING
+    avg = sum(clean) / len(clean)
+    std = statistics.stdev(clean) if len(clean) > 1 else 0.0
+    return avg, std
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -83,12 +145,16 @@ def write_headers_if_needed(raw_file: str, min_file: str):
     # Usa open('x') per creazione atomica — evita TOCTOU e troncamento (DI-004)
     try:
         with open(raw_file, "x", encoding="utf-8") as f:
-            f.write("#date time CO2[PPM] flag\n")
+            f.write("#date time CO2[PPM] T[C] RH[%] flag\n")
     except FileExistsError:
         pass
     try:
         with open(min_file, "x", encoding="utf-8") as f:
-            f.write("#date time CO2[PPM] CO2_std[PPM] ndata_60s_mean flag\n")
+            f.write(
+                "#date time CO2[PPM] CO2_std[PPM] "
+                "T[C] T_std[C] RH[%] RH_std[%] "
+                "ndata_60s_mean flag\n"
+            )
     except FileExistsError:
         pass
 
@@ -170,7 +236,11 @@ class AcqThread(threading.Thread):
         if ser is None or self._stop.is_set():
             return
 
+        sht31_bus = open_sht31_bus()
+
         co2_buf  = []
+        t_buf    = []
+        rh_buf   = []
         flag_buf = []
         cur_min  = datetime.utcnow().replace(second=0, microsecond=0)
 
@@ -218,10 +288,19 @@ class AcqThread(threading.Thread):
                             avg      = sum(co2_buf) / len(co2_buf)
                             std      = statistics.stdev(co2_buf) if len(co2_buf) > 1 else 0.0
                             n        = len(co2_buf)
+                            t_avg,  t_std  = _mean_std_missing(t_buf)
+                            rh_avg, rh_std = _mean_std_missing(rh_buf)
                             with open(min_file, "a", encoding="utf-8") as mf:
-                                mf.write(f"{ts_avg} {avg:.2f} {std:.2f} {n} {min_flag}\n")
+                                mf.write(
+                                    f"{ts_avg} {avg:.2f} {std:.2f} "
+                                    f"{t_avg:.2f} {t_std:.2f} "
+                                    f"{rh_avg:.2f} {rh_std:.2f} "
+                                    f"{n} {min_flag}\n"
+                                )
                                 mf.flush()  # DI-003
                             co2_buf  = []
+                            t_buf    = []
+                            rh_buf   = []
                             flag_buf = []
                             cur_min  = now.replace(second=0, microsecond=0)
                         raw_file, min_file = new_raw, new_min
@@ -237,12 +316,19 @@ class AcqThread(threading.Thread):
                             # Usa self._get_flag() come fallback se flag_buf vuoto (DI-006/CORR-003)
                             min_flag = FLAG_CALIB if FLAG_CALIB in flag_buf else self._get_flag()
                             with open(min_file, "a", encoding="utf-8") as mf:
-                                mf.write(f"{ts_avg} 999.99 0.00 0 {min_flag}\n")
+                                mf.write(
+                                    f"{ts_avg} {MISSING:.2f} {MISSING:.2f} "
+                                    f"{MISSING:.2f} {MISSING:.2f} "
+                                    f"{MISSING:.2f} {MISSING:.2f} "
+                                    f"0 {min_flag}\n"
+                                )
                                 mf.flush()  # DI-003
                         except OSError as e:
                             print(f"[acq] write sentinel: {e}")
                         cur_min  = now.replace(second=0, microsecond=0)
                         co2_buf  = []
+                        t_buf    = []
+                        rh_buf   = []
                         flag_buf = []
                     continue
 
@@ -252,11 +338,12 @@ class AcqThread(threading.Thread):
                     continue
 
                 current_flag = self._get_flag()  # lettura atomica (ARCH-001)
+                t, rh = read_sht31(sht31_bus)
 
                 # ── Scrittura raw — try/except isolato (DI-002) ───────────────
                 try:
                     with open(raw_file, "a", encoding="utf-8") as rf:
-                        rf.write(f"{ts_str} {value:.2f} {current_flag}\n")
+                        rf.write(f"{ts_str} {value:.2f} {t:.2f} {rh:.2f} {current_flag}\n")
                         rf.flush()  # DI-003
                 except OSError as e:
                     print(f"[acq] write raw: {e}")
@@ -264,6 +351,8 @@ class AcqThread(threading.Thread):
                 now_min = now.replace(second=0, microsecond=0)
                 if now_min == cur_min:
                     co2_buf.append(value)
+                    t_buf.append(t)
+                    rh_buf.append(rh)
                     flag_buf.append(current_flag)
                 else:
                     # ── Scrittura media minuto — try/except isolato (DI-002) ──
@@ -276,14 +365,23 @@ class AcqThread(threading.Thread):
                             std = statistics.stdev(co2_buf) if len(co2_buf) > 1 else 0.0
                             n   = len(co2_buf)
                         else:
-                            avg, std, n = 999.99, 0.0, 0
+                            avg, std, n = MISSING, MISSING, 0
+                        t_avg,  t_std  = _mean_std_missing(t_buf)
+                        rh_avg, rh_std = _mean_std_missing(rh_buf)
                         with open(min_file, "a", encoding="utf-8") as mf:
-                            mf.write(f"{ts_avg} {avg:.2f} {std:.2f} {n} {min_flag}\n")
+                            mf.write(
+                                f"{ts_avg} {avg:.2f} {std:.2f} "
+                                f"{t_avg:.2f} {t_std:.2f} "
+                                f"{rh_avg:.2f} {rh_std:.2f} "
+                                f"{n} {min_flag}\n"
+                            )
                             mf.flush()  # DI-003
                     except OSError as e:
                         print(f"[acq] write min: {e}")
                     cur_min  = now_min
                     co2_buf  = [value]
+                    t_buf    = [t]
+                    rh_buf   = [rh]
                     flag_buf = [current_flag]
 
                 # ── Segnale GUI — try/except isolato (DI-002) ─────────────────

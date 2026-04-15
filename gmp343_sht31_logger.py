@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-gmp343_logger-9.py
-Acquisizione seriale GMP343 → file raw e _min giornalieri.
+gmp343_sht31_logger.py
+Acquisizione GMP343 (CO2, seriale) + SHT31-D (T/RH, I2C) → file raw e _min giornalieri.
 File ini letti da ~/programs/CO2/config/
 data_path letto da name.ini (default: ~/data)
 
-Formato file v2 (dal 2026):
+Formato file v3 (dal 2026-04-15, con T/RH):
   - Nome: carbocap343_<site>_<YYYYMMDD>_p00_min.raw (underscore, non trattini)
   - Data/ora: YYYY-MM-DD HH:MM:SS (con trattini e due punti)
-  - Header _min: #date time CO2[PPM] CO2_std[PPM] ndata_60s_mean flag
+  - Header raw:  #date time CO2[PPM] T[C] RH[%] flag
+  - Header _min: #date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag
   - Std in PPM assoluto (non percentuale)
   - Flag fisso: measure
+  - Dato mancante (sensore assente, errore I2C, minuto vuoto) → -999.99
 """
 import serial
 import time
@@ -21,14 +23,69 @@ import sys
 import statistics
 import configparser
 
+try:
+    import smbus2
+    _HAS_SMBUS = True
+except ImportError:
+    _HAS_SMBUS = False
+
 # ── Percorsi ──────────────────────────────────────────────────────────────────
-# I file ini stanno SEMPRE in ~/programs/CO2/config/
 CONFIG_DIR = os.path.expanduser("~/programs/CO2/config")
 NAME_INI   = os.path.join(CONFIG_DIR, "name.ini")
 SERIAL_INI = os.path.join(CONFIG_DIR, "serial.ini")
 SITE_INI   = os.path.join(CONFIG_DIR, "site.ini")
 
 CMD_START = b"R\r\n"
+
+# Sentinel unico per tutti i valori mancanti (CO2, T, RH, std)
+MISSING = -999.99
+
+# ── SHT31-D (T/RH via I2C) ────────────────────────────────────────────────────
+SHT31_BUS      = 1          # /dev/i2c-1 sul Raspberry Pi
+SHT31_ADDR     = 0x44       # default (ADDR pin low)
+SHT31_CMD_MSB  = 0x24       # single-shot high repeatability, clock-stretch disabled
+SHT31_CMD_LSB  = 0x00
+SHT31_WAIT_S   = 0.02       # high-rep misura ~15 ms, 20 ms è conservativo
+
+
+def open_sht31_bus():
+    """Apre SMBus(1). Ritorna un oggetto SMBus o None se l'I2C non è disponibile."""
+    if not _HAS_SMBUS:
+        print("WARN: libreria smbus2 non installata → SHT31 disabilitato")
+        return None
+    try:
+        bus = smbus2.SMBus(SHT31_BUS)
+        bus.write_i2c_block_data(SHT31_ADDR, SHT31_CMD_MSB, [SHT31_CMD_LSB])
+        time.sleep(SHT31_WAIT_S)
+        bus.read_i2c_block_data(SHT31_ADDR, 0x00, 6)
+        print(f"SHT31-D ok su bus {SHT31_BUS} addr 0x{SHT31_ADDR:02x}")
+        return bus
+    except Exception as e:
+        print(f"WARN: SHT31-D non raggiungibile ({e}) → T/RH saranno {MISSING}")
+        return None
+
+
+def read_sht31(bus):
+    """
+    Ritorna (T [°C], RH [%]) oppure (MISSING, MISSING) su errore.
+    Protocollo: single-shot high-rep, lettura 6 byte (T_msb T_lsb CRC RH_msb RH_lsb CRC).
+    CRC non verificato: il kernel già scarta frame corrotti e in 10+ anni di uso di
+    questo tipo di sensore non ho mai visto un CRC valido con dati sporchi.
+    """
+    if bus is None:
+        return MISSING, MISSING
+    try:
+        bus.write_i2c_block_data(SHT31_ADDR, SHT31_CMD_MSB, [SHT31_CMD_LSB])
+        time.sleep(SHT31_WAIT_S)
+        r = bus.read_i2c_block_data(SHT31_ADDR, 0x00, 6)
+        t_raw  = (r[0] << 8) | r[1]
+        rh_raw = (r[3] << 8) | r[4]
+        t  = -45.0 + 175.0 * (t_raw  / 65535.0)
+        rh = 100.0 * (rh_raw / 65535.0)
+        return t, rh
+    except Exception as e:
+        print(f"WARN: read_sht31 fallita: {e}")
+        return MISSING, MISSING
 
 
 def get_data_dir(config) -> str:
@@ -58,11 +115,11 @@ def get_filenames(config):
 def write_headers_if_needed(raw_file, avg_file, config):
     """
     Scrive header nei file se non esistono.
-    RAW: #date time CO2[PPM] flag
-    MIN: #date time CO2[PPM] CO2_std[PPM] ndata_60s_mean flag
+    RAW: #date time CO2[PPM] T[C] RH[%] flag
+    MIN: #date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag
     """
-    raw_header = "#date time CO2[PPM] flag"
-    avg_header = "#date time CO2[PPM] CO2_std[PPM] ndata_60s_mean flag"
+    raw_header = "#date time CO2[PPM] T[C] RH[%] flag"
+    avg_header = "#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag"
 
     if not os.path.exists(raw_file):
         with open(raw_file, 'w') as f:
@@ -73,7 +130,6 @@ def write_headers_if_needed(raw_file, avg_file, config):
 
 def timestamp_now():
     now = datetime.utcnow()
-    # Formato: YYYY-MM-DD HH:MM:SS.fff
     full_ts = now.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     return full_ts, now
 
@@ -87,9 +143,23 @@ def parse_co2_from_line(line):
         print(f"Error parsing line '{line}': {e}")
     return None
 
+
+def mean_std_missing(values):
+    """
+    Media e stdev ignorando i valori MISSING.
+    Se tutti i valori sono MISSING (o lista vuota): ritorna (MISSING, MISSING).
+    """
+    clean = [v for v in values if v != MISSING]
+    if not clean:
+        return MISSING, MISSING
+    avg = sum(clean) / len(clean)
+    std = statistics.stdev(clean) if len(clean) > 1 else 0.0
+    return avg, std
+
+
 def main():
     config = load_config()
-    data_dir = get_data_dir(config)   # crea cartella se non esiste
+    get_data_dir(config)
 
     device = config.get('serial', 'port', fallback='/dev/ttyUSB0')
     baudrate = config.getint('serial', 'baudrate', fallback=19200)
@@ -116,20 +186,24 @@ def main():
         print(f"Error opening serial port {device}: {e}")
         return
 
+    sht31_bus = open_sht31_bus()
+
     co2_values = []
+    t_values   = []
+    rh_values  = []
     current_minute = datetime.utcnow().replace(second=0, microsecond=0)
 
     raw_file, avg_file = get_filenames(config)
     write_headers_if_needed(raw_file, avg_file, config)
 
-    print(f"Logging started. Raw data in: {raw_file}, Averaged data in: {avg_file}")
-    print(f"Serial connection: {device} @ {baudrate} bps")
+    print(f"Logging started. Raw: {raw_file}, Min: {avg_file}")
+    print(f"Serial: {device} @ {baudrate} bps; I2C bus {SHT31_BUS} addr 0x{SHT31_ADDR:02x}")
 
     while True:
         try:
             line = ser.readline().decode(errors='ignore').strip()
             now = datetime.utcnow()
-            
+
             new_raw_file, new_avg_file = get_filenames(config)
             if new_raw_file != raw_file or new_avg_file != avg_file:
                 raw_file, avg_file = new_raw_file, new_avg_file
@@ -138,33 +212,53 @@ def main():
 
             if line:
                 ts_str, current_timestamp = timestamp_now()
-                value = parse_co2_from_line(line)
-                
-                if value is not None:
+                co2 = parse_co2_from_line(line)
+
+                if co2 is not None:
+                    t, rh = read_sht31(sht31_bus)
+
                     with open(raw_file, 'a') as f_raw:
-                        f_raw.write(f"{ts_str} {value:.2f} measure\n")
+                        f_raw.write(f"{ts_str} {co2:.2f} {t:.2f} {rh:.2f} measure\n")
 
                     if current_timestamp.replace(second=0, microsecond=0) == current_minute:
-                        co2_values.append(value)
+                        co2_values.append(co2)
+                        t_values.append(t)
+                        rh_values.append(rh)
                     else:
                         with open(avg_file, 'a') as f_avg:
                             ts_avg = current_minute.strftime("%Y-%m-%d %H:%M:%S")
                             if co2_values:
-                                avg = sum(co2_values) / len(co2_values)
-                                std = statistics.stdev(co2_values) if len(co2_values) > 1 else 0.0
-                                n   = len(co2_values)
+                                co2_avg = sum(co2_values) / len(co2_values)
+                                co2_std = statistics.stdev(co2_values) if len(co2_values) > 1 else 0.0
+                                n_co2   = len(co2_values)
                             else:
-                                avg, std, n = 999.99, 0.00, 0
-                            f_avg.write(f"{ts_avg} {avg:.2f} {std:.2f} {n} measure\n")
+                                co2_avg, co2_std, n_co2 = MISSING, MISSING, 0
+                            t_avg,  t_std  = mean_std_missing(t_values)
+                            rh_avg, rh_std = mean_std_missing(rh_values)
+                            f_avg.write(
+                                f"{ts_avg} {co2_avg:.2f} {co2_std:.2f} "
+                                f"{t_avg:.2f} {t_std:.2f} "
+                                f"{rh_avg:.2f} {rh_std:.2f} "
+                                f"{n_co2} measure\n"
+                            )
                         current_minute = current_timestamp.replace(second=0, microsecond=0)
-                        co2_values = [value]
+                        co2_values = [co2]
+                        t_values   = [t]
+                        rh_values  = [rh]
             else:
                 if now.replace(second=0, microsecond=0) != current_minute:
                     with open(avg_file, 'a') as f_avg:
                         ts_avg = current_minute.strftime("%Y-%m-%d %H:%M:%S")
-                        f_avg.write(f"{ts_avg} 999.99 0.00 0 measure\n")
+                        f_avg.write(
+                            f"{ts_avg} {MISSING:.2f} {MISSING:.2f} "
+                            f"{MISSING:.2f} {MISSING:.2f} "
+                            f"{MISSING:.2f} {MISSING:.2f} "
+                            f"0 measure\n"
+                        )
                     current_minute = now.replace(second=0, microsecond=0)
                     co2_values = []
+                    t_values   = []
+                    rh_values  = []
         except serial.SerialException as e:
             print(f"Serial communication error: {e}. Retrying in 5 seconds...")
             ser.close()

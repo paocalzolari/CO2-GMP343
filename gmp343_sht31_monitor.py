@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GMP343 Monitor Integrato v13
-Tab 1 : Monitor real-time  (mostra flag corrente dal file)
+gmp343_sht31_monitor.py — GMP343 + SHT31-D Monitor integrato
+Tab 1 : Monitor real-time  (CO2 + T + RH + flag corrente dal file)
 Tab 2 : Grafico CO₂        (punti calib in arancione, label flag fuori plot)
 
-Formato file v2 (dal 2026):
-  - Nome: carbocap343_<site>_<YYYYMMDD>_p00_min.raw (underscore, non trattini)
-  - Data/ora: YYYY-MM-DD HH:MM:SS (con trattini e due punti)
-  - Header: #date time CO2[PPM] CO2_std[PPM] ndata_60s_mean flag
-  - Parser adattato per nuovo formato timestamp e std in PPM
+Formato file v3 (dal 2026-04-15, con T/RH):
+  - Header: #date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag
+  - Dato mancante: -999.99
+  - Parser retrocompatibile col formato v2 (5 colonne, senza T/RH).
 """
 
 import sys, os
@@ -125,16 +124,23 @@ def _startup_log():
     print()
 
 
+MISSING = -999.99
+
+
 def read_file(path: str):
     """
-    Legge un file dati formato v2.
-    Formato: #date time CO2[PPM] CO2_std[PPM] ndata_60s_mean flag
+    Legge un file dati _min.
+    Supporta sia formato v3 (con T/RH, 9 colonne) sia v2 (solo CO2, 5 colonne):
+      v3: date time CO2 CO2_std T T_std RH RH_std n flag
+      v2: date time CO2 CO2_std n flag
+    Per i file v2 T e RH sono restituiti come MISSING.
     Timestamp: YYYY-MM-DD HH:MM:SS
-    Restituisce liste (times, values, stds_ppm, counts, flags).
+    Ritorna: (times, values, stds, counts, flags, t, t_std, rh, rh_std)
     """
     times, values, stds, counts, flags = [], [], [], [], []
+    ts_t, ts_tstd, ts_rh, ts_rhstd = [], [], [], []
     if not path or not os.path.exists(path):
-        return times, values, stds, counts, flags
+        return times, values, stds, counts, flags, ts_t, ts_tstd, ts_rh, ts_rhstd
     try:
         with open(path, "r", encoding="utf-8") as fh:
             for raw in fh:
@@ -144,47 +150,79 @@ def read_file(path: str):
                 if len(p) < 3:
                     continue
                 try:
-                    # Parser: YYYY-MM-DD HH:MM:SS CO2 [std_ppm n flag]
                     dt  = datetime.strptime(f"{p[0]} {p[1]}", "%Y-%m-%d %H:%M:%S")
                     co2 = float(p[2])
-                    std = float(p[3]) if len(p) >= 4 else 0.0
-                    n   = int(p[4])   if len(p) >= 5 else 1
-                    flag= p[5].lower() if len(p) >= 6 else "measure"
+                    # Discriminazione formato: v3 ha 9 colonne (ts=2 parole), v2 ne ha 5.
+                    # Dopo ts+CO2 restano len(p)-3 colonne:
+                    #   v3 → 7 (CO2_std T T_std RH RH_std n flag)
+                    #   v2 → 3 (CO2_std n flag)  o 2 (n flag)  o 1 (flag)
+                    remaining = len(p) - 3
+                    if remaining >= 7:
+                        # v3: CO2_std T T_std RH RH_std n flag
+                        co2_std = float(p[3])
+                        t_val   = float(p[4])
+                        t_std   = float(p[5])
+                        rh_val  = float(p[6])
+                        rh_std  = float(p[7])
+                        n       = int(p[8])
+                        flag    = p[9].lower() if len(p) >= 10 else "measure"
+                    else:
+                        # v2: [CO2_std [n [flag]]]
+                        co2_std = float(p[3]) if len(p) >= 4 else 0.0
+                        n       = int(p[4])   if len(p) >= 5 else 1
+                        flag    = p[5].lower() if len(p) >= 6 else "measure"
+                        t_val, t_std, rh_val, rh_std = MISSING, MISSING, MISSING, MISSING
                     if flag not in ("measure", "calib"):
                         flag = "measure"
                     times.append(dt)
                     values.append(co2)
-                    stds.append(std)   # std in PPM
+                    stds.append(co2_std)
                     counts.append(n)
                     flags.append(flag)
+                    ts_t.append(t_val)
+                    ts_tstd.append(t_std)
+                    ts_rh.append(rh_val)
+                    ts_rhstd.append(rh_std)
                 except ValueError:
                     continue
     except OSError:
         pass
-    return times, values, stds, counts, flags
+    return times, values, stds, counts, flags, ts_t, ts_tstd, ts_rh, ts_rhstd
 
 
 def load_period(cfg: configparser.ConfigParser,
                 start: date_type, n_days: int):
-    """Carica n_days giorni a partire da start; restituisce array numpy ordinati."""
+    """
+    Carica n_days giorni a partire da start; ritorna array numpy ordinati.
+    Tuple: (times, values, stds, counts, flags, t, t_std, rh, rh_std)
+    """
     all_t, all_v, all_s, all_c, all_f = [], [], [], [], []
+    all_tt, all_tstd, all_rh, all_rhstd = [], [], [], []
     for i in range(n_days):
         d = start + timedelta(days=i)
-        t, v, s, c, f = read_file(build_filename(cfg, d))
+        t, v, s, c, f, tt, tstd, rh, rhstd = read_file(build_filename(cfg, d))
         all_t.extend(t)
         all_v.extend(v)
         all_s.extend(s)
         all_c.extend(c)
         all_f.extend(f)
+        all_tt.extend(tt)
+        all_tstd.extend(tstd)
+        all_rh.extend(rh)
+        all_rhstd.extend(rhstd)
     if not all_t:
         return None
-    idx    = np.argsort(all_t)
-    times  = np.array(all_t)[idx]
-    values = np.array(all_v, dtype=float)[idx]
-    stds   = np.array(all_s, dtype=float)[idx]
-    counts = np.array(all_c, dtype=int)[idx]
-    flags  = np.array(all_f)[idx]
-    return times, values, stds, counts, flags
+    idx     = np.argsort(all_t)
+    times   = np.array(all_t)[idx]
+    values  = np.array(all_v, dtype=float)[idx]
+    stds    = np.array(all_s, dtype=float)[idx]
+    counts  = np.array(all_c, dtype=int)[idx]
+    flags   = np.array(all_f)[idx]
+    t_arr   = np.array(all_tt,    dtype=float)[idx]
+    tstd    = np.array(all_tstd,  dtype=float)[idx]
+    rh_arr  = np.array(all_rh,    dtype=float)[idx]
+    rhstd   = np.array(all_rhstd, dtype=float)[idx]
+    return times, values, stds, counts, flags, t_arr, tstd, rh_arr, rhstd
 
 
 def day_xlim(d: date_type):
@@ -195,8 +233,12 @@ def day_xlim(d: date_type):
 
 
 def smart_ylim(values):
-    """Calcola ylim con margine."""
-    lo, hi = float(np.nanmin(values)), float(np.nanmax(values))
+    """Calcola ylim con margine, ignorando i valori MISSING."""
+    arr = np.asarray(values, dtype=float)
+    arr = arr[(arr != MISSING) & ~np.isnan(arr)]
+    if len(arr) == 0:
+        return 0.0, 500.0
+    lo, hi = float(np.min(arr)), float(np.max(arr))
     span = hi - lo
     if span < MIN_Y_RANGE:
         mid = (lo + hi) / 2
@@ -453,15 +495,18 @@ class GraphWidget(QWidget):
             self._ignore_lim_change = False
             return
 
-        times, values, stds, counts, flags = result
+        times, values, stds, counts, flags, _t, _tstd, _rh, _rhstd = result
         xt = mdates.date2num(times)
+        # Sostituisci MISSING con NaN per il plot (break nella linea, no Y axis esteso)
+        values_plot = np.where(values == MISSING, np.nan, values)
 
         # ── Linea continua (tutti i punti) ────────────────────────────────
-        self.line.set_data(xt, values)
+        self.line.set_data(xt, values_plot)
 
-        # ── Scatter per flag ──────────────────────────────────────────────
-        mask_m = (flags == "measure")
-        mask_c = (flags == "calib")
+        # ── Scatter per flag (solo punti validi, MISSING esclusi) ─────────
+        mask_valid = values != MISSING
+        mask_m = mask_valid & (flags == "measure")
+        mask_c = mask_valid & (flags == "calib")
 
         if mask_m.any():
             self.sc_measure.set_offsets(np.column_stack([xt[mask_m], values[mask_m]]))
@@ -734,7 +779,8 @@ class GMP343Monitor(QMainWindow):
 
     def _color(self, value):
         s = self._thr("sentinel_value")
-        if abs(value - s) < 0.1:
+        # Accetta sia vecchia sentinella 999.99 sia nuova -999.99 (MISSING)
+        if abs(value - s) < 0.1 or value == MISSING:
             return self.guicfg.get("colors", "invalid_color", fallback="#999")
         lo = self._thr("min_valid"); hi = self._thr("max_valid")
         if value < lo or value > hi:
@@ -806,6 +852,23 @@ class GMP343Monitor(QMainWindow):
         row2.addSpacing(8)
         row2.addWidget(QLabel("n:")); self.lbl_n   = QLabel("---"); row2.addWidget(self.lbl_n)
         row2.addStretch(); vco2.addLayout(row2)
+
+        # T e RH (SHT31-D)
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("T:"))
+        self.lbl_t = QLabel("--- °C")
+        self.lbl_t.setFont(QFont("Arial", 14, QFont.Bold))
+        self.lbl_t.setStyleSheet("color:#c05000")
+        row3.addWidget(self.lbl_t)
+        row3.addSpacing(16)
+        row3.addWidget(QLabel("RH:"))
+        self.lbl_rh = QLabel("--- %")
+        self.lbl_rh.setFont(QFont("Arial", 14, QFont.Bold))
+        self.lbl_rh.setStyleSheet("color:#007060")
+        row3.addWidget(self.lbl_rh)
+        row3.addStretch()
+        vco2.addLayout(row3)
+
         grp_co2.setLayout(vco2); vbox.addWidget(grp_co2)
 
         # statistiche
@@ -905,6 +968,7 @@ class GMP343Monitor(QMainWindow):
         if result is None:
             self.lbl_co2.setText("--- ppm"); self.lbl_status.setText("")
             self.lbl_std.setText("---"); self.lbl_n.setText("---")
+            self.lbl_t.setText("--- °C"); self.lbl_rh.setText("--- %")
             self.lbl_ts.setText("Nessun dato")
             self.lbl_flag.setText("---"); self.lbl_flag.setStyleSheet("color:#888;font-size:9px")
             self.lbl_file.setText("file non trovato" if not path else path)
@@ -912,12 +976,14 @@ class GMP343Monitor(QMainWindow):
             self.lbl_avg.setText("---"); self.lbl_cnt.setText("0")
             return
 
-        times, values, stds, counts, flags = result
+        times, values, stds, counts, flags, t_arr, _tstd, rh_arr, _rhstd = result
         last_co2  = float(values[-1])
         last_std  = float(stds[-1])
         last_n    = int(counts[-1])
         last_ts   = times[-1].strftime("%Y/%m/%d %H:%M:%S")
         last_flag = flags[-1] if len(flags) > 0 else "measure"
+        last_t    = float(t_arr[-1])
+        last_rh   = float(rh_arr[-1])
 
         # Label flag
         if last_flag == "calib":
@@ -927,9 +993,9 @@ class GMP343Monitor(QMainWindow):
             self.lbl_flag.setText("● MEASURE")
             self.lbl_flag.setStyleSheet("color:#2060c0;font-weight:bold;font-size:10px")
 
-        # Filtra sentinella per statistiche
+        # Filtra sentinella per statistiche (sia vecchia 999.99 che nuova -999.99)
         sent = self._thr("sentinel_value")
-        valid = values[np.abs(values - sent) > 0.1]
+        valid = values[(np.abs(values - sent) > 0.1) & (values != MISSING)]
 
         dec = self.guicfg.getint("display","co2_decimals",fallback=2)
         col = self._color(last_co2)
@@ -937,6 +1003,15 @@ class GMP343Monitor(QMainWindow):
         self.lbl_co2.setStyleSheet(f"color:{col};font-weight:bold")
         self.lbl_std.setText(f"{last_std:.2f} ppm")
         self.lbl_n.setText(str(last_n))
+        # T e RH: se MISSING mostra placeholder
+        if last_t == MISSING:
+            self.lbl_t.setText("--- °C")
+        else:
+            self.lbl_t.setText(f"{last_t:.2f} °C")
+        if last_rh == MISSING:
+            self.lbl_rh.setText("--- %")
+        else:
+            self.lbl_rh.setText(f"{last_rh:.2f} %")
         self.lbl_ts.setText(last_ts)
         self.lbl_file.setText(path)
 
