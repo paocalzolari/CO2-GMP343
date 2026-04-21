@@ -1,0 +1,13 @@
+# Canonical author mapping for Francescopiero Calzolari.
+#
+# Left side = canonical (name + email).
+# Right side = how the commit was originally authored.
+#
+# Valid authored identities (no remapping needed):
+#   Francescopiero Calzolari <f.calzolari@isac.cnr.it>
+#   Francescopiero Calzolari <francescopiero.calzolari@cnr.it>
+#
+# Legacy / wrong identities remapped below:
+
+Francescopiero Calzolari <f.calzolari@isac.cnr.it> Paolo Calzolari <p.calzolari@isac.cnr.it>
+Francescopiero Calzolari <f.calzolari@isac.cnr.it> Francescopiero Calzolari <paocalzolari-hue@users.noreply.github.com>
