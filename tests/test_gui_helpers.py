@@ -175,6 +175,86 @@ class TestReadFile:
         assert valve_labels == ["-", "test"]
 
 
+# ── load_period (multi-file, 7-tupla con valve) ─────────────────────────
+class TestLoadPeriod:
+    """load_period è come read_file ma su N giorni. La signature è stata
+    estesa a 7-tupla (valve_pos + valve_labels)."""
+
+    def _make_cfg(self, tmp_path):
+        cfg = configparser.ConfigParser()
+        cfg["output"] = {
+            "basename": "carbocap343",
+            "extension": "raw",
+            "data_path": str(tmp_path),
+        }
+        cfg["location"] = {"name": "TEST"}
+        return cfg
+
+    def _write_min(self, tmp_path, day_str, rows, with_valve=False):
+        """Scrive un file _min.raw per il giorno specificato."""
+        fname = tmp_path / f"carbocap343_TEST_{day_str}_p00_min.raw"
+        header = "#date time CO2[PPM] CO2_std[PPM] ndata_60s_mean flag"
+        if with_valve:
+            header += " valve_pos valve_label"
+        with open(fname, "w") as f:
+            f.write(header + "\n")
+            for r in rows:
+                f.write(r + "\n")
+        return fname
+
+    def test_empty_period_returns_none(self, tmp_path):
+        cfg = self._make_cfg(tmp_path)
+        result = gui.load_period(cfg, date_type(2026, 1, 1), n_days=3)
+        assert result is None
+
+    def test_single_day_no_valve_returns_empty_valve_arrays(self, tmp_path):
+        cfg = self._make_cfg(tmp_path)
+        self._write_min(tmp_path, "20260423",
+                        ["2026-04-23 10:30:00 412.34 0.85 60 measure",
+                         "2026-04-23 10:31:00 413.12 0.91 60 measure"])
+        result = gui.load_period(cfg, date_type(2026, 4, 23), n_days=1)
+        assert result is not None
+        times, values, stds, counts, flags, valve_pos, valve_labels = result
+        assert len(times) == 2
+        # file senza colonne valvola → array vuoti (retrocompat)
+        assert valve_pos.size == 0
+        assert valve_labels.size == 0
+
+    def test_single_day_with_valve(self, tmp_path):
+        cfg = self._make_cfg(tmp_path)
+        self._write_min(tmp_path, "20260423",
+                        ["2026-04-23 10:30:00 412.34 0.85 60 measure 3 span-low",
+                         "2026-04-23 10:31:00 413.12 0.91 60 measure 3 span-low",
+                         "2026-04-23 10:32:00 414.50 1.10 55 measure 5 span-mid"],
+                        with_valve=True)
+        result = gui.load_period(cfg, date_type(2026, 4, 23), n_days=1)
+        times, _, _, _, _, valve_pos, valve_labels = result
+        assert len(times) == 3
+        assert list(valve_pos) == [3, 3, 5]
+        assert list(valve_labels) == ["span-low", "span-low", "span-mid"]
+
+    def test_multiday_padded_with_sentinels(self, tmp_path):
+        """Se un giorno ha valvola e un altro no, il periodo combinato deve
+        restituire array valve_pos pieno (no-valve → sentinelle -1)."""
+        cfg = self._make_cfg(tmp_path)
+        # Giorno 1: senza valvola
+        self._write_min(tmp_path, "20260422",
+                        ["2026-04-22 23:00:00 410.0 0.3 60 measure"])
+        # Giorno 2: con valvola
+        self._write_min(tmp_path, "20260423",
+                        ["2026-04-23 00:00:00 411.0 0.3 60 measure 2 ambient"],
+                        with_valve=True)
+        result = gui.load_period(cfg, date_type(2026, 4, 22), n_days=2)
+        times, _, _, _, _, valve_pos, valve_labels = result
+        assert len(times) == 2
+        assert valve_pos.size == 2
+        # Giorno 1 → sentinella, giorno 2 → valore vero
+        assert valve_pos[0] == -1
+        assert valve_labels[0] == "-"
+        assert valve_pos[1] == 2
+        assert valve_labels[1] == "ambient"
+
+
 # ── smart_ylim ───────────────────────────────────────────────────────────
 
 class TestSmartYlim:

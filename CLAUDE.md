@@ -289,13 +289,22 @@ loro header, quelli nuovi avranno le 8 colonne).
   valvola non connessa / engine in stato `idle|stopped`
 - `valve_label = -` → label vuota o sconosciuta
 
-### Retrocompatibilità parser GUI
+### Retrocompatibilità parser GUI + visualizzazione
 
 La GUI [gui_integrated_v13.py](gui_integrated_v13.py) legge correttamente
-file con header sia a 6 che a 8 colonne. Le 2 colonne extra sono accettate
-e conservate (`valve_pos`, `valve_labels` nella signature aggiornata di
-`read_file`) ma **non sono ancora visualizzate**: l'aggiornamento
-visuale è demandato a un lavoro successivo.
+file con header sia a 6 che a 8 colonne. Le 2 colonne extra (`valve_pos`,
+`valve_labels`) sono accettate dal parser `read_file` (7-tupla) e
+aggregate dal period loader `load_period` su più giorni, con sentinella
+`-1 / -` per i file senza colonne valvola (padding per allineamento
+temporale).
+
+**Visualizzazione grafico**: il `GraphWidget` mostra una **striscia
+colorata** sottile (4% dell'altezza in basso) con una fascia per ogni
+run contiguo di posizione valvola, colorata tramite cmap `tab20` (fino a
+20 posizioni distinguibili). Se la fascia è larga > 3% del plot, appare
+un'etichetta `<pos> <label>` sopra la striscia. Attivazione dalla
+checkbox **"Posizione valvola"** (default ON; no-op se i file non hanno
+le colonne valvola).
 
 ### Diagnosi rapida
 

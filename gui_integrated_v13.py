@@ -196,19 +196,35 @@ def read_file(path: str):
 
 def load_period(cfg: configparser.ConfigParser,
                 start: date_type, n_days: int):
-    """Carica n_days giorni a partire da start; restituisce array numpy ordinati."""
+    """Carica n_days giorni a partire da start; restituisce array numpy ordinati.
+
+    Restituisce una 7-tupla:
+        (times, values, stds, counts, flags, valve_pos, valve_labels)
+    Gli ultimi 2 sono array numpy allineati agli altri SOLO se almeno un
+    file del periodo ha l'integrazione valve-scheduler attiva (header a
+    8 colonne). Altrimenti sono array vuoti — comportamento retrocompat
+    per la GUI che può fare `valve_pos.size > 0` per decidere se mostrare.
+    """
     all_t, all_v, all_s, all_c, all_f = [], [], [], [], []
+    all_vp, all_vl = [], []
+    n_with_valve = 0
     for i in range(n_days):
         d = start + timedelta(days=i)
-        # read_file ritorna 7 valori (le ultime 2 sono valve_pos e valve_labels,
-        # opzionali — disponibili se l'integrazione valve-scheduler è attiva nel
-        # logger). Per ora la GUI non le visualizza, quindi le ignoriamo.
-        t, v, s, c, f, _vp, _vl = read_file(build_filename(cfg, d))
+        t, v, s, c, f, vp, vl = read_file(build_filename(cfg, d))
         all_t.extend(t)
         all_v.extend(v)
         all_s.extend(s)
         all_c.extend(c)
         all_f.extend(f)
+        if vp:
+            all_vp.extend(vp)
+            all_vl.extend(vl)
+            n_with_valve += 1
+        else:
+            # File senza colonne valvola: padding con sentinelle per mantenere
+            # allineamento con gli altri array (se almeno un altro file le ha)
+            all_vp.extend([-1] * len(t))
+            all_vl.extend(["-"] * len(t))
     if not all_t:
         return None
     idx    = np.argsort(all_t)
@@ -217,7 +233,13 @@ def load_period(cfg: configparser.ConfigParser,
     stds   = np.array(all_s, dtype=float)[idx]
     counts = np.array(all_c, dtype=int)[idx]
     flags  = np.array(all_f)[idx]
-    return times, values, stds, counts, flags
+    if n_with_valve > 0:
+        valve_pos    = np.array(all_vp, dtype=int)[idx]
+        valve_labels = np.array(all_vl)[idx]
+    else:
+        valve_pos    = np.array([], dtype=int)
+        valve_labels = np.array([], dtype=str)
+    return times, values, stds, counts, flags, valve_pos, valve_labels
 
 
 def day_xlim(d: date_type):
@@ -294,6 +316,8 @@ class GraphWidget(QWidget):
         super().__init__(parent)
         self.cfg         = cfg
         self._night_poly = []   # patch zone notturne
+        self._valve_poly = []   # patch posizione valvola (striscia bassa)
+        self._valve_text = []   # label testuali "pos=N" lungo la striscia
         self._zoom_xlim  = None # None = vista libera
         self._zoom_ylim  = None
 
@@ -339,6 +363,17 @@ class GraphWidget(QWidget):
             self.chk_night.setChecked(True)
             self.chk_night.stateChanged.connect(self._reload)
             bar.addWidget(self.chk_night)
+
+        # Checkbox posizione valvola (striscia colorata in basso).
+        # Default ON: se i dati non la contengono, il disegno è automaticamente
+        # no-op (retrocompat con file _min.raw storici a 6 colonne).
+        self.chk_valve = QCheckBox("Posizione valvola")
+        self.chk_valve.setChecked(True)
+        self.chk_valve.setToolTip(
+            "Mostra una striscia colorata in basso con la posizione della\n"
+            "valvola VICI (richiede integration.ini abilitato).")
+        self.chk_valve.stateChanged.connect(self._reload)
+        bar.addWidget(self.chk_valve)
 
         btn_home = QPushButton("⌂ Home")
         btn_home.setToolTip("Torna alla vista completa")
@@ -473,6 +508,20 @@ class GraphWidget(QWidget):
                 pass
         self._night_poly = []
 
+        # ── Pulisci patch e label valvola dal ciclo precedente ─────────────
+        for p in self._valve_poly:
+            try:
+                p.remove()
+            except Exception:
+                pass
+        self._valve_poly = []
+        for t in self._valve_text:
+            try:
+                t.remove()
+            except Exception:
+                pass
+        self._valve_text = []
+
         if result is None:
             self.line.set_data([], [])
             self.sc_measure.set_offsets(np.empty((0, 2)))
@@ -486,7 +535,7 @@ class GraphWidget(QWidget):
             self._ignore_lim_change = False
             return
 
-        times, values, stds, counts, flags = result
+        times, values, stds, counts, flags, valve_pos, valve_labels = result
         xt = mdates.date2num(times)
 
         # ── Linea continua (tutti i punti) ────────────────────────────────
@@ -516,6 +565,57 @@ class GraphWidget(QWidget):
             self.flag_label.set_text("MEASURE")
             self.flag_label.set_color("#2060c0")
             self.flag_label.get_bbox_patch().set_edgecolor("#2060c0")
+
+        # ── Striscia posizione valvola (in basso, ymin=0..ymax=0.04 axes) ──
+        # Attiva solo se abbiamo dati valvola (integrazione valve-scheduler)
+        # E la checkbox è spuntata. Ogni run contiguo di stessa posizione
+        # diventa un axvspan colorato (cmap tab20 → 20 posizioni distinguibili).
+        want_valve = (hasattr(self, "chk_valve") and self.chk_valve.isChecked()
+                      and valve_pos.size == len(times))
+        if want_valve:
+            # Rileva i run contigui di stessa posizione (trascura -1 = sconosciuta)
+            from matplotlib import cm as _cm
+            cmap = _cm.get_cmap("tab20")
+            i = 0
+            while i < len(valve_pos):
+                cur_pos = int(valve_pos[i])
+                if cur_pos < 1:
+                    i += 1
+                    continue
+                j = i + 1
+                while j < len(valve_pos) and int(valve_pos[j]) == cur_pos:
+                    j += 1
+                x0 = xt[i]
+                x1 = xt[j-1] if j-1 < len(xt) else xt[-1]
+                # estendi x1 di mezzo minuto (medie 1-min) per coprire l'intervallo
+                x1_ext = x1 + (1.0 / (60 * 24)) * 0.5
+                color = cmap((cur_pos - 1) % 20)
+                patch = self.ax.axvspan(
+                    x0, x1_ext, ymin=0.0, ymax=0.04,
+                    color=color, alpha=0.85, zorder=1)
+                self._valve_poly.append(patch)
+                # Etichetta testuale sulla fascia solo se abbastanza larga (>5% del plot)
+                try:
+                    xmin, xmax = self.ax.get_xlim()
+                    width_frac = (x1_ext - x0) / max(1e-9, (xmax - xmin))
+                except Exception:
+                    width_frac = 1.0
+                if width_frac > 0.03:
+                    lab = str(valve_labels[i]) if valve_labels.size > i else ""
+                    if lab and lab != "-":
+                        text = f"{cur_pos} {lab}"
+                    else:
+                        text = str(cur_pos)
+                    txt = self.ax.text(
+                        (x0 + x1_ext) / 2.0, 0.02, text,
+                        transform=self.ax.get_xaxis_transform(),
+                        ha="center", va="center", fontsize=7,
+                        color="white", weight="bold",
+                        bbox=dict(facecolor=color, alpha=0.9,
+                                  edgecolor="none", pad=1),
+                        zorder=2)
+                    self._valve_text.append(txt)
+                i = j
 
         # ── Zone notturne ─────────────────────────────────────────────────
         want_night = ASTRAL_OK and hasattr(self, "chk_night") and self.chk_night.isChecked()
@@ -945,7 +1045,7 @@ class GMP343Monitor(QMainWindow):
             self.lbl_avg.setText("---"); self.lbl_cnt.setText("0")
             return
 
-        times, values, stds, counts, flags = result
+        times, values, stds, counts, flags, valve_pos, valve_labels = result
         last_co2  = float(values[-1])
         last_std  = float(stds[-1])
         last_n    = int(counts[-1])
