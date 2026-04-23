@@ -11,15 +11,16 @@ Formato file v3 (dal 2026-04-15, con T/RH):
   - Parser retrocompatibile col formato v2 (5 colonne, senza T/RH).
 """
 
-import sys, os
+import sys, os, logging
 from datetime import datetime, timedelta, timezone, date as date_type
 import configparser
+from pathlib import Path
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QVBoxLayout, QHBoxLayout, QLabel, QGroupBox,
     QGridLayout, QTabWidget, QPushButton,
-    QComboBox, QDateEdit, QCheckBox
+    QComboBox, QDateEdit, QCheckBox, QFrame, QMessageBox
 )
 from PyQt5.QtCore  import QTimer, Qt, QDate
 from PyQt5.QtGui   import QFont, QPixmap
@@ -35,6 +36,21 @@ from matplotlib.figure import Figure
 import matplotlib.dates  as mdates
 import matplotlib.ticker as mticker
 import numpy as np
+
+# ── valve-scheduler opzionale ─────────────────────────────────────────────────
+_VALVE_SCHED_DIR = os.path.expanduser("~/programs/valve-scheduler")
+try:
+    if _VALVE_SCHED_DIR not in sys.path:
+        sys.path.insert(0, _VALVE_SCHED_DIR)
+    from valvescheduler.core.config import load_cfg as vs_load_cfg
+    from valvescheduler.core.engine import ScheduleEngine
+    from valvescheduler.core.schedule import load_schedule_csv, save_schedule_csv, default_example
+    from valvescheduler.core.mqtt_pub import build_publisher as vs_build_publisher
+    from valvescheduler.hardware.vici_emtca import VICIEMTCA, VICIError, VICITimeout
+    from valvescheduler.gui.main_window import TabSchedule
+    _HAS_VALVE_SCHEDULER = True
+except ImportError:
+    _HAS_VALVE_SCHEDULER = False
 
 # ── astral opzionale ──────────────────────────────────────────────────────────
 try:
@@ -130,17 +146,23 @@ MISSING = -999.99
 def read_file(path: str):
     """
     Legge un file dati _min.
-    Supporta sia formato v3 (con T/RH, 9 colonne) sia v2 (solo CO2, 5 colonne):
-      v3: date time CO2 CO2_std T T_std RH RH_std n flag
-      v2: date time CO2 CO2_std n flag
+    Supporta sia formato v3 (con T/RH, 10+ colonne) sia v2 (solo CO2, 6+ colonne):
+      v3: date time CO2 CO2_std T T_std RH RH_std n flag [valve_pos valve_label]
+      v2: date time CO2 CO2_std n flag [valve_pos valve_label]
     Per i file v2 T e RH sono restituiti come MISSING.
+    Colonne valvola opzionali (integrazione valve-scheduler).
     Timestamp: YYYY-MM-DD HH:MM:SS
-    Ritorna: (times, values, stds, counts, flags, t, t_std, rh, rh_std)
+    Ritorna: (times, values, stds, counts, flags, t, t_std, rh, rh_std,
+              valve_pos, valve_labels)
     """
     times, values, stds, counts, flags = [], [], [], [], []
     ts_t, ts_tstd, ts_rh, ts_rhstd = [], [], [], []
+    valve_pos, valve_labels = [], []
+    has_valve_cols = False
     if not path or not os.path.exists(path):
-        return times, values, stds, counts, flags, ts_t, ts_tstd, ts_rh, ts_rhstd
+        return (times, values, stds, counts, flags,
+                ts_t, ts_tstd, ts_rh, ts_rhstd,
+                valve_pos, valve_labels)
     try:
         with open(path, "r", encoding="utf-8") as fh:
             for raw in fh:
@@ -174,6 +196,24 @@ def read_file(path: str):
                         t_val, t_std, rh_val, rh_std = MISSING, MISSING, MISSING, MISSING
                     if flag not in ("measure", "calib"):
                         flag = "measure"
+                    # Colonne opzionali valve-scheduler (dopo il flag)
+                    # v3: posizioni p[10], p[11]; v2: posizioni p[6], p[7]
+                    if remaining >= 7:
+                        # v3: valve dopo flag a p[9]
+                        valve_idx = 10
+                    else:
+                        # v2: valve dopo flag a p[5]
+                        valve_idx = 6
+                    if len(p) >= valve_idx + 2:
+                        has_valve_cols = True
+                        try:
+                            vpos = int(p[valve_idx])
+                        except ValueError:
+                            vpos = -1
+                        vlab = p[valve_idx + 1]
+                    else:
+                        vpos = -1
+                        vlab = "-"
                     times.append(dt)
                     values.append(co2)
                     stds.append(co2_std)
@@ -183,24 +223,34 @@ def read_file(path: str):
                     ts_tstd.append(t_std)
                     ts_rh.append(rh_val)
                     ts_rhstd.append(rh_std)
+                    valve_pos.append(vpos)
+                    valve_labels.append(vlab)
                 except ValueError:
                     continue
     except OSError:
         pass
-    return times, values, stds, counts, flags, ts_t, ts_tstd, ts_rh, ts_rhstd
+    if not has_valve_cols:
+        valve_pos, valve_labels = [], []
+    return (times, values, stds, counts, flags,
+            ts_t, ts_tstd, ts_rh, ts_rhstd,
+            valve_pos, valve_labels)
 
 
 def load_period(cfg: configparser.ConfigParser,
                 start: date_type, n_days: int):
     """
     Carica n_days giorni a partire da start; ritorna array numpy ordinati.
-    Tuple: (times, values, stds, counts, flags, t, t_std, rh, rh_std)
+    Tuple: (times, values, stds, counts, flags, t, t_std, rh, rh_std,
+            valve_pos, valve_labels)
+    valve_pos/valve_labels sono array vuoti se nessun file ha colonne valvola.
     """
     all_t, all_v, all_s, all_c, all_f = [], [], [], [], []
     all_tt, all_tstd, all_rh, all_rhstd = [], [], [], []
+    all_vp, all_vl = [], []
+    n_with_valve = 0
     for i in range(n_days):
         d = start + timedelta(days=i)
-        t, v, s, c, f, tt, tstd, rh, rhstd = read_file(build_filename(cfg, d))
+        t, v, s, c, f, tt, tstd, rh, rhstd, vp, vl = read_file(build_filename(cfg, d))
         all_t.extend(t)
         all_v.extend(v)
         all_s.extend(s)
@@ -210,6 +260,13 @@ def load_period(cfg: configparser.ConfigParser,
         all_tstd.extend(tstd)
         all_rh.extend(rh)
         all_rhstd.extend(rhstd)
+        if vp:
+            all_vp.extend(vp)
+            all_vl.extend(vl)
+            n_with_valve += 1
+        else:
+            all_vp.extend([-1] * len(t))
+            all_vl.extend(["-"] * len(t))
     if not all_t:
         return None
     idx     = np.argsort(all_t)
@@ -222,7 +279,15 @@ def load_period(cfg: configparser.ConfigParser,
     tstd    = np.array(all_tstd,  dtype=float)[idx]
     rh_arr  = np.array(all_rh,    dtype=float)[idx]
     rhstd   = np.array(all_rhstd, dtype=float)[idx]
-    return times, values, stds, counts, flags, t_arr, tstd, rh_arr, rhstd
+    if n_with_valve > 0:
+        valve_pos    = np.array(all_vp, dtype=int)[idx]
+        valve_labels = np.array(all_vl)[idx]
+    else:
+        valve_pos    = np.array([], dtype=int)
+        valve_labels = np.array([], dtype=str)
+    return (times, values, stds, counts, flags,
+            t_arr, tstd, rh_arr, rhstd,
+            valve_pos, valve_labels)
 
 
 def day_xlim(d: date_type):
@@ -307,6 +372,8 @@ class GraphWidget(QWidget):
         super().__init__(parent)
         self.cfg         = cfg
         self._night_poly = []   # patch zone notturne
+        self._valve_poly = []   # patch posizione valvola (striscia bassa)
+        self._valve_text = []   # label testuali "pos=N" lungo la striscia
         self._zoom_xlim  = None # None = vista libera
         self._zoom_ylim  = None
 
@@ -352,6 +419,17 @@ class GraphWidget(QWidget):
             self.chk_night.setChecked(True)
             self.chk_night.stateChanged.connect(self._reload)
             bar.addWidget(self.chk_night)
+
+        # Checkbox posizione valvola (striscia colorata in basso).
+        # Default ON: se i dati non la contengono, il disegno è automaticamente
+        # no-op (retrocompat con file _min.raw storici a 6 colonne).
+        self.chk_valve = QCheckBox("Posizione valvola")
+        self.chk_valve.setChecked(True)
+        self.chk_valve.setToolTip(
+            "Mostra una striscia colorata in basso con la posizione della\n"
+            "valvola VICI (richiede integration.ini abilitato).")
+        self.chk_valve.stateChanged.connect(self._reload)
+        bar.addWidget(self.chk_valve)
 
         btn_home = QPushButton("⌂ Home")
         btn_home.setToolTip("Torna alla vista completa")
@@ -515,6 +593,20 @@ class GraphWidget(QWidget):
                 pass
         self._night_poly = []
 
+        # ── Pulisci patch e label valvola dal ciclo precedente ─────────────
+        for p in self._valve_poly:
+            try:
+                p.remove()
+            except Exception:
+                pass
+        self._valve_poly = []
+        for t in self._valve_text:
+            try:
+                t.remove()
+            except Exception:
+                pass
+        self._valve_text = []
+
         if result is None:
             self.line.set_data([], [])
             self.line_t.set_data([], [])
@@ -530,7 +622,9 @@ class GraphWidget(QWidget):
             self._ignore_lim_change = False
             return
 
-        times, values, stds, counts, flags, t_arr, _tstd, rh_arr, _rhstd = result
+        (times, values, stds, counts, flags,
+         t_arr, _tstd, rh_arr, _rhstd,
+         valve_pos, valve_labels) = result
         xt = mdates.date2num(times)
         # Sostituisci MISSING con NaN per i plot (break nella linea, no Y axis esteso)
         values_plot = np.where(values == MISSING, np.nan, values)
@@ -570,6 +664,57 @@ class GraphWidget(QWidget):
             self.flag_label.set_text("MEASURE")
             self.flag_label.set_color("#2060c0")
             self.flag_label.get_bbox_patch().set_edgecolor("#2060c0")
+
+        # ── Striscia posizione valvola (in basso, ymin=0..ymax=0.04 axes) ──
+        # Attiva solo se abbiamo dati valvola (integrazione valve-scheduler)
+        # E la checkbox è spuntata. Ogni run contiguo di stessa posizione
+        # diventa un axvspan colorato (cmap tab20 → 20 posizioni distinguibili).
+        want_valve = (hasattr(self, "chk_valve") and self.chk_valve.isChecked()
+                      and valve_pos.size == len(times))
+        if want_valve:
+            # Rileva i run contigui di stessa posizione (trascura -1 = sconosciuta)
+            from matplotlib import cm as _cm
+            cmap = _cm.get_cmap("tab20")
+            i = 0
+            while i < len(valve_pos):
+                cur_pos = int(valve_pos[i])
+                if cur_pos < 1:
+                    i += 1
+                    continue
+                j = i + 1
+                while j < len(valve_pos) and int(valve_pos[j]) == cur_pos:
+                    j += 1
+                x0 = xt[i]
+                x1 = xt[j-1] if j-1 < len(xt) else xt[-1]
+                # estendi x1 di mezzo minuto (medie 1-min) per coprire l'intervallo
+                x1_ext = x1 + (1.0 / (60 * 24)) * 0.5
+                color = cmap((cur_pos - 1) % 20)
+                patch = self.ax.axvspan(
+                    x0, x1_ext, ymin=0.0, ymax=0.04,
+                    color=color, alpha=0.85, zorder=1)
+                self._valve_poly.append(patch)
+                # Etichetta testuale sulla fascia solo se abbastanza larga (>5% del plot)
+                try:
+                    xmin, xmax = self.ax.get_xlim()
+                    width_frac = (x1_ext - x0) / max(1e-9, (xmax - xmin))
+                except Exception:
+                    width_frac = 1.0
+                if width_frac > 0.03:
+                    lab = str(valve_labels[i]) if valve_labels.size > i else ""
+                    if lab and lab != "-":
+                        text = f"{cur_pos} {lab}"
+                    else:
+                        text = str(cur_pos)
+                    txt = self.ax.text(
+                        (x0 + x1_ext) / 2.0, 0.02, text,
+                        transform=self.ax.get_xaxis_transform(),
+                        ha="center", va="center", fontsize=7,
+                        color="white", weight="bold",
+                        bbox=dict(facecolor=color, alpha=0.9,
+                                  edgecolor="none", pad=1),
+                        zorder=2)
+                    self._valve_text.append(txt)
+                i = j
 
         # ── Zone notturne ─────────────────────────────────────────────────
         want_night = ASTRAL_OK and hasattr(self, "chk_night") and self.chk_night.isChecked()
@@ -780,6 +925,268 @@ class GraphWidget(QWidget):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Tab Valvola VICI (valve-scheduler integrato)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TabValve(QWidget):
+    """Tab integrata del valve-scheduler nel monitor CO2.
+
+    Wrappa header connessione + TabSchedule dal package valvescheduler.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._valve = None
+        self._engine = None
+        self._publisher = None
+        self._vs_cfg = None
+        self._program_dir = Path(_VALVE_SCHED_DIR)
+        self._log = logging.getLogger("valve-tab")
+        self._build_ui()
+        self._load_valve_config()
+
+    def _load_valve_config(self):
+        ini_path = self._program_dir / "config" / "valve-scheduler.ini"
+        if ini_path.exists():
+            self._vs_cfg = vs_load_cfg(str(ini_path))
+            self._publisher = vs_build_publisher(self._vs_cfg)
+            n = int(self._vs_cfg.get("n_positions", 10))
+            self._tab_sched.set_n_positions(n)
+            # Porta VICI: usa /dev/vici se esiste, altrimenti da config
+            if os.path.exists("/dev/vici"):
+                self._vs_cfg["serial_port"] = "/dev/vici"
+            sched_path = self._vs_cfg.get("schedule_file", "schedule/schedule.csv")
+            if not Path(sched_path).is_absolute():
+                sched_path = self._program_dir / sched_path
+            self._tab_sched.load_initial(Path(sched_path))
+            self._tab_sched._chk_loop.setChecked(
+                bool(self._vs_cfg.get("loop_enabled", True)))
+            self._log.info("config valve-scheduler caricata da %s", ini_path)
+            # Auto-connect se richiesto dall'INI
+            if self._vs_cfg.get("auto_connect"):
+                QTimer.singleShot(500, self._connect_valve)
+        else:
+            self._log.warning("INI valve-scheduler non trovato: %s", ini_path)
+
+    def _build_ui(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 6, 6, 6)
+
+        # Header: connessione valvola
+        hdr = QHBoxLayout()
+        self._btn_connect = QPushButton("Apri porta VICI")
+        self._btn_connect.clicked.connect(self._on_connect_clicked)
+        hdr.addWidget(self._btn_connect)
+        self._btn_configure = QPushButton("Configura attuatore")
+        self._btn_configure.setToolTip(
+            "IFM1 + AM3 + SM A + NP (multiposizione)")
+        self._btn_configure.clicked.connect(self._on_configure_clicked)
+        self._btn_configure.setEnabled(False)
+        hdr.addWidget(self._btn_configure)
+        self._btn_home = QPushButton("Home")
+        self._btn_home.setToolTip("HM — posizione 1")
+        self._btn_home.clicked.connect(self._on_home_clicked)
+        self._btn_home.setEnabled(False)
+        hdr.addWidget(self._btn_home)
+        hdr.addStretch()
+        self._lbl_valve_status = QLabel("valvola: non connessa")
+        self._lbl_valve_status.setStyleSheet(
+            "color:#8b8b8b;font-weight:bold;")
+        hdr.addWidget(self._lbl_valve_status)
+        lay.addLayout(hdr)
+
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFrameShadow(QFrame.Sunken)
+        lay.addWidget(line)
+
+        # TabSchedule riusato dal package valve-scheduler
+        service_dir = self._program_dir / "service"
+        service_dir.mkdir(parents=True, exist_ok=True)
+        self._tab_sched = TabSchedule(
+            service_dir=service_dir,
+            n_positions=10)
+        lay.addWidget(self._tab_sched, stretch=1)
+
+        # Wire signals
+        self._tab_sched.start_requested.connect(self._on_start)
+        self._tab_sched.stop_requested.connect(self._on_stop)
+        self._tab_sched.pause_requested.connect(self._on_pause)
+        self._tab_sched.resume_requested.connect(self._on_resume)
+        self._tab_sched.skip_requested.connect(self._on_skip)
+        self._tab_sched.loop_toggled.connect(self._on_loop_toggled)
+        self._tab_sched.go_position_requested.connect(self._on_manual_go)
+
+    # ── connessione valvola ──────────────────────────────────────────────
+    def _on_connect_clicked(self):
+        if self._valve is None:
+            self._connect_valve()
+        else:
+            self._disconnect_valve()
+
+    def _connect_valve(self):
+        if not self._vs_cfg:
+            QMessageBox.warning(self, "Config mancante",
+                                "File valve-scheduler.ini non trovato.")
+            return
+        try:
+            v = VICIEMTCA(
+                port=self._vs_cfg["serial_port"],
+                baud=int(self._vs_cfg.get("serial_baud", 9600)),
+                timeout=float(self._vs_cfg.get("serial_timeout", 2.0)),
+                dev_id=self._vs_cfg.get("serial_dev_id", ""),
+                rs485=bool(self._vs_cfg.get("serial_rs485", False)))
+            v.open()
+            try:
+                fw = v.ping()
+            except VICITimeout:
+                v.close()
+                QMessageBox.critical(
+                    self, "Nessuna risposta",
+                    "Porta aperta ma attuatore non risponde.\n"
+                    "Controllare cavo e alimentazione.")
+                return
+            self._valve = v
+            self._log.info("VICI connesso — FW: %s", fw)
+            if self._vs_cfg.get("configure_on_start"):
+                try:
+                    v.configure_multiposition(
+                        n_positions=int(self._vs_cfg["n_positions"]),
+                        go_home=bool(self._vs_cfg.get("go_home_on_start", False)))
+                except Exception as exc:
+                    self._log.warning("configure_on_start: %s", exc)
+            self._btn_connect.setText("Chiudi porta VICI")
+            self._btn_configure.setEnabled(True)
+            self._btn_home.setEnabled(True)
+            self._lbl_valve_status.setText(f"valvola: connessa  (FW: {fw})")
+            self._lbl_valve_status.setStyleSheet(
+                "color:#1a7f37;font-weight:bold;")
+        except Exception as exc:
+            QMessageBox.critical(self, "Errore apertura", str(exc))
+
+    def _disconnect_valve(self):
+        if self._engine and self._engine.isRunning():
+            QMessageBox.warning(self, "Schedule in corso",
+                                "Ferma lo schedule prima di chiudere.")
+            return
+        if self._valve:
+            try:
+                self._valve.close()
+            except Exception:
+                pass
+            self._valve = None
+        self._btn_connect.setText("Apri porta VICI")
+        self._btn_configure.setEnabled(False)
+        self._btn_home.setEnabled(False)
+        self._lbl_valve_status.setText("valvola: non connessa")
+        self._lbl_valve_status.setStyleSheet(
+            "color:#8b8b8b;font-weight:bold;")
+
+    def _on_configure_clicked(self):
+        if not self._valve:
+            return
+        try:
+            self._valve.configure_multiposition(
+                n_positions=int(self._vs_cfg["n_positions"]),
+                go_home=True)
+            QMessageBox.information(
+                self, "OK",
+                f"Attuatore configurato multipos ({self._vs_cfg['n_positions']} pos).")
+        except Exception as exc:
+            QMessageBox.warning(self, "Errore", str(exc))
+
+    def _on_home_clicked(self):
+        if self._valve:
+            try:
+                self._valve.home()
+            except Exception as exc:
+                QMessageBox.warning(self, "Errore", str(exc))
+
+    def _on_manual_go(self, position):
+        if not self._valve:
+            QMessageBox.warning(self, "Non connesso",
+                                "Apri prima la porta VICI.")
+            return
+        try:
+            self._valve.go_to(position)
+        except Exception as exc:
+            QMessageBox.warning(self, "Errore", str(exc))
+
+    # ── engine ───────────────────────────────────────────────────────────
+    def _on_start(self):
+        if self._engine and self._engine.isRunning():
+            return
+        if not self._valve:
+            QMessageBox.warning(self, "Non connesso",
+                                "Apri prima la porta VICI.")
+            return
+        schedule = self._tab_sched.get_schedule()
+        errs = schedule.validate(int(self._vs_cfg["n_positions"]))
+        if errs:
+            QMessageBox.warning(
+                self, "Schedule non valido",
+                "Errori:\n - " + "\n - ".join(errs))
+            return
+        self._tab_sched._persist()
+        status_file = self._vs_cfg.get("status_file",
+                                        "service/valve_status.json")
+        if not Path(status_file).is_absolute():
+            status_file = self._program_dir / status_file
+        self._engine = ScheduleEngine(
+            valve=self._valve,
+            schedule=schedule,
+            loop_enabled=self._tab_sched._chk_loop.isChecked(),
+            status_file=Path(status_file),
+            mqtt_publish=(self._publisher.publish
+                          if self._publisher else None),
+            mqtt_topic=self._vs_cfg.get("mqtt_topic", "valve/status"),
+        )
+        self._engine.status_changed.connect(self._tab_sched.on_status)
+        self._engine.log_msg.connect(
+            lambda msg: self._log.info("[engine] %s", msg))
+        self._engine.start()
+        self._log.info("schedule avviato — %d step", len(schedule))
+
+    def _on_stop(self):
+        if self._engine:
+            self._engine.stop()
+
+    def _on_pause(self):
+        if self._engine:
+            self._engine.pause()
+
+    def _on_resume(self):
+        if self._engine:
+            self._engine.resume()
+
+    def _on_skip(self):
+        if self._engine:
+            self._engine.skip_current_step()
+
+    def _on_loop_toggled(self, enabled):
+        if self._vs_cfg:
+            self._vs_cfg["loop_enabled"] = enabled
+        if self._engine and self._engine.isRunning():
+            self._engine.set_loop_enabled(enabled)
+
+    # ── cleanup ──────────────────────────────────────────────────────────
+    def cleanup(self):
+        if self._engine and self._engine.isRunning():
+            self._engine.stop()
+            self._engine.wait(3000)
+        if self._publisher:
+            try:
+                self._publisher.stop()
+            except Exception:
+                pass
+        if self._valve:
+            try:
+                self._valve.close()
+            except Exception:
+                pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  Finestra principale
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -860,6 +1267,11 @@ class GMP343Monitor(QMainWindow):
         self.setCentralWidget(tabs)
         tabs.addTab(self._build_monitor_tab(), "📊  Monitor")
         tabs.addTab(self._build_graph_tab(),   "📈  Grafico")
+        if _HAS_VALVE_SCHEDULER:
+            self.tab_valve = TabValve()
+            tabs.addTab(self.tab_valve, "🔧  Valvola VICI")
+        else:
+            self.tab_valve = None
         tabs.setStyleSheet("QTabBar::tab { padding: 6px 18px; font-size: 11pt; }")
 
     # ── tab monitor ───────────────────────────────────────────────────────────
@@ -1031,7 +1443,9 @@ class GMP343Monitor(QMainWindow):
             self.lbl_avg.setText("---"); self.lbl_cnt.setText("0")
             return
 
-        times, values, stds, counts, flags, t_arr, _tstd, rh_arr, _rhstd = result
+        (times, values, stds, counts, flags,
+         t_arr, _tstd, rh_arr, _rhstd,
+         valve_pos, valve_labels) = result
         last_co2  = float(values[-1])
         last_std  = float(stds[-1])
         last_n    = int(counts[-1])
@@ -1099,6 +1513,8 @@ class GMP343Monitor(QMainWindow):
         # GUI-001/ARCH-004: ferma timer; GUI-002: rilascia Figure matplotlib
         self.timer.stop()
         self.graph.cleanup()
+        if self.tab_valve:
+            self.tab_valve.cleanup()
         event.accept()
 
 

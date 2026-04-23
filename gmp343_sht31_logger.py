@@ -10,14 +10,19 @@ Formato file v3 (dal 2026-04-15, con T/RH):
   - Nome: carbocap343_<site>_<YYYYMMDD>_p00_min.raw (underscore, non trattini)
   - Data/ora: YYYY-MM-DD HH:MM:SS (con trattini e due punti)
   - Header raw:  #date time CO2[PPM] T[C] RH[%] flag
-  - Header _min: #date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag
+  - Header _min: #date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag [valve_pos valve_label]
   - Std in PPM assoluto (non percentuale)
-  - Flag fisso: measure
+  - Flag: measure o calib
+    - Se calib_auto=false in integration.ini (default): flag fisso "measure"
+    - Se calib_auto=true: flag determinato dalla valve_label corrente
+      (le label in calib_labels → "calib", le altre → "measure")
   - Dato mancante (sensore assente, errore I2C, minuto vuoto) → -999.99
 """
 import serial
 import time
-from datetime import datetime
+import json
+import tempfile
+from datetime import datetime, timezone
 import os
 import sys
 import statistics
@@ -29,13 +34,53 @@ try:
 except ImportError:
     _HAS_SMBUS = False
 
+# ── Integrazione valve-scheduler (opt-in) ─────────────────────────────────────
+# Import tollerante: se il modulo manca o integration.ini non c'è, il logger
+# si comporta esattamente come prima (formato file invariato).
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from gmp343_valve_state import format_for_raw as valve_format_for_raw
+    from gmp343_valve_state import get_flag as valve_get_flag
+    _HAS_VALVE_MODULE = True
+except ImportError:
+    _HAS_VALVE_MODULE = False
+
 # ── Percorsi ──────────────────────────────────────────────────────────────────
-CONFIG_DIR = os.path.expanduser("~/programs/CO2/config")
-NAME_INI   = os.path.join(CONFIG_DIR, "name.ini")
-SERIAL_INI = os.path.join(CONFIG_DIR, "serial.ini")
-SITE_INI   = os.path.join(CONFIG_DIR, "site.ini")
+CONFIG_DIR      = os.path.expanduser("~/programs/CO2/config")
+NAME_INI        = os.path.join(CONFIG_DIR, "name.ini")
+SERIAL_INI      = os.path.join(CONFIG_DIR, "serial.ini")
+SITE_INI        = os.path.join(CONFIG_DIR, "site.ini")
+INTEGRATION_INI = os.path.join(CONFIG_DIR, "integration.ini")  # opzionale
 
 CMD_START = b"R\r\n"
+
+# ── Status JSON per acq-tools ────────────────────────────────────────────────
+STATUS_JSON = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "shared", "ipc_co2", "status.json")
+
+
+def _write_status_json(instrument_connected, last_co2=None, last_t=None, last_rh=None):
+    """Scrive status.json atomicamente (tmp + rename) per acq-tools.
+
+    Aggiorna l'mtime — acq-tools considera stale dopo 120s.
+    """
+    status = {
+        "instrument_connected": instrument_connected,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "last_co2_ppm": last_co2,
+        "last_t_c": last_t,
+        "last_rh_pct": last_rh,
+    }
+    try:
+        os.makedirs(os.path.dirname(STATUS_JSON), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            dir=os.path.dirname(STATUS_JSON), suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump(status, f)
+        os.replace(tmp, STATUS_JSON)
+    except OSError as e:
+        print(f"WARN: status.json write failed: {e}")
 
 # Sentinel unico per tutti i valori mancanti (CO2, T, RH, std)
 MISSING = -999.99
@@ -88,6 +133,31 @@ def read_sht31(bus):
         return MISSING, MISSING
 
 
+def load_valve_integration():
+    """Carica la config integrazione valve-scheduler (opt-in, retrocompat).
+
+    Restituisce (enabled, status_file, stale_after_s, calib_auto, calib_labels).
+    Se integration.ini non esiste o il modulo valve_state non è importabile,
+    enabled=False — il logger scrive nel formato storico senza colonne valvola.
+    Se calib_auto=True, il flag measure/calib è determinato dalla valve_label.
+    """
+    if not _HAS_VALVE_MODULE or not os.path.exists(INTEGRATION_INI):
+        return (False, "", 10.0, False, [])
+    cp = configparser.ConfigParser()
+    cp.read(INTEGRATION_INI)
+    if not cp.has_section("valve_scheduler"):
+        return (False, "", 10.0, False, [])
+    enabled = cp.getboolean("valve_scheduler", "enabled", fallback=False)
+    status_file = cp.get("valve_scheduler", "status_file",
+                         fallback="~/programs/valve-scheduler/service/valve_status.json")
+    stale = cp.getfloat("valve_scheduler", "stale_after_s", fallback=10.0)
+    calib_auto = cp.getboolean("valve_scheduler", "calib_auto", fallback=False)
+    calib_labels_raw = cp.get("valve_scheduler", "calib_labels", fallback="")
+    calib_labels = [s.strip() for s in calib_labels_raw.split(",") if s.strip()]
+    return (enabled, os.path.expanduser(status_file), stale,
+            calib_auto, calib_labels)
+
+
 def get_data_dir(config) -> str:
     """Legge data_path da name.ini ed espande ~ ; crea la cartella se mancante."""
     raw = config.get("output", "data_path", fallback="~/data")
@@ -112,14 +182,17 @@ def get_filenames(config):
     avg_file  = os.path.join(data_dir, f"{basename}_{site_name}_{today}_p00_min.{extension}")
     return raw_file, avg_file
 
-def write_headers_if_needed(raw_file, avg_file, config):
+def write_headers_if_needed(raw_file, avg_file, config, valve_enabled=False):
     """
     Scrive header nei file se non esistono.
     RAW: #date time CO2[PPM] T[C] RH[%] flag
-    MIN: #date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag
+    MIN: #date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag [valve_pos valve_label]
     """
     raw_header = "#date time CO2[PPM] T[C] RH[%] flag"
-    avg_header = "#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag"
+    if valve_enabled:
+        avg_header = "#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag valve_pos valve_label"
+    else:
+        avg_header = "#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag"
 
     if not os.path.exists(raw_file):
         with open(raw_file, 'w') as f:
@@ -156,10 +229,49 @@ def mean_std_missing(values):
     std = statistics.stdev(clean) if len(clean) > 1 else 0.0
     return avg, std
 
+def _valve_suffix(valve_enabled, valve_status_file, valve_stale_s):
+    """Restituisce la stringa ' <pos> <label>' se integrazione attiva, altrimenti ''.
+
+    Nota: inizia con uno spazio per comporre la riga `_min.raw`.
+    Sentinelle se il file manca/stale: ' -1 -'.
+    """
+    if not valve_enabled:
+        return ""
+    try:
+        pos_s, lab_s = valve_format_for_raw(valve_status_file, valve_stale_s)
+        return f" {pos_s} {lab_s}"
+    except Exception:
+        return " -1 -"
+
+
+def _auto_flag(calib_auto, valve_enabled, valve_status_file, valve_stale_s, calib_labels):
+    """Determina il flag measure/calib in base alla valvola (se calib_auto attivo).
+
+    Se calib_auto è False o la valvola non è abilitata: ritorna 'measure'.
+    """
+    if not calib_auto or not valve_enabled:
+        return "measure"
+    try:
+        return valve_get_flag(valve_status_file, valve_stale_s, calib_labels)
+    except Exception:
+        return "measure"
+
 
 def main():
     config = load_config()
     get_data_dir(config)
+
+    # Integrazione valve-scheduler (opt-in, letta una volta all'avvio)
+    (valve_enabled, valve_status_file, valve_stale_s,
+     calib_auto, calib_labels) = load_valve_integration()
+    if valve_enabled:
+        print(f"[integration] valve-scheduler ATTIVA — status_file={valve_status_file}")
+        if calib_auto:
+            print(f"[integration] calib_auto ATTIVO — calib_labels={calib_labels}")
+        else:
+            print("[integration] calib_auto disattivo — flag sempre 'measure'")
+    else:
+        print("[integration] valve-scheduler disattiva (formato file storico)")
 
     device = config.get('serial', 'port', fallback='/dev/ttyUSB0')
     baudrate = config.getint('serial', 'baudrate', fallback=19200)
@@ -187,14 +299,18 @@ def main():
         return
 
     sht31_bus = open_sht31_bus()
+    _write_status_json(True)  # seriale aperta → strumento connesso
 
     co2_values = []
     t_values   = []
     rh_values  = []
+    _last_co2 = None  # ultimo valore per status.json
+    _last_t   = None
+    _last_rh  = None
     current_minute = datetime.utcnow().replace(second=0, microsecond=0)
 
     raw_file, avg_file = get_filenames(config)
-    write_headers_if_needed(raw_file, avg_file, config)
+    write_headers_if_needed(raw_file, avg_file, config, valve_enabled)
 
     print(f"Logging started. Raw: {raw_file}, Min: {avg_file}")
     print(f"Serial: {device} @ {baudrate} bps; I2C bus {SHT31_BUS} addr 0x{SHT31_ADDR:02x}")
@@ -207,7 +323,7 @@ def main():
             new_raw_file, new_avg_file = get_filenames(config)
             if new_raw_file != raw_file or new_avg_file != avg_file:
                 raw_file, avg_file = new_raw_file, new_avg_file
-                write_headers_if_needed(raw_file, avg_file, config)
+                write_headers_if_needed(raw_file, avg_file, config, valve_enabled)
                 print(f"New day. New files: {raw_file}, {avg_file}")
 
             if line:
@@ -217,8 +333,11 @@ def main():
                 if co2 is not None:
                     t, rh = read_sht31(sht31_bus)
 
+                    flag = _auto_flag(calib_auto, valve_enabled,
+                                      valve_status_file, valve_stale_s, calib_labels)
+
                     with open(raw_file, 'a') as f_raw:
-                        f_raw.write(f"{ts_str} {co2:.2f} {t:.2f} {rh:.2f} measure\n")
+                        f_raw.write(f"{ts_str} {co2:.2f} {t:.2f} {rh:.2f} {flag}\n")
 
                     if current_timestamp.replace(second=0, microsecond=0) == current_minute:
                         co2_values.append(co2)
@@ -235,12 +354,19 @@ def main():
                                 co2_avg, co2_std, n_co2 = MISSING, MISSING, 0
                             t_avg,  t_std  = mean_std_missing(t_values)
                             rh_avg, rh_std = mean_std_missing(rh_values)
+                            flag = _auto_flag(calib_auto, valve_enabled,
+                                              valve_status_file, valve_stale_s, calib_labels)
+                            valve_suf = _valve_suffix(valve_enabled, valve_status_file, valve_stale_s)
                             f_avg.write(
                                 f"{ts_avg} {co2_avg:.2f} {co2_std:.2f} "
                                 f"{t_avg:.2f} {t_std:.2f} "
                                 f"{rh_avg:.2f} {rh_std:.2f} "
-                                f"{n_co2} measure\n"
+                                f"{n_co2} {flag}{valve_suf}\n"
                             )
+                        _last_co2 = co2_avg if co2_avg != MISSING else None
+                        _last_t   = t_avg   if t_avg   != MISSING else None
+                        _last_rh  = rh_avg  if rh_avg  != MISSING else None
+                        _write_status_json(True, _last_co2, _last_t, _last_rh)
                         current_minute = current_timestamp.replace(second=0, microsecond=0)
                         co2_values = [co2]
                         t_values   = [t]
@@ -249,11 +375,14 @@ def main():
                 if now.replace(second=0, microsecond=0) != current_minute:
                     with open(avg_file, 'a') as f_avg:
                         ts_avg = current_minute.strftime("%Y-%m-%d %H:%M:%S")
+                        flag = _auto_flag(calib_auto, valve_enabled,
+                                          valve_status_file, valve_stale_s, calib_labels)
+                        valve_suf = _valve_suffix(valve_enabled, valve_status_file, valve_stale_s)
                         f_avg.write(
                             f"{ts_avg} {MISSING:.2f} {MISSING:.2f} "
                             f"{MISSING:.2f} {MISSING:.2f} "
                             f"{MISSING:.2f} {MISSING:.2f} "
-                            f"0 measure\n"
+                            f"0 {flag}{valve_suf}\n"
                         )
                     current_minute = now.replace(second=0, microsecond=0)
                     co2_values = []
@@ -261,13 +390,16 @@ def main():
                     rh_values  = []
         except serial.SerialException as e:
             print(f"Serial communication error: {e}. Retrying in 5 seconds...")
+            _write_status_json(False)
             ser.close()
             time.sleep(5)
             try:
                 ser.open()
                 ser.write(CMD_START)
+                _write_status_json(True, _last_co2, _last_t, _last_rh)
             except serial.SerialException as reopen_e:
                 print(f"Unable to reopen serial port: {reopen_e}. Exiting.")
+                _write_status_json(False)
                 break
         except Exception as e:
             print(f"Unexpected error: {e}")

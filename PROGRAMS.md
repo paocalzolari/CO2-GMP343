@@ -1,7 +1,7 @@
 # CO2 / GMP343 — Stato programmi correnti
 
 Documento di riferimento sui programmi attivi nella cartella `programs/CO2/`.
-Aggiornato il: **2026-04-15**
+Aggiornato il: **2026-04-23**
 
 > ⚠️ Mantenere questo file allineato. Per rigenerarlo automaticamente usare la
 > skill `co2-status` (`~/.claude/skills/co2-status/`).
@@ -50,9 +50,12 @@ Aggiornato il: **2026-04-15**
 - Nome file: `carbocap343_<site>_<YYYYMMDD>_p00_min.raw` (con underscore, non trattini)
 - Data/ora: `YYYY-MM-DD HH:MM:SS`
 - Header `raw`: `#date time CO2[PPM] T[C] RH[%] flag`
-- Header `_min`: `#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag`
+- Header `_min`: `#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag [valve_pos valve_label]`
 - Std in **PPM assoluto** (non percentuale). T_std in °C, RH_std in %.
-- Flag: `measure` o `calib` (modificabile da GUI in `gmp343_sht31_calib.py`)
+- Flag: `measure` o `calib`
+  - Con `calib_auto=true` in `config/integration.ini`: determinato automaticamente
+    dalla `valve_label` corrente (le label in `calib_labels` → `calib`, le altre → `measure`)
+  - Senza `calib_auto`: flag `measure` fisso (backend) o manuale (GUI calib)
 - Sentinel per dato mancante: `-999.99` (CO2 non acquisito, SHT31 non
   raggiungibile, minuto vuoto). La GUI filtra queste sentinelle dalle
   statistiche e dal plot.
@@ -147,7 +150,41 @@ quando necessario. `CO2 Monitor` non apre terminale (è solo una GUI Qt).
 
 ---
 
-## Procedura calibrazione
+## Calibrazione automatica via valve-scheduler (modo principale)
+
+Con `calib_auto=true` in `config/integration.ini`, il **backend headless**
+(`gmp343_sht31_logger.py`) determina il flag `measure`/`calib` automaticamente
+dalla posizione della valvola VICI, senza bisogno di intervento manuale:
+
+- Le `valve_label` elencate in `calib_labels` (es. `zero,span,span-low,span-high`)
+  → flag **`calib`**
+- Tutte le altre label (es. `sample`, `ambient`) → flag **`measure`**
+- Valvola non raggiungibile / label sconosciuta → flag **`measure`** (fallback sicuro)
+
+### Come attivare
+
+Edit `config/integration.ini`:
+
+```ini
+[valve_scheduler]
+enabled       = true
+status_file   = ~/programs/valve-scheduler/service/valve_status.json
+stale_after_s = 10
+calib_auto    = true
+calib_labels  = zero,span,span-low,span-high
+```
+
+Poi: `sudo systemctl restart co2-logger`
+
+Il backend headless gestisce tutto in automatico seguendo lo schedule della
+valvola. Non serve fermare il service né usare la GUI di calibrazione.
+
+---
+
+## Procedura calibrazione manuale (modo legacy)
+
+Se il valve-scheduler non è disponibile o per calibrazioni manuali estemporanee,
+resta disponibile la procedura manuale con `gmp343_sht31_calib.py`.
 
 Il backend systemd e `gmp343_sht31_calib.py` **non possono girare insieme**:
 entrambi vogliono `/dev/gmp343` e scrivono sugli stessi file giornalieri.
