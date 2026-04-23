@@ -128,13 +128,25 @@ def _startup_log():
 def read_file(path: str):
     """
     Legge un file dati formato v2.
-    Formato: #date time CO2[PPM] CO2_std[PPM] ndata_60s_mean flag
-    Timestamp: YYYY-MM-DD HH:MM:SS
-    Restituisce liste (times, values, stds_ppm, counts, flags).
+
+    Header base (6 colonne):
+      #date time CO2[PPM] CO2_std[PPM] ndata_60s_mean flag
+
+    Header esteso con integrazione valve-scheduler (8 colonne):
+      #date time CO2[PPM] CO2_std[PPM] ndata_60s_mean flag valve_pos valve_label
+
+    Il parser è retrocompatibile: se le 2 colonne extra mancano, ritorna
+    liste `valve_pos=[]` e `valve_labels=[]` vuote (lunghezza 0).
+    Altrimenti quelle liste hanno la stessa lunghezza delle altre.
+
+    Timestamp: YYYY-MM-DD HH:MM:SS.
+    Restituisce (times, values, stds_ppm, counts, flags, valve_pos, valve_labels).
     """
     times, values, stds, counts, flags = [], [], [], [], []
+    valve_pos, valve_labels = [], []
+    has_valve_cols = False  # diventa True se almeno una riga ha 8 colonne
     if not path or not os.path.exists(path):
-        return times, values, stds, counts, flags
+        return times, values, stds, counts, flags, valve_pos, valve_labels
     try:
         with open(path, "r", encoding="utf-8") as fh:
             for raw in fh:
@@ -144,7 +156,7 @@ def read_file(path: str):
                 if len(p) < 3:
                     continue
                 try:
-                    # Parser: YYYY-MM-DD HH:MM:SS CO2 [std_ppm n flag]
+                    # Parser: YYYY-MM-DD HH:MM:SS CO2 [std_ppm n flag [valve_pos valve_label]]
                     dt  = datetime.strptime(f"{p[0]} {p[1]}", "%Y-%m-%d %H:%M:%S")
                     co2 = float(p[2])
                     std = float(p[3]) if len(p) >= 4 else 0.0
@@ -152,16 +164,34 @@ def read_file(path: str):
                     flag= p[5].lower() if len(p) >= 6 else "measure"
                     if flag not in ("measure", "calib"):
                         flag = "measure"
+                    # Colonne opzionali valve-scheduler (se header a 8 colonne)
+                    if len(p) >= 8:
+                        has_valve_cols = True
+                        try:
+                            vpos = int(p[6])
+                        except ValueError:
+                            vpos = -1
+                        vlab = p[7]
+                    else:
+                        vpos = -1
+                        vlab = "-"
                     times.append(dt)
                     values.append(co2)
                     stds.append(std)   # std in PPM
                     counts.append(n)
                     flags.append(flag)
+                    # popola le liste valvola solo se almeno una riga ha i dati,
+                    # così le GUI che non le usano vedono liste vuote come prima.
+                    valve_pos.append(vpos)
+                    valve_labels.append(vlab)
                 except ValueError:
                     continue
     except OSError:
         pass
-    return times, values, stds, counts, flags
+    if not has_valve_cols:
+        # retrocompatibilità totale: liste vuote se file "vecchio"
+        valve_pos, valve_labels = [], []
+    return times, values, stds, counts, flags, valve_pos, valve_labels
 
 
 def load_period(cfg: configparser.ConfigParser,
@@ -170,7 +200,10 @@ def load_period(cfg: configparser.ConfigParser,
     all_t, all_v, all_s, all_c, all_f = [], [], [], [], []
     for i in range(n_days):
         d = start + timedelta(days=i)
-        t, v, s, c, f = read_file(build_filename(cfg, d))
+        # read_file ritorna 7 valori (le ultime 2 sono valve_pos e valve_labels,
+        # opzionali — disponibili se l'integrazione valve-scheduler è attiva nel
+        # logger). Per ora la GUI non le visualizza, quindi le ignoriamo.
+        t, v, s, c, f, _vp, _vl = read_file(build_filename(cfg, d))
         all_t.extend(t)
         all_v.extend(v)
         all_s.extend(s)

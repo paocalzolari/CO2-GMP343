@@ -165,6 +165,13 @@ Header file `_min` (formato v2 in uso dal 2026):
 #date time CO2[PPM] CO2_std[PPM] ndata_60s_mean flag
 ```
 
+Con integrazione **valve-scheduler** attiva (opzionale, vedere sezione
+sotto) l'header `_min` ha **2 colonne aggiuntive**:
+
+```text
+#date time CO2[PPM] CO2_std[PPM] ndata_60s_mean flag valve_pos valve_label
+```
+
 Caratteristiche formato v2:
 
 - Underscore nei nomi file (non più trattini)
@@ -172,6 +179,8 @@ Caratteristiche formato v2:
 - SD in **ppm assoluto**, non percentuale
 - `flag` ∈ {`measure`, `calib`} — `calib` solo durante sessioni di taratura
 - Sentinella per minuto senza dati validi: `999.99 0.00 0`
+- `valve_pos`: intero 1..N, sentinella `-1` se valve-scheduler non risponde
+- `valve_label`: etichetta dello step (es. `span-low`), sentinella `-` se vuota
 
 > Le sentinelle qui (`999.99` per CO₂ mancante) sono **diverse** da quelle
 > usate da o3-monitor / nox-monitor (`-99.9`). È un'eredità storica del
@@ -232,6 +241,68 @@ bash install_libraries.sh                  # PyQt5, pyserial, matplotlib, numpy,
 sudo bash autoexec/install-systemd.sh      # installa e abilita il service
 cp autoexec/Monitor-GMP343.desktop ~/.config/autostart/
 crontab autoexec/crontab.txt
+```
+
+## Integrazione con valve-scheduler (opzionale, opt-in)
+
+Sul Raspberry Pi 5 il logger può annotare ad ogni minuto la **posizione
+della valvola multiposizione VICI** pilotata dal programma
+[~/programs/valve-scheduler/](../valve-scheduler/) (driver EMTCA-CE,
+valvola 10 vie).
+
+L'integrazione è **opt-in, disabilitata di default** e **retrocompatibile**:
+senza attivarla, il logger scrive i file `_min.raw` identici a prima
+(6 colonne), come è sempre stato.
+
+### Come funziona
+
+1. Il `valve-scheduler` pubblica il suo stato corrente in un file JSON
+   atomico: `~/programs/valve-scheduler/service/valve_status.json`
+   (scritto via tmp + rename, safe da leggere senza lock).
+2. Il modulo [`gmp343_valve_state.py`](gmp343_valve_state.py) legge quel
+   JSON con cache per mtime e tolleranza totale agli errori (file mancante,
+   JSON corrotto, stato stale → sentinelle `-1 -`).
+3. Al momento del dump della media 1-min, il logger chiama
+   `format_for_raw()` e aggiunge 2 colonne: `valve_pos` e `valve_label`.
+
+Il file `valve_status.json` viene letto **1 volta al minuto** (non per ogni
+campione seriale): overhead trascurabile anche sul Pi 5.
+
+### Come attivare
+
+Edit [`config/integration.ini`](config/integration.ini):
+
+```ini
+[valve_scheduler]
+enabled       = true
+status_file   = ~/programs/valve-scheduler/service/valve_status.json
+stale_after_s = 10
+```
+
+Poi riavvia il backend: `sudo systemctl restart co2-logger` (il flag è
+letto una volta all'avvio; i file giornalieri esistenti mantengono il
+loro header, quelli nuovi avranno le 8 colonne).
+
+### Sentinelle
+
+- `valve_pos = -1` → valve-scheduler non raggiungibile / file stale /
+  valvola non connessa / engine in stato `idle|stopped`
+- `valve_label = -` → label vuota o sconosciuta
+
+### Retrocompatibilità parser GUI
+
+La GUI [gui_integrated_v13.py](gui_integrated_v13.py) legge correttamente
+file con header sia a 6 che a 8 colonne. Le 2 colonne extra sono accettate
+e conservate (`valve_pos`, `valve_labels` nella signature aggiornata di
+`read_file`) ma **non sono ancora visualizzate**: l'aggiornamento
+visuale è demandato a un lavoro successivo.
+
+### Diagnosi rapida
+
+```bash
+# stato valve-scheduler come visto dal logger CO2
+python3 ~/programs/CO2-GMP343/gmp343_valve_state.py \
+    ~/programs/valve-scheduler/service/valve_status.json
 ```
 
 ## Note importanti

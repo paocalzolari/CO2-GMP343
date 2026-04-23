@@ -21,14 +21,45 @@ import sys
 import statistics
 import configparser
 
+# ── Integrazione valve-scheduler (opt-in) ─────────────────────────────────────
+# Import tollerante: se il modulo manca o integration.ini non c'è, il logger
+# si comporta esattamente come prima (formato file invariato).
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from gmp343_valve_state import format_for_raw as valve_format_for_raw
+    _HAS_VALVE_MODULE = True
+except ImportError:
+    _HAS_VALVE_MODULE = False
+
 # ── Percorsi ──────────────────────────────────────────────────────────────────
 # I file ini stanno SEMPRE in ~/programs/CO2/config/
-CONFIG_DIR = os.path.expanduser("~/programs/CO2/config")
-NAME_INI   = os.path.join(CONFIG_DIR, "name.ini")
-SERIAL_INI = os.path.join(CONFIG_DIR, "serial.ini")
-SITE_INI   = os.path.join(CONFIG_DIR, "site.ini")
+CONFIG_DIR      = os.path.expanduser("~/programs/CO2/config")
+NAME_INI        = os.path.join(CONFIG_DIR, "name.ini")
+SERIAL_INI      = os.path.join(CONFIG_DIR, "serial.ini")
+SITE_INI        = os.path.join(CONFIG_DIR, "site.ini")
+INTEGRATION_INI = os.path.join(CONFIG_DIR, "integration.ini")  # opzionale
 
 CMD_START = b"R\r\n"
+
+
+def load_valve_integration():
+    """Carica la config integrazione valve-scheduler (opt-in, retrocompat).
+
+    Restituisce (enabled: bool, status_file: str, stale_after_s: float).
+    Se integration.ini non esiste o il modulo valve_state non è importabile,
+    enabled=False — il logger scrive nel formato v2 storico (6 colonne).
+    """
+    if not _HAS_VALVE_MODULE or not os.path.exists(INTEGRATION_INI):
+        return (False, "", 10.0)
+    cp = configparser.ConfigParser()
+    cp.read(INTEGRATION_INI)
+    if not cp.has_section("valve_scheduler"):
+        return (False, "", 10.0)
+    enabled = cp.getboolean("valve_scheduler", "enabled", fallback=False)
+    status_file = cp.get("valve_scheduler", "status_file",
+                         fallback="~/programs/valve-scheduler/service/valve_status.json")
+    stale = cp.getfloat("valve_scheduler", "stale_after_s", fallback=10.0)
+    return (enabled, os.path.expanduser(status_file), stale)
 
 
 def get_data_dir(config) -> str:
@@ -55,14 +86,17 @@ def get_filenames(config):
     avg_file  = os.path.join(data_dir, f"{basename}_{site_name}_{today}_p00_min.{extension}")
     return raw_file, avg_file
 
-def write_headers_if_needed(raw_file, avg_file, config):
+def write_headers_if_needed(raw_file, avg_file, config, valve_enabled=False):
     """
     Scrive header nei file se non esistono.
     RAW: #date time CO2[PPM] flag
-    MIN: #date time CO2[PPM] CO2_std[PPM] ndata_60s_mean flag
+    MIN: #date time CO2[PPM] CO2_std[PPM] ndata_60s_mean flag [valve_pos valve_label]
     """
     raw_header = "#date time CO2[PPM] flag"
-    avg_header = "#date time CO2[PPM] CO2_std[PPM] ndata_60s_mean flag"
+    if valve_enabled:
+        avg_header = "#date time CO2[PPM] CO2_std[PPM] ndata_60s_mean flag valve_pos valve_label"
+    else:
+        avg_header = "#date time CO2[PPM] CO2_std[PPM] ndata_60s_mean flag"
 
     if not os.path.exists(raw_file):
         with open(raw_file, 'w') as f:
@@ -87,9 +121,32 @@ def parse_co2_from_line(line):
         print(f"Error parsing line '{line}': {e}")
     return None
 
+def _valve_suffix(valve_enabled, valve_status_file, valve_stale_s):
+    """Restituisce la stringa ' <pos> <label>' se integrazione attiva, altrimenti ''.
+
+    Nota: inizia con uno spazio per comporre la riga `_min.raw`.
+    Sentinelle se il file manca/stale: ' -1 -'.
+    """
+    if not valve_enabled:
+        return ""
+    try:
+        pos_s, lab_s = valve_format_for_raw(valve_status_file, valve_stale_s)
+        return f" {pos_s} {lab_s}"
+    except Exception:
+        # Massima tolleranza: qualunque errore → sentinelle
+        return " -1 -"
+
+
 def main():
     config = load_config()
     data_dir = get_data_dir(config)   # crea cartella se non esiste
+
+    # Integrazione valve-scheduler (opt-in, letta una volta all'avvio)
+    valve_enabled, valve_status_file, valve_stale_s = load_valve_integration()
+    if valve_enabled:
+        print(f"[integration] valve-scheduler ATTIVA — status_file={valve_status_file}")
+    else:
+        print("[integration] valve-scheduler disattiva (formato file v2 storico)")
 
     device = config.get('serial', 'port', fallback='/dev/ttyUSB0')
     baudrate = config.getint('serial', 'baudrate', fallback=19200)
@@ -120,7 +177,7 @@ def main():
     current_minute = datetime.utcnow().replace(second=0, microsecond=0)
 
     raw_file, avg_file = get_filenames(config)
-    write_headers_if_needed(raw_file, avg_file, config)
+    write_headers_if_needed(raw_file, avg_file, config, valve_enabled)
 
     print(f"Logging started. Raw data in: {raw_file}, Averaged data in: {avg_file}")
     print(f"Serial connection: {device} @ {baudrate} bps")
@@ -129,17 +186,17 @@ def main():
         try:
             line = ser.readline().decode(errors='ignore').strip()
             now = datetime.utcnow()
-            
+
             new_raw_file, new_avg_file = get_filenames(config)
             if new_raw_file != raw_file or new_avg_file != avg_file:
                 raw_file, avg_file = new_raw_file, new_avg_file
-                write_headers_if_needed(raw_file, avg_file, config)
+                write_headers_if_needed(raw_file, avg_file, config, valve_enabled)
                 print(f"New day. New files: {raw_file}, {avg_file}")
 
             if line:
                 ts_str, current_timestamp = timestamp_now()
                 value = parse_co2_from_line(line)
-                
+
                 if value is not None:
                     with open(raw_file, 'a') as f_raw:
                         f_raw.write(f"{ts_str} {value:.2f} measure\n")
@@ -155,14 +212,16 @@ def main():
                                 n   = len(co2_values)
                             else:
                                 avg, std, n = 999.99, 0.00, 0
-                            f_avg.write(f"{ts_avg} {avg:.2f} {std:.2f} {n} measure\n")
+                            valve_suf = _valve_suffix(valve_enabled, valve_status_file, valve_stale_s)
+                            f_avg.write(f"{ts_avg} {avg:.2f} {std:.2f} {n} measure{valve_suf}\n")
                         current_minute = current_timestamp.replace(second=0, microsecond=0)
                         co2_values = [value]
             else:
                 if now.replace(second=0, microsecond=0) != current_minute:
                     with open(avg_file, 'a') as f_avg:
                         ts_avg = current_minute.strftime("%Y-%m-%d %H:%M:%S")
-                        f_avg.write(f"{ts_avg} 999.99 0.00 0 measure\n")
+                        valve_suf = _valve_suffix(valve_enabled, valve_status_file, valve_stale_s)
+                        f_avg.write(f"{ts_avg} 999.99 0.00 0 measure{valve_suf}\n")
                     current_minute = now.replace(second=0, microsecond=0)
                     co2_values = []
         except serial.SerialException as e:

@@ -74,12 +74,17 @@ class TestBuildFilename:
 # ── read_file ────────────────────────────────────────────────────────────
 
 class TestReadFile:
+    # Da 2026-04-23: read_file ritorna una 7-tupla (sono state aggiunte le
+    # colonne opzionali valve_pos e valve_labels in coda) per integrazione
+    # con valve-scheduler. Per file a 6 colonne (storici) queste liste sono
+    # vuote — retrocompatibilità totale.
+
     def test_missing_path_returns_empty_lists(self):
         result = gui.read_file("/does/not/exist.raw")
-        assert result == ([], [], [], [], [])
+        assert result == ([], [], [], [], [], [], [])
 
     def test_empty_path_returns_empty_lists(self):
-        assert gui.read_file("") == ([], [], [], [], [])
+        assert gui.read_file("") == ([], [], [], [], [], [], [])
 
     def test_parses_v2_format(self, tmp_path):
         f = tmp_path / "test.raw"
@@ -88,12 +93,15 @@ class TestReadFile:
             "2026-04-22 11:00:00 412.5 0.3 60 measure\n"
             "2026-04-22 11:01:00 413.0 0.4 58 measure\n"
         )
-        times, values, stds, counts, flags = gui.read_file(str(f))
+        times, values, stds, counts, flags, valve_pos, valve_labels = gui.read_file(str(f))
         assert len(times) == 2
         assert values == [412.5, 413.0]
         assert stds == [0.3, 0.4]
         assert counts == [60, 58]
         assert flags == ["measure", "measure"]
+        # File a 6 colonne: nessuna colonna valvola → liste vuote
+        assert valve_pos == []
+        assert valve_labels == []
 
     def test_skips_comment_lines(self, tmp_path):
         f = tmp_path / "c.raw"
@@ -123,7 +131,7 @@ class TestReadFile:
             "2026-04-22 11:01:00 999.99 0.0 0 calib\n"
             "2026-04-22 11:02:00 413.0 0.4 58\n"           # no flag → default measure
         )
-        _, _, _, _, flags = gui.read_file(str(f))
+        _, _, _, _, flags, _, _ = gui.read_file(str(f))
         assert flags == ["measure", "calib", "measure"]
 
     def test_unknown_flag_coerced_to_measure(self, tmp_path):
@@ -131,8 +139,40 @@ class TestReadFile:
         f.write_text(
             "2026-04-22 11:00:00 412.5 0.3 60 bogus\n"
         )
-        _, _, _, _, flags = gui.read_file(str(f))
+        _, _, _, _, flags, _, _ = gui.read_file(str(f))
         assert flags == ["measure"]
+
+    # Nuovi test: integrazione valve-scheduler (formato esteso 8 colonne)
+
+    def test_parses_extended_8col_format(self, tmp_path):
+        f = tmp_path / "ext.raw"
+        f.write_text(
+            "#date time CO2[PPM] CO2_std[PPM] ndata_60s_mean flag valve_pos valve_label\n"
+            "2026-04-23 10:30:00 412.34 0.85 60 measure 3 span-low\n"
+            "2026-04-23 10:31:00 413.12 0.91 60 measure -1 -\n"
+            "2026-04-23 10:32:00 414.50 1.10 55 calib 5 span-mid\n"
+        )
+        times, values, stds, counts, flags, valve_pos, valve_labels = gui.read_file(str(f))
+        assert len(times) == 3
+        assert valve_pos == [3, -1, 5]
+        assert valve_labels == ["span-low", "-", "span-mid"]
+        assert flags == ["measure", "measure", "calib"]
+
+    def test_mixed_col_counts_in_same_file(self, tmp_path):
+        # Scenario edge: un file con alcune righe a 6 e altre a 8 colonne
+        # (non dovrebbe succedere in produzione, ma il parser non deve
+        # crashare — assegna sentinelle dove le colonne mancano).
+        f = tmp_path / "mixed_cols.raw"
+        f.write_text(
+            "2026-04-23 10:30:00 412.34 0.85 60 measure\n"
+            "2026-04-23 10:31:00 413.12 0.91 60 measure 4 test\n"
+        )
+        times, _, _, _, _, valve_pos, valve_labels = gui.read_file(str(f))
+        assert len(times) == 2
+        # has_valve_cols=True perché almeno una riga ha 8 colonne
+        # → le liste sono popolate, con sentinelle per la riga a 6 col
+        assert valve_pos == [-1, 4]
+        assert valve_labels == ["-", "test"]
 
 
 # ── smart_ylim ───────────────────────────────────────────────────────────
