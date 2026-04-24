@@ -10,3 +10,6 @@ co2-calib
 *.tar.gz
 *.egg-info/
 .eggs/
+
+# Runtime PID files
+*.pid
