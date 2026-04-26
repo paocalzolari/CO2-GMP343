@@ -53,9 +53,14 @@ Aggiornato il: **2026-04-23**
 - Header `_min`: `#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag [valve_pos valve_label]`
 - Std in **PPM assoluto** (non percentuale). T_std in °C, RH_std in %.
 - Flag: `measure` o `calib`
-  - Con `calib_auto=true` in `config/integration.ini`: determinato automaticamente
-    dalla `valve_label` corrente (le label in `calib_labels` → `calib`, le altre → `measure`)
-  - Senza `calib_auto`: flag `measure` fisso (backend) o manuale (GUI calib)
+  - Con `calib_auto=true` in `config/integration.ini`: determinato automaticamente.
+    Regola **posizionale** (primaria): `valve_pos != measure_position` (default 1)
+    → `calib`. Affiancata in OR: se la `valve_label` è in `calib_labels` →
+    `calib` (legacy, utile per marcare come `calib` anche posizioni con label
+    speciali pur essendo nella posizione di misura). Se valve-scheduler non
+    risponde, mantiene l'**ultimo flag valido** (non torna a `measure`).
+  - Senza `calib_auto`: flag `measure` fisso (backend) o manuale (GUI calib,
+    con popup di conferma sul toggle).
 - Sentinel per dato mancante: `-999.99` (CO2 non acquisito, SHT31 non
   raggiungibile, minuto vuoto). La GUI filtra queste sentinelle dalle
   statistiche e dal plot.
@@ -156,10 +161,18 @@ Con `calib_auto=true` in `config/integration.ini`, il **backend headless**
 (`gmp343_sht31_logger.py`) determina il flag `measure`/`calib` automaticamente
 dalla posizione della valvola VICI, senza bisogno di intervento manuale:
 
-- Le `valve_label` elencate in `calib_labels` (es. `zero,span,span-low,span-high`)
-  → flag **`calib`**
-- Tutte le altre label (es. `sample`, `ambient`) → flag **`measure`**
-- Valvola non raggiungibile / label sconosciuta → flag **`measure`** (fallback sicuro)
+- **Regola posizionale (primaria)**: se `valve_pos != measure_position`
+  (default `1`) → flag **`calib`**. Il presupposto è che la posizione di
+  misura ambientale sia una sola; tutte le altre posizioni servono per
+  bombole di calibrazione (zero, span, ecc.) e producono dato `calib`.
+- **Regola per label (legacy, in OR)**: se la `valve_label` è in
+  `calib_labels` (es. `zero,span,span-low,span-high`) → flag **`calib`**
+  anche se la posizione fosse quella di misura. Utile se in futuro si
+  vuole marcare come `calib` un punto particolare con label dedicata.
+- **Valvola non raggiungibile / file stale / engine idle** → mantiene
+  l'**ultimo flag valido** (non torna a `measure` di default). Stato
+  interno al modulo `gmp343_valve_state`, all'avvio inizializzato a
+  `measure`.
 
 ### Come attivare
 
@@ -167,11 +180,12 @@ Edit `config/integration.ini`:
 
 ```ini
 [valve_scheduler]
-enabled       = true
-status_file   = ~/programs/valve-scheduler/service/valve_status.json
-stale_after_s = 10
-calib_auto    = true
-calib_labels  = zero,span,span-low,span-high
+enabled          = true
+status_file      = ~/programs/valve-scheduler/service/valve_status.json
+stale_after_s    = 10
+calib_auto       = true
+measure_position = 1
+calib_labels     = zero,span,span-low,span-high
 ```
 
 Poi: `sudo systemctl restart co2-logger`
@@ -203,6 +217,12 @@ cd /home/misura/programs/CO2 && python3 gmp343_sht31_calib.py    # 2. apri la GU
 # ... chiudi la GUI quando hai finito ...
 sudo systemctl start co2-logger                         # 3. riparti il backend
 ```
+
+Il pulsante di toggle `measure ↔ calib` mostra un **popup di conferma** che
+ricorda all'utente cosa sta per fare e che in modalità automatica il flag
+è già gestito dalla posizione della valvola. È un freno volontario: in
+modo automatico il toggle manuale è quasi sempre superfluo e può creare
+incoerenze tra flag scritto e posizione valvola registrata.
 
 Durante la calibrazione i record vengono comunque scritti sui file giornalieri
 del giorno corrente, con il flag `calib` per i campioni in calibrazione e

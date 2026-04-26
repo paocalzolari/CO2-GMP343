@@ -11,7 +11,7 @@ Formato file v3 (dal 2026-04-15, con T/RH):
   - Parser retrocompatibile col formato v2 (5 colonne, senza T/RH).
 """
 
-import sys, os, logging
+import sys, os, json, signal, subprocess, logging
 from datetime import datetime, timedelta, timezone, date as date_type
 import configparser
 from pathlib import Path
@@ -20,7 +20,10 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QVBoxLayout, QHBoxLayout, QLabel, QGroupBox,
     QGridLayout, QTabWidget, QPushButton,
-    QComboBox, QDateEdit, QCheckBox, QFrame, QMessageBox
+    QComboBox, QDateEdit, QCheckBox, QFrame, QMessageBox,
+    QDialog, QFormLayout, QSpinBox, QDoubleSpinBox, QLineEdit,
+    QDialogButtonBox, QFileDialog, QToolButton,
+    QPlainTextEdit, QScrollArea, QAction
 )
 from PyQt5.QtCore  import QTimer, Qt, QDate
 from PyQt5.QtGui   import QFont, QPixmap
@@ -39,18 +42,46 @@ import numpy as np
 
 # ── valve-scheduler opzionale ─────────────────────────────────────────────────
 _VALVE_SCHED_DIR = os.path.expanduser("~/programs/valve-scheduler")
-try:
-    if _VALVE_SCHED_DIR not in sys.path:
-        sys.path.insert(0, _VALVE_SCHED_DIR)
-    from valvescheduler.core.config import load_cfg as vs_load_cfg
-    from valvescheduler.core.engine import ScheduleEngine
-    from valvescheduler.core.schedule import load_schedule_csv, save_schedule_csv, default_example
-    from valvescheduler.core.mqtt_pub import build_publisher as vs_build_publisher
-    from valvescheduler.hardware.vici_emtca import VICIEMTCA, VICIError, VICITimeout
-    from valvescheduler.gui.main_window import TabSchedule
-    _HAS_VALVE_SCHEDULER = True
-except ImportError:
-    _HAS_VALVE_SCHEDULER = False
+_HAS_VALVE_SCHEDULER = Path(_VALVE_SCHED_DIR).is_dir()
+if _HAS_VALVE_SCHEDULER and _VALVE_SCHED_DIR not in sys.path:
+    sys.path.insert(0, _VALVE_SCHED_DIR)
+_VALVE_STATUS_JSON = Path(
+    "/home/misura/programs/valve-scheduler/service/valve_status.json")
+_VALVE_STATUS_STALE_S = 10.0
+_MEASURE_POSITION = 1
+
+
+def read_live_valve() -> tuple[int, str, bool]:
+    """Legge valve_status.json e ritorna (pos, label, fresh).
+
+    pos: posizione corrente (-1 se sconosciuta)
+    label: step_label dal JSON (vuoto se mancante)
+    fresh: True se timestamp entro _VALVE_STATUS_STALE_S
+    """
+    if not _VALVE_STATUS_JSON.exists():
+        return (-1, "", False)
+    try:
+        with _VALVE_STATUS_JSON.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return (-1, "", False)
+    ts_str = str(data.get("timestamp", ""))
+    fresh = False
+    if ts_str:
+        try:
+            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - ts).total_seconds()
+            fresh = age <= _VALVE_STATUS_STALE_S
+        except (ValueError, TypeError):
+            fresh = False
+    try:
+        pos = int(data.get("position", -1))
+    except (TypeError, ValueError):
+        pos = -1
+    label = str(data.get("step_label", ""))
+    return (pos, label, fresh)
 
 # ── astral opzionale ──────────────────────────────────────────────────────────
 try:
@@ -374,6 +405,8 @@ class GraphWidget(QWidget):
         self._night_poly = []   # patch zone notturne
         self._valve_poly = []   # patch posizione valvola (striscia bassa)
         self._valve_text = []   # label testuali "pos=N" lungo la striscia
+        self._sc_by_pos  = []   # PathCollection scatter per posizione valvola
+        self._pos_legend = None # Legend handle (rimosso/ricreato a ogni reload)
         self._zoom_xlim  = None # None = vista libera
         self._zoom_ylim  = None
 
@@ -607,6 +640,20 @@ class GraphWidget(QWidget):
                 pass
         self._valve_text = []
 
+        # ── Pulisci scatter colorati per posizione e legenda ───────────────
+        for sc in self._sc_by_pos:
+            try:
+                sc.remove()
+            except Exception:
+                pass
+        self._sc_by_pos = []
+        if self._pos_legend is not None:
+            try:
+                self._pos_legend.remove()
+            except Exception:
+                pass
+            self._pos_legend = None
+
         if result is None:
             self.line.set_data([], [])
             self.line_t.set_data([], [])
@@ -639,31 +686,100 @@ class GraphWidget(QWidget):
         self.line_t.set_data(xt, t_plot)
         self.line_rh.set_data(xt, rh_plot)
 
-        # ── Scatter per flag (solo punti validi, MISSING esclusi) ─────────
+        # ── Scatter dei punti CO₂ ─────────────────────────────────────────
+        # Se i file hanno colonne valvola (formato "v3+valvola"), coloriamo
+        # ogni punto in base alla posizione valvola con palette tab20.
+        # Altrimenti retrocompatibilità: blu per measure, arancione per calib.
         mask_valid = values != MISSING
-        mask_m = mask_valid & (flags == "measure")
-        mask_c = mask_valid & (flags == "calib")
+        has_valve_data = (valve_pos.size == len(times)
+                          and np.any(valve_pos >= 1))
 
-        if mask_m.any():
-            self.sc_measure.set_offsets(np.column_stack([xt[mask_m], values[mask_m]]))
-        else:
+        if has_valve_data:
+            # Nascondi gli scatter legacy (flag-based)
             self.sc_measure.set_offsets(np.empty((0, 2)))
-
-        if mask_c.any():
-            self.sc_calib.set_offsets(np.column_stack([xt[mask_c], values[mask_c]]))
-        else:
             self.sc_calib.set_offsets(np.empty((0, 2)))
 
-        # ── Label flag: stato dell'ULTIMA acquisizione ─────────────────────
-        last_flag = flags[-1] if len(flags) > 0 else "measure"
-        if last_flag == "calib":
-            self.flag_label.set_text("CALIB")
-            self.flag_label.set_color("#e06000")
-            self.flag_label.get_bbox_patch().set_edgecolor("#e06000")
+            from matplotlib import cm as _cm
+            cmap = _cm.get_cmap("tab20")
+            unique_pos = sorted({int(p) for p in valve_pos
+                                 if int(p) >= 1})
+            legend_handles = []
+            for pos in unique_pos:
+                mask = mask_valid & (valve_pos == pos)
+                if not mask.any():
+                    continue
+                color = cmap((pos - 1) % 20)
+                # Etichetta: prima label non vuota incontrata per quella posizione
+                label_for_pos = ""
+                for vl in valve_labels[mask]:
+                    s = str(vl)
+                    if s and s != "-":
+                        label_for_pos = s
+                        break
+                lab = f"pos {pos} ({label_for_pos})" if label_for_pos else f"pos {pos}"
+                # Marker diverso a seconda del flag: cerchio per measure,
+                # diamante per calib (la regola si basa sul flag già scritto)
+                # ma per semplicità usiamo cerchio per posizione di misura
+                # e diamante per le altre (regola posizionale visiva).
+                # Approssimiamo: il "flag" prevalente nei dati di questa
+                # posizione decide il marker.
+                flags_here = flags[mask]
+                is_calib = np.any(flags_here == "calib")
+                marker = "D" if is_calib else "o"
+                size   = 28 if is_calib else 18
+                sc = self.ax.scatter(
+                    xt[mask], values[mask],
+                    s=size, color=color, marker=marker,
+                    zorder=4 if is_calib else 3,
+                    label=lab,
+                )
+                self._sc_by_pos.append(sc)
+                legend_handles.append(sc)
+
+            if legend_handles:
+                self._pos_legend = self.ax.legend(
+                    handles=legend_handles, loc="upper left",
+                    fontsize=8, framealpha=0.85, ncol=1,
+                )
         else:
-            self.flag_label.set_text("MEASURE")
-            self.flag_label.set_color("#2060c0")
-            self.flag_label.get_bbox_patch().set_edgecolor("#2060c0")
+            # Retrocompat: file senza colonne valvola → blu/arancione su flag
+            mask_m = mask_valid & (flags == "measure")
+            mask_c = mask_valid & (flags == "calib")
+            if mask_m.any():
+                self.sc_measure.set_offsets(np.column_stack([xt[mask_m], values[mask_m]]))
+            else:
+                self.sc_measure.set_offsets(np.empty((0, 2)))
+            if mask_c.any():
+                self.sc_calib.set_offsets(np.column_stack([xt[mask_c], values[mask_c]]))
+            else:
+                self.sc_calib.set_offsets(np.empty((0, 2)))
+
+        # ── Label flag: fonte LIVE (valve_status.json, ~2s) con fallback ──
+        live_pos, live_label, live_fresh = read_live_valve()
+        if live_fresh and live_pos >= 1:
+            last_pos = live_pos
+            last_flag = "measure" if live_pos == _MEASURE_POSITION else "calib"
+            label_for_text = live_label
+        else:
+            last_flag = flags[-1] if len(flags) > 0 else "measure"
+            last_pos = int(valve_pos[-1]) if valve_pos.size > 0 else -1
+            label_for_text = (str(valve_labels[-1])
+                              if valve_labels.size > 0
+                              and str(valve_labels[-1]) not in ("-", "")
+                              else "")
+        # Pos 10 → rosso (span-high), altre calib → arancione, pos 1 → blu.
+        if last_flag == "calib" and last_pos == 10:
+            color = "#c00000"; text = f"CALIB pos{last_pos}"
+        elif last_flag == "calib":
+            color = "#e06000"
+            text = f"CALIB pos{last_pos}" if last_pos >= 1 else "CALIB"
+        else:
+            color = "#2060c0"; text = "MEASURE"
+        if label_for_text and label_for_text != "-":
+            text = f"{text} ({label_for_text})"
+        self.flag_label.set_text(text)
+        self.flag_label.set_color(color)
+        self.flag_label.get_bbox_patch().set_edgecolor(color)
 
         # ── Striscia posizione valvola (in basso, ymin=0..ymax=0.04 axes) ──
         # Attiva solo se abbiamo dati valvola (integrazione valve-scheduler)
@@ -928,71 +1044,623 @@ class GraphWidget(QWidget):
 #  Tab Valvola VICI (valve-scheduler integrato)
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TabValve(QWidget):
-    """Tab integrata del valve-scheduler nel monitor CO2.
+class DaemonSettingsDialog(QDialog):
+    """Dialog per editare le impostazioni del valve-daemon."""
 
-    Wrappa header connessione + TabSchedule dal package valvescheduler.
+    def __init__(self, current: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Impostazioni valve-daemon")
+        self.setMinimumWidth(420)
+        form = QFormLayout(self)
+        form.setSpacing(8)
+
+        ini_lbl = QLabel(current.get("ini_path", "—"))
+        ini_lbl.setStyleSheet("color:#666;font-size:8pt")
+        form.addRow("File INI:", ini_lbl)
+
+        self.ed_port = QLineEdit(current.get("serial_port", "/dev/vici"))
+        form.addRow("Porta seriale:", self.ed_port)
+
+        self.cb_baud = QComboBox()
+        self.cb_baud.setEditable(True)
+        for b in (1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200):
+            self.cb_baud.addItem(str(b))
+        self.cb_baud.setEditText(str(current.get("serial_baud", 9600)))
+        form.addRow("Baud rate:", self.cb_baud)
+
+        self.sp_timeout = QDoubleSpinBox()
+        self.sp_timeout.setRange(0.1, 30.0)
+        self.sp_timeout.setSingleStep(0.5)
+        self.sp_timeout.setValue(float(current.get("serial_timeout", 2.0)))
+        self.sp_timeout.setSuffix(" s")
+        form.addRow("Serial timeout:", self.sp_timeout)
+
+        self.chk_rs485 = QCheckBox("RS-485 (default RS-232)")
+        self.chk_rs485.setChecked(bool(current.get("serial_rs485", False)))
+        form.addRow("Modalità seriale:", self.chk_rs485)
+
+        self.ed_dev_id = QLineEdit(current.get("serial_dev_id", ""))
+        self.ed_dev_id.setPlaceholderText("(solo RS-485, default Z)")
+        form.addRow("Device ID:", self.ed_dev_id)
+
+        self.sp_n = QSpinBox()
+        self.sp_n.setRange(2, 40)
+        self.sp_n.setValue(int(current.get("n_positions", 10)))
+        form.addRow("Numero posizioni:", self.sp_n)
+
+        self.sp_idle = QDoubleSpinBox()
+        self.sp_idle.setRange(0.5, 30.0)
+        self.sp_idle.setSingleStep(0.5)
+        self.sp_idle.setValue(float(current.get("idle_poll_s", 2.0)))
+        self.sp_idle.setSuffix(" s")
+        form.addRow("Polling CP idle:", self.sp_idle)
+
+        self.chk_auto = QCheckBox("Apri valvola all'avvio del daemon")
+        self.chk_auto.setChecked(bool(current.get("auto_connect", True)))
+        form.addRow("", self.chk_auto)
+
+        self.chk_cfg_start = QCheckBox(
+            "Applica IFM1+AM3+SMA+NP all'apertura (avanzato)")
+        self.chk_cfg_start.setChecked(bool(current.get("configure_on_start", False)))
+        form.addRow("", self.chk_cfg_start)
+
+        self.chk_home_start = QCheckBox(
+            "HM (vai a pos 1) all'apertura")
+        self.chk_home_start.setChecked(bool(current.get("go_home_on_start", False)))
+        form.addRow("", self.chk_home_start)
+
+        # Sezione "File e cartelle" — separatore visivo
+        sep = QLabel("───── File e cartelle ─────")
+        sep.setStyleSheet("color:#888;font-size:9pt;padding-top:8px")
+        sep.setAlignment(Qt.AlignCenter)
+        form.addRow(sep)
+
+        prog_dir = "/home/misura/programs/valve-scheduler"
+        path_hint = QLabel(
+            f"Path relativi sono risolti rispetto a {prog_dir}/.\n"
+            "Per usare cartelle in altri posti, scrivi un path assoluto.")
+        path_hint.setStyleSheet("color:#666;font-size:8pt")
+        path_hint.setWordWrap(True)
+        form.addRow(path_hint)
+
+        self.ed_status = QLineEdit(
+            current.get("status_file", "service/valve_status.json"))
+        self.ed_status.setToolTip(
+            "JSON di stato — scritto dal daemon, letto dal logger CO2.\n"
+            "Se cambi qui, aggiorna anche config/integration.ini del logger.")
+        form.addRow("File di stato JSON:", self.ed_status)
+
+        h_log = QHBoxLayout()
+        self.ed_logdir = QLineEdit(current.get("log_dir", "log"))
+        self.ed_logdir.setToolTip(
+            "Directory per valve-daemon.log (rotazione 1MB × 5).")
+        h_log.addWidget(self.ed_logdir)
+        btn_browse_log = QToolButton()
+        btn_browse_log.setText("…")
+        btn_browse_log.clicked.connect(
+            lambda: self._browse_dir(self.ed_logdir, prog_dir))
+        h_log.addWidget(btn_browse_log)
+        wrap_log = QWidget(); wrap_log.setLayout(h_log)
+        h_log.setContentsMargins(0, 0, 0, 0)
+        form.addRow("Cartella log:", wrap_log)
+
+        h_sch = QHBoxLayout()
+        self.ed_sched = QLineEdit(
+            current.get("schedule_file", "schedule/schedule.csv"))
+        self.ed_sched.setToolTip(
+            "Schedule CSV di default (caricato all'avvio della GUI).\n"
+            "Lo schedule attivo è quello editato in tabella.")
+        h_sch.addWidget(self.ed_sched)
+        btn_browse_sched = QToolButton()
+        btn_browse_sched.setText("…")
+        btn_browse_sched.clicked.connect(
+            lambda: self._browse_file(self.ed_sched, prog_dir,
+                                       "CSV (*.csv);;Tutti i file (*)"))
+        h_sch.addWidget(btn_browse_sched)
+        wrap_sch = QWidget(); wrap_sch.setLayout(h_sch)
+        h_sch.setContentsMargins(0, 0, 0, 0)
+        form.addRow("Schedule CSV default:", wrap_sch)
+
+        warn = QLabel(
+            "Salvando, il daemon ferma l'IdlePoller e riapre la porta\n"
+            "con le nuove impostazioni (~1 s). Schedule in corso vanno\n"
+            "fermati prima. Il cambio di cartella log richiede un riavvio\n"
+            "del daemon (sudo systemctl restart valve-daemon).")
+        warn.setStyleSheet("color:#666;font-size:9pt")
+        form.addRow(warn)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        form.addRow(btns)
+
+    def _browse_dir(self, line_edit: QLineEdit, base: str) -> None:
+        start = line_edit.text().strip() or base
+        if not Path(start).is_absolute():
+            start = str(Path(base) / start)
+        d = QFileDialog.getExistingDirectory(
+            self, "Seleziona cartella", start)
+        if d:
+            line_edit.setText(d)
+
+    def _browse_file(self, line_edit: QLineEdit, base: str,
+                     filter_str: str) -> None:
+        start = line_edit.text().strip() or base
+        if not Path(start).is_absolute():
+            start = str(Path(base) / start)
+        f, _ = QFileDialog.getOpenFileName(
+            self, "Seleziona file", start, filter_str)
+        if f:
+            line_edit.setText(f)
+
+    def values(self) -> dict:
+        try:
+            baud = int(self.cb_baud.currentText().strip())
+        except ValueError:
+            baud = 9600
+        return {
+            "serial_port":        self.ed_port.text().strip() or "/dev/vici",
+            "serial_baud":        baud,
+            "serial_timeout":     float(self.sp_timeout.value()),
+            "serial_rs485":       self.chk_rs485.isChecked(),
+            "serial_dev_id":      self.ed_dev_id.text().strip(),
+            "n_positions":        int(self.sp_n.value()),
+            "idle_poll_s":        float(self.sp_idle.value()),
+            "auto_connect":       self.chk_auto.isChecked(),
+            "configure_on_start": self.chk_cfg_start.isChecked(),
+            "go_home_on_start":   self.chk_home_start.isChecked(),
+            "status_file":        self.ed_status.text().strip()
+                                    or "service/valve_status.json",
+            "log_dir":            self.ed_logdir.text().strip() or "log",
+            "schedule_file":      self.ed_sched.text().strip()
+                                    or "schedule/schedule.csv",
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Configurazione CO2 logger (Output, Seriale GMP343, Sito, Sensori, Layout Pi 5)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Pinout 40-pin GPIO — uguale per Pi 2/3/4/5. Sorgente: pinout.xyz e
+# raspberrypi.com/documentation/computers/raspberry-pi.html
+PI5_PINOUT = """
+                  Raspberry Pi 5 — 40-pin GPIO header
+
+           +---+---+               LEGENDA
+   3V3 ─── │ 1 │ 2 │ ─── 5V        ★ I2C-1 (default per sensori)
+  GPIO2 ★ │ 3 │ 4 │ ─── 5V         I2C-1 SDA = pin 3 (GPIO2)
+  GPIO3 ★ │ 5 │ 6 │ ─── GND        I2C-1 SCL = pin 5 (GPIO3)
+  GPIO4   │ 7 │ 8 │   GPIO14      Power: 3V3 = pin 1, GND = pin 6/9/14/...
+   GND    │ 9 │10 │   GPIO15
+  GPIO17  │11 │12 │   GPIO18      ID_SD/ID_SC = HAT EEPROM (NON usare)
+  GPIO27  │13 │14 │ ─── GND
+  GPIO22  │15 │16 │   GPIO23      Bus I2C aggiuntivi su Pi 5 (via dtoverlay):
+   3V3    │17 │18 │   GPIO24       i2c-3 SDA=GPIO4, SCL=GPIO5  (pin 7+29)
+  GPIO10  │19 │20 │ ─── GND        i2c-4 SDA=GPIO8, SCL=GPIO9  (pin 24+21)
+  GPIO9   │21 │22 │   GPIO25       i2c-5 SDA=GPIO12, SCL=GPIO13(pin 32+33)
+  GPIO11  │23 │24 │   GPIO8        i2c-6 SDA=GPIO22, SCL=GPIO23(pin 15+16)
+   GND    │25 │26 │   GPIO7
+  ID_SD   │27 │28 │   ID_SC        Per attivarli: aggiungere a /boot/firmware/config.txt:
+  GPIO5   │29 │30 │ ─── GND          dtoverlay=i2c3,pins_2_3
+  GPIO6   │31 │32 │   GPIO12         dtoverlay=i2c4
+  GPIO13  │33 │34 │ ─── GND          dtparam=i2c_arm=on  (i2c-1, già attivo)
+  GPIO19  │35 │36 │   GPIO16
+  GPIO26  │37 │38 │   GPIO20      Indirizzi I2C noti dei sensori che hai:
+   GND    │39 │40 │   GPIO21       SHT31-D    0x44 (ADDR pin LOW, default)
+           +---+---+               SHT31-D    0x45 (ADDR pin HIGH)
+                                   BMP388     0x77 (SDO LOW, default)
+                                   BMP388     0x76 (SDO HIGH)
+
+Per collegare un secondo SHT31-D + un BMP388 in parallelo sullo stesso bus i2c-1:
+
+   SHT31-D primario (0x44, già installato) ──┐
+                                              ├── pin 3 (SDA) + pin 5 (SCL)
+   SHT31-D secondario (0x45, ADDR a Vcc)  ───┤    pin 1 (3V3) + pin 6 (GND)
+                                              │
+   BMP388 (0x77, default)                 ────┘
+
+I tre sensori condividono SDA/SCL/3V3/GND. Possono coesistere perché
+hanno indirizzi I2C diversi. Per discriminare il SHT31 secondario,
+collega il pin ADDR a 3V3 (default è a GND → 0x44).
+Verifica con: `i2cdetect -y 1` (devono comparire 0x44, 0x45, 0x77).
+"""
+
+
+class _IniMixin:
+    """Helper di lettura/scrittura INI molto semplice (configparser)."""
+    @staticmethod
+    def _read_ini(path: str) -> configparser.ConfigParser:
+        cp = configparser.ConfigParser()
+        cp.optionxform = str  # preserva case
+        if os.path.exists(path):
+            cp.read(path, encoding="utf-8")
+        return cp
+
+    @staticmethod
+    def _write_ini(path: str, cp: configparser.ConfigParser) -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            cp.write(f)
+
+
+class MonitorConfigDialog(QDialog, _IniMixin):
+    """Editor INI del CO2 logger / monitor.
+
+    Tab:
+      - Output (name.ini)
+      - Seriale GMP343 (serial.ini)
+      - Sito (site.ini)
+      - Sensori I2C (sensors.ini, ancora non letto dal logger — preview)
+      - Layout Pi 5 (riferimento)
+    """
+
+    def __init__(self, config_dir: str, parent=None):
+        super().__init__(parent)
+        self.config_dir = config_dir
+        self.setWindowTitle("Impostazioni CO2 logger")
+        self.resize(640, 560)
+
+        lay = QVBoxLayout(self)
+        self._tabs = QTabWidget()
+        self._tabs.addTab(self._build_output_tab(),    "Output")
+        self._tabs.addTab(self._build_serial_tab(),    "Seriale GMP343")
+        self._tabs.addTab(self._build_site_tab(),      "Sito")
+        self._tabs.addTab(self._build_sensors_tab(),   "Sensori I2C")
+        self._tabs.addTab(self._build_layout_tab(),    "Layout Pi 5")
+        lay.addWidget(self._tabs)
+
+        warn = QLabel(
+            "Le modifiche a Output / Seriale richiedono il restart del "
+            "logger CO2 per avere effetto:\n"
+            "    sudo systemctl restart co2-logger")
+        warn.setStyleSheet("color:#666;font-size:9pt")
+        warn.setWordWrap(True)
+        lay.addWidget(warn)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self._on_save)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+    # ────────────────────────────────────────────────────── Tab Output
+    def _build_output_tab(self) -> QWidget:
+        ini = self._read_ini(os.path.join(self.config_dir, "name.ini"))
+        sec = ini["output"] if "output" in ini else {}
+
+        w = QWidget(); form = QFormLayout(w)
+        info = QLabel(
+            "Nomi e cartella dei file `.raw` e `_min.raw` scritti dal logger.")
+        info.setStyleSheet("color:#666;font-size:9pt")
+        info.setWordWrap(True)
+        form.addRow(info)
+
+        h_dir = QHBoxLayout()
+        self.ed_data_path = QLineEdit(sec.get("data_path", "~/data"))
+        h_dir.addWidget(self.ed_data_path)
+        btn_d = QToolButton(); btn_d.setText("…")
+        btn_d.clicked.connect(lambda: self._browse_dir(self.ed_data_path))
+        h_dir.addWidget(btn_d)
+        wrap = QWidget(); wrap.setLayout(h_dir); h_dir.setContentsMargins(0,0,0,0)
+        form.addRow("Cartella dati:", wrap)
+
+        self.ed_basename = QLineEdit(sec.get("basename", "carbocap343"))
+        form.addRow("Basename file:", self.ed_basename)
+        self.ed_extension = QLineEdit(sec.get("extension", "raw"))
+        form.addRow("Estensione:", self.ed_extension)
+
+        ex = QLabel(
+            f"Esempio file giornaliero:\n"
+            f"  {self.ed_basename.text()}_<sito>_<YYYYMMDD>_p00.{self.ed_extension.text()}")
+        ex.setStyleSheet("color:#888;font-size:8pt;font-family:monospace")
+        form.addRow("", ex)
+        # aggiorna esempio dinamicamente
+        def _upd():
+            ex.setText(
+                f"Esempio file giornaliero:\n"
+                f"  {self.ed_basename.text()}_<sito>_<YYYYMMDD>_p00.{self.ed_extension.text()}")
+        self.ed_basename.textChanged.connect(_upd)
+        self.ed_extension.textChanged.connect(_upd)
+        return w
+
+    # ──────────────────────────────────────────────── Tab Seriale GMP343
+    def _build_serial_tab(self) -> QWidget:
+        ini = self._read_ini(os.path.join(self.config_dir, "serial.ini"))
+        sec = ini["serial"] if "serial" in ini else {}
+
+        w = QWidget(); form = QFormLayout(w)
+        info = QLabel(
+            "Porta seriale per il sensore Vaisala GMP343. Su Raspberry Pi 5 "
+            "il symlink udev `/dev/gmp343` è persistente; usa quello.")
+        info.setStyleSheet("color:#666;font-size:9pt"); info.setWordWrap(True)
+        form.addRow(info)
+
+        self.ed_serial_port = QLineEdit(sec.get("port", "/dev/gmp343"))
+        form.addRow("Porta:", self.ed_serial_port)
+
+        self.cb_serial_baud = QComboBox(); self.cb_serial_baud.setEditable(True)
+        for b in (1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200):
+            self.cb_serial_baud.addItem(str(b))
+        self.cb_serial_baud.setEditText(sec.get("baudrate", "19200"))
+        form.addRow("Baud rate:", self.cb_serial_baud)
+
+        self.sp_bytesize = QSpinBox(); self.sp_bytesize.setRange(5, 8)
+        self.sp_bytesize.setValue(int(sec.get("bytesize", 8)))
+        form.addRow("Bytesize:", self.sp_bytesize)
+
+        self.cb_parity = QComboBox()
+        self.cb_parity.addItems(["N", "E", "O"])
+        self.cb_parity.setCurrentText(sec.get("parity", "N"))
+        form.addRow("Parity:", self.cb_parity)
+
+        self.sp_stopbits = QSpinBox(); self.sp_stopbits.setRange(1, 2)
+        self.sp_stopbits.setValue(int(sec.get("stopbits", 1)))
+        form.addRow("Stopbits:", self.sp_stopbits)
+
+        self.sp_serial_timeout = QSpinBox()
+        self.sp_serial_timeout.setRange(1, 30)
+        self.sp_serial_timeout.setValue(int(float(sec.get("timeout", 1))))
+        self.sp_serial_timeout.setSuffix(" s")
+        form.addRow("Timeout:", self.sp_serial_timeout)
+        return w
+
+    # ─────────────────────────────────────────────────── Tab Sito
+    def _build_site_tab(self) -> QWidget:
+        ini = self._read_ini(os.path.join(self.config_dir, "site.ini"))
+        sec = ini["location"] if "location" in ini else {}
+
+        w = QWidget(); form = QFormLayout(w)
+        info = QLabel(
+            "Identificazione della stazione e coordinate per il calcolo "
+            "alba/tramonto (zone notturne nel grafico).")
+        info.setStyleSheet("color:#666;font-size:9pt"); info.setWordWrap(True)
+        form.addRow(info)
+
+        self.ed_site_name = QLineEdit(sec.get("name", "ISACBO"))
+        form.addRow("Nome stazione:", self.ed_site_name)
+
+        self.sp_lat = QDoubleSpinBox()
+        self.sp_lat.setRange(-90.0, 90.0); self.sp_lat.setDecimals(6)
+        self.sp_lat.setValue(float(sec.get("latitude", 44.523624)))
+        form.addRow("Latitudine:", self.sp_lat)
+
+        self.sp_lon = QDoubleSpinBox()
+        self.sp_lon.setRange(-180.0, 180.0); self.sp_lon.setDecimals(6)
+        self.sp_lon.setValue(float(sec.get("longitude", 11.338379)))
+        form.addRow("Longitudine:", self.sp_lon)
+
+        self.cb_tz = QComboBox(); self.cb_tz.setEditable(True)
+        for tz in ("UTC", "Europe/Rome", "Europe/London"):
+            self.cb_tz.addItem(tz)
+        self.cb_tz.setEditText(sec.get("timezone", "UTC"))
+        form.addRow("Timezone:", self.cb_tz)
+        return w
+
+    # ────────────────────────────────────────────── Tab Sensori I2C
+    def _build_sensors_tab(self) -> QWidget:
+        ini = self._read_ini(os.path.join(self.config_dir, "sensors.ini"))
+
+        w = QWidget(); lay = QVBoxLayout(w)
+        warn = QLabel(
+            "⚠ Configurazione preview — il logger ATTUALE legge solo lo SHT31-D "
+            "primario hardcoded (bus 1, addr 0x44). Salvando qui prepari "
+            "sensors.ini per quando il logger sarà aggiornato a leggerlo "
+            "(Fase 2 del refactor).")
+        warn.setWordWrap(True)
+        warn.setStyleSheet(
+            "background:#fff8e1;border:1px solid #f5b800;"
+            "padding:6px;border-radius:4px;font-size:9pt")
+        lay.addWidget(warn)
+
+        # SHT31 primario
+        self._sens_widgets = {}
+        for key, default in [
+            ("sht31_a",  {"label":"SHT31-D primario (T+RH)", "enabled":True,
+                          "bus":1, "addr":"0x44"}),
+            ("sht31_b",  {"label":"SHT31-D secondario (T+RH)","enabled":False,
+                          "bus":1, "addr":"0x45"}),
+            ("bmp388",   {"label":"BMP388 (P+T)",            "enabled":False,
+                          "bus":1, "addr":"0x77"}),
+        ]:
+            sec = ini[key] if key in ini else {}
+            grp = QGroupBox(default["label"])
+            f = QFormLayout(grp)
+            chk = QCheckBox("Abilitato")
+            chk.setChecked(self._cfg_bool(sec.get("enabled"), default["enabled"]))
+            f.addRow("", chk)
+            sp_bus = QSpinBox(); sp_bus.setRange(0, 9)
+            sp_bus.setValue(int(sec.get("bus", default["bus"])))
+            f.addRow("I2C bus:", sp_bus)
+            ed_addr = QLineEdit(sec.get("addr", default["addr"]))
+            ed_addr.setPlaceholderText("es. 0x44")
+            f.addRow("I2C address:", ed_addr)
+            lay.addWidget(grp)
+            self._sens_widgets[key] = (chk, sp_bus, ed_addr)
+
+        hint = QLabel(
+            "Suggerimento: prima di collegare un nuovo sensore, esegui "
+            "`i2cdetect -y 1` per verificare che il bus sia libero "
+            "all'indirizzo desiderato.")
+        hint.setStyleSheet("color:#666;font-size:8pt")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+        lay.addStretch()
+        return w
+
+    # ─────────────────────────────────────────── Tab Layout Pi 5
+    def _build_layout_tab(self) -> QWidget:
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        inner = QWidget()
+        vbox = QVBoxLayout(inner)
+        title = QLabel("Layout GPIO header — Raspberry Pi 5 (uguale a Pi 4/3/2)")
+        title.setStyleSheet("font-weight:bold;font-size:11pt")
+        vbox.addWidget(title)
+
+        view = QPlainTextEdit()
+        view.setReadOnly(True)
+        view.setFont(QFont("Monospace", 9))
+        view.setPlainText(PI5_PINOUT)
+        view.setStyleSheet("background:#fafafa")
+        vbox.addWidget(view, stretch=1)
+
+        scroll.setWidget(inner)
+        return scroll
+
+    # ────────────────────────────────────────────── helpers + save
+    @staticmethod
+    def _cfg_bool(v, default: bool = False) -> bool:
+        if v is None:
+            return default
+        return str(v).strip().lower() in ("true", "yes", "1", "on")
+
+    def _browse_dir(self, line_edit: QLineEdit) -> None:
+        start = os.path.expanduser(line_edit.text().strip() or "~")
+        d = QFileDialog.getExistingDirectory(self, "Seleziona cartella", start)
+        if d:
+            line_edit.setText(d)
+
+    def _on_save(self) -> None:
+        try:
+            # name.ini
+            ini = self._read_ini(os.path.join(self.config_dir, "name.ini"))
+            if "output" not in ini:
+                ini["output"] = {}
+            ini["output"]["data_path"] = self.ed_data_path.text().strip()
+            ini["output"]["basename"]  = self.ed_basename.text().strip()
+            ini["output"]["extension"] = self.ed_extension.text().strip()
+            self._write_ini(os.path.join(self.config_dir, "name.ini"), ini)
+
+            # serial.ini
+            ini = self._read_ini(os.path.join(self.config_dir, "serial.ini"))
+            if "serial" not in ini:
+                ini["serial"] = {}
+            ini["serial"]["port"]     = self.ed_serial_port.text().strip()
+            ini["serial"]["baudrate"] = self.cb_serial_baud.currentText().strip()
+            ini["serial"]["bytesize"] = str(self.sp_bytesize.value())
+            ini["serial"]["parity"]   = self.cb_parity.currentText()
+            ini["serial"]["stopbits"] = str(self.sp_stopbits.value())
+            # `timeout` letto dal logger con getint() → scrivi come intero
+            ini["serial"]["timeout"]  = str(int(round(self.sp_serial_timeout.value())))
+            self._write_ini(os.path.join(self.config_dir, "serial.ini"), ini)
+
+            # site.ini
+            ini = self._read_ini(os.path.join(self.config_dir, "site.ini"))
+            if "location" not in ini:
+                ini["location"] = {}
+            ini["location"]["name"]      = self.ed_site_name.text().strip()
+            ini["location"]["latitude"]  = f"{self.sp_lat.value():.6f}"
+            ini["location"]["longitude"] = f"{self.sp_lon.value():.6f}"
+            ini["location"]["timezone"]  = self.cb_tz.currentText().strip()
+            self._write_ini(os.path.join(self.config_dir, "site.ini"), ini)
+
+            # sensors.ini
+            ini = self._read_ini(os.path.join(self.config_dir, "sensors.ini"))
+            for key, (chk, sp_bus, ed_addr) in self._sens_widgets.items():
+                if key not in ini:
+                    ini[key] = {}
+                ini[key]["enabled"] = "true" if chk.isChecked() else "false"
+                ini[key]["bus"]     = str(sp_bus.value())
+                ini[key]["addr"]    = ed_addr.text().strip() or "0x44"
+            self._write_ini(os.path.join(self.config_dir, "sensors.ini"), ini)
+
+        except OSError as exc:
+            QMessageBox.critical(self, "Errore di scrittura", str(exc))
+            return
+
+        # Conferma + opzionale restart logger
+        reply = QMessageBox.question(
+            self, "Salvato",
+            "Configurazione scritta.\n\n"
+            "Per applicarla al backend logger CO2 (porta seriale, "
+            "cartella dati) serve un riavvio del service:\n\n"
+            "  sudo systemctl restart co2-logger\n\n"
+            "Vuoi farlo adesso?",
+            QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            try:
+                subprocess.run(["sudo", "-n", "systemctl", "restart",
+                                "co2-logger"], check=True, timeout=10)
+                QMessageBox.information(
+                    self, "Restart eseguito",
+                    "co2-logger riavviato.")
+            except (subprocess.CalledProcessError,
+                    subprocess.TimeoutExpired,
+                    FileNotFoundError) as exc:
+                QMessageBox.warning(
+                    self, "Restart automatico fallito",
+                    f"Non posso riavviare automaticamente "
+                    f"(serve sudo senza password):\n{exc}\n\n"
+                    "Esegui manualmente da terminale:\n"
+                    "  sudo systemctl restart co2-logger")
+        self.accept()
+
+
+class TabValve(QWidget):
+    """Tab valvola VICI — controllo completo via IPC verso valve-daemon.
+
+    Embed TabSchedule (editor schedule + controlli engine) dal package
+    valvescheduler. I segnali vengono ridiretti a un client IPC che parla
+    con il daemon via Unix socket. La GUI non apre la seriale: solo il
+    daemon possiede il VICI (niente race condition).
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._valve = None
-        self._engine = None
-        self._publisher = None
-        self._vs_cfg = None
-        self._program_dir = Path(_VALVE_SCHED_DIR)
         self._log = logging.getLogger("valve-tab")
+        # IPC client (lazy-importato per non rompere il monitor su sistemi
+        # senza valve-scheduler installato)
+        from valvescheduler.core.ipc_client import (
+            DaemonClient, DaemonError, DaemonUnreachable)
+        from valvescheduler.gui.main_window import TabSchedule
+        self._DaemonError = DaemonError
+        self._DaemonUnreachable = DaemonUnreachable
+        self._client = DaemonClient(timeout=2.0)
+        self._TabSchedule = TabSchedule
         self._build_ui()
-        self._load_valve_config()
+        # Refresh stato dal daemon (1s)
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._refresh_status)
+        self._timer.start(1000)
+        self._refresh_status()
 
-    def _load_valve_config(self):
-        ini_path = self._program_dir / "config" / "valve-scheduler.ini"
-        if ini_path.exists():
-            self._vs_cfg = vs_load_cfg(str(ini_path))
-            self._publisher = vs_build_publisher(self._vs_cfg)
-            n = int(self._vs_cfg.get("n_positions", 10))
-            self._tab_sched.set_n_positions(n)
-            # Porta VICI: usa /dev/vici se esiste, altrimenti da config
-            if os.path.exists("/dev/vici"):
-                self._vs_cfg["serial_port"] = "/dev/vici"
-            sched_path = self._vs_cfg.get("schedule_file", "schedule/schedule.csv")
-            if not Path(sched_path).is_absolute():
-                sched_path = self._program_dir / sched_path
-            self._tab_sched.load_initial(Path(sched_path))
-            self._tab_sched._chk_loop.setChecked(
-                bool(self._vs_cfg.get("loop_enabled", True)))
-            self._log.info("config valve-scheduler caricata da %s", ini_path)
-            # Auto-connect se richiesto dall'INI
-            if self._vs_cfg.get("auto_connect"):
-                QTimer.singleShot(500, self._connect_valve)
-        else:
-            self._log.warning("INI valve-scheduler non trovato: %s", ini_path)
-
+    # ───────────────────────────────────────────────────────────── UI
     def _build_ui(self):
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
 
-        # Header: connessione valvola
+        # Header: stato daemon + comandi manuali immediati
         hdr = QHBoxLayout()
-        self._btn_connect = QPushButton("Apri porta VICI")
-        self._btn_connect.clicked.connect(self._on_connect_clicked)
-        hdr.addWidget(self._btn_connect)
+        self._lbl_daemon = QLabel("● daemon: ?")
+        self._lbl_daemon.setFont(QFont("Arial", 10, QFont.Bold))
+        hdr.addWidget(self._lbl_daemon)
+        hdr.addSpacing(16)
+
+        self._lbl_pos_live = QLabel("pos=—")
+        self._lbl_pos_live.setFont(QFont("Arial", 14, QFont.Bold))
+        hdr.addWidget(self._lbl_pos_live)
+        hdr.addSpacing(8)
+        self._lbl_label_live = QLabel("")
+        self._lbl_label_live.setStyleSheet("color:#444;font-size:10pt")
+        hdr.addWidget(self._lbl_label_live)
+
+        hdr.addStretch()
+
+        self._btn_home = QPushButton("Home (HM)")
+        self._btn_home.setToolTip("Vai a posizione 1")
+        self._btn_home.clicked.connect(self._on_home)
+        hdr.addWidget(self._btn_home)
         self._btn_configure = QPushButton("Configura attuatore")
         self._btn_configure.setToolTip(
-            "IFM1 + AM3 + SM A + NP (multiposizione)")
-        self._btn_configure.clicked.connect(self._on_configure_clicked)
-        self._btn_configure.setEnabled(False)
+            "IFM1 + AM3 + SM A + NP (valvola multipos)")
+        self._btn_configure.clicked.connect(self._on_configure)
         hdr.addWidget(self._btn_configure)
-        self._btn_home = QPushButton("Home")
-        self._btn_home.setToolTip("HM — posizione 1")
-        self._btn_home.clicked.connect(self._on_home_clicked)
-        self._btn_home.setEnabled(False)
-        hdr.addWidget(self._btn_home)
-        hdr.addStretch()
-        self._lbl_valve_status = QLabel("valvola: non connessa")
-        self._lbl_valve_status.setStyleSheet(
-            "color:#8b8b8b;font-weight:bold;")
-        hdr.addWidget(self._lbl_valve_status)
+        self._btn_settings = QPushButton("Impostazioni…")
+        self._btn_settings.setToolTip(
+            "Modifica porta seriale, n_positions, polling, ecc.")
+        self._btn_settings.clicked.connect(self._on_settings)
+        hdr.addWidget(self._btn_settings)
         lay.addLayout(hdr)
 
         line = QFrame()
@@ -1000,15 +1668,25 @@ class TabValve(QWidget):
         line.setFrameShadow(QFrame.Sunken)
         lay.addWidget(line)
 
-        # TabSchedule riusato dal package valve-scheduler
-        service_dir = self._program_dir / "service"
+        # TabSchedule (riusato): tabella editabile + Start/Stop/Pause/Skip/Loop
+        service_dir = Path(
+            "/home/misura/programs/valve-scheduler/service")
         service_dir.mkdir(parents=True, exist_ok=True)
-        self._tab_sched = TabSchedule(
-            service_dir=service_dir,
-            n_positions=10)
+        self._tab_sched = self._TabSchedule(
+            service_dir=service_dir, n_positions=10)
+        # Inietta "Sincronizza schedule" nella riga pulsanti tabella, dopo
+        # `Salva CSV…` e dopo lo stretch → allineato a destra.
+        if hasattr(self._tab_sched, "_table_btn_row"):
+            self._btn_sync = QPushButton("⟳ Sincronizza schedule")
+            self._btn_sync.setToolTip(
+                "Manda al daemon le label/posizioni/durate della tabella.\n"
+                "Da premere dopo aver editato celle: l'IdlePoller userà le\n"
+                "nuove label per `step_label` nel file _min.raw.")
+            self._btn_sync.clicked.connect(self._on_sync_schedule)
+            self._tab_sched._table_btn_row.addWidget(self._btn_sync)
         lay.addWidget(self._tab_sched, stretch=1)
 
-        # Wire signals
+        # Wire signals → IPC client
         self._tab_sched.start_requested.connect(self._on_start)
         self._tab_sched.stop_requested.connect(self._on_stop)
         self._tab_sched.pause_requested.connect(self._on_pause)
@@ -1016,174 +1694,213 @@ class TabValve(QWidget):
         self._tab_sched.skip_requested.connect(self._on_skip)
         self._tab_sched.loop_toggled.connect(self._on_loop_toggled)
         self._tab_sched.go_position_requested.connect(self._on_manual_go)
+        # Pulsante manuale "Sincronizza schedule al daemon" (vedi _build_ui)
+        # Push iniziale: lo schedule caricato da _last_schedule.csv all'avvio
+        # del monitor è già la versione confermata, quindi va bene mandarla.
+        QTimer.singleShot(500, self._push_schedule_to_daemon)
 
-    # ── connessione valvola ──────────────────────────────────────────────
-    def _on_connect_clicked(self):
-        if self._valve is None:
-            self._connect_valve()
+    # ────────────────────────────────────────────── refresh stato daemon
+    def _refresh_status(self) -> None:
+        if not self._client.is_alive():
+            self._lbl_daemon.setText("● daemon: OFFLINE")
+            self._lbl_daemon.setStyleSheet(
+                "color:#c00;font-weight:bold;font-size:10pt")
+            self._set_btns_enabled(False)
+            return
+        try:
+            st = self._client.get_status()
+        except self._DaemonError as exc:
+            self._lbl_daemon.setText(f"● daemon: errore ({exc})")
+            self._lbl_daemon.setStyleSheet(
+                "color:#c00;font-weight:bold;font-size:10pt")
+            return
+        valve_open = bool(st.get("valve_open"))
+        sched_running = bool(st.get("schedule_running"))
+        if valve_open:
+            self._lbl_daemon.setText("● daemon: ONLINE • valvola aperta")
+            self._lbl_daemon.setStyleSheet(
+                "color:#1a7f37;font-weight:bold;font-size:10pt")
         else:
-            self._disconnect_valve()
+            self._lbl_daemon.setText("● daemon: ONLINE • valvola chiusa")
+            self._lbl_daemon.setStyleSheet(
+                "color:#b58900;font-weight:bold;font-size:10pt")
+        # Position live
+        pos = int(st.get("position", -1))
+        self._lbl_pos_live.setText(f"pos={pos}" if pos >= 1 else "pos=—")
+        if pos == 1:
+            self._lbl_pos_live.setStyleSheet("color:#2060c0;font-weight:bold")
+        elif pos == 10:
+            self._lbl_pos_live.setStyleSheet("color:#c00000;font-weight:bold")
+        elif pos >= 1:
+            self._lbl_pos_live.setStyleSheet("color:#e06000;font-weight:bold")
+        else:
+            self._lbl_pos_live.setStyleSheet("color:#888;font-weight:bold")
+        # Label live (dal valve_status.json, già letto da read_live_valve)
+        live_pos, live_label, live_fresh = read_live_valve()
+        if live_fresh and live_label and live_label not in ("-", ""):
+            self._lbl_label_live.setText(f"({live_label})")
+        else:
+            self._lbl_label_live.setText("")
+        self._set_btns_enabled(valve_open and not sched_running)
 
-    def _connect_valve(self):
-        if not self._vs_cfg:
-            QMessageBox.warning(self, "Config mancante",
-                                "File valve-scheduler.ini non trovato.")
-            return
+    def _set_btns_enabled(self, enabled: bool) -> None:
+        self._btn_home.setEnabled(enabled)
+        self._btn_configure.setEnabled(enabled)
+
+    # ────────────────────────────────────────────── azioni → IPC client
+    def _safe_call(self, fn, *args, **kwargs) -> bool:
         try:
-            v = VICIEMTCA(
-                port=self._vs_cfg["serial_port"],
-                baud=int(self._vs_cfg.get("serial_baud", 9600)),
-                timeout=float(self._vs_cfg.get("serial_timeout", 2.0)),
-                dev_id=self._vs_cfg.get("serial_dev_id", ""),
-                rs485=bool(self._vs_cfg.get("serial_rs485", False)))
-            v.open()
-            try:
-                fw = v.ping()
-            except VICITimeout:
-                v.close()
-                QMessageBox.critical(
-                    self, "Nessuna risposta",
-                    "Porta aperta ma attuatore non risponde.\n"
-                    "Controllare cavo e alimentazione.")
-                return
-            self._valve = v
-            self._log.info("VICI connesso — FW: %s", fw)
-            if self._vs_cfg.get("configure_on_start"):
-                try:
-                    v.configure_multiposition(
-                        n_positions=int(self._vs_cfg["n_positions"]),
-                        go_home=bool(self._vs_cfg.get("go_home_on_start", False)))
-                except Exception as exc:
-                    self._log.warning("configure_on_start: %s", exc)
-            self._btn_connect.setText("Chiudi porta VICI")
-            self._btn_configure.setEnabled(True)
-            self._btn_home.setEnabled(True)
-            self._lbl_valve_status.setText(f"valvola: connessa  (FW: {fw})")
-            self._lbl_valve_status.setStyleSheet(
-                "color:#1a7f37;font-weight:bold;")
-        except Exception as exc:
-            QMessageBox.critical(self, "Errore apertura", str(exc))
+            fn(*args, **kwargs)
+            return True
+        except self._DaemonUnreachable:
+            QMessageBox.warning(self, "Daemon non raggiungibile",
+                                "Il valve-daemon non risponde. Controlla:\n"
+                                "  systemctl status valve-daemon")
+            return False
+        except self._DaemonError as exc:
+            QMessageBox.warning(self, "Errore daemon", str(exc))
+            return False
 
-    def _disconnect_valve(self):
-        if self._engine and self._engine.isRunning():
-            QMessageBox.warning(self, "Schedule in corso",
-                                "Ferma lo schedule prima di chiudere.")
-            return
-        if self._valve:
-            try:
-                self._valve.close()
-            except Exception:
-                pass
-            self._valve = None
-        self._btn_connect.setText("Apri porta VICI")
-        self._btn_configure.setEnabled(False)
-        self._btn_home.setEnabled(False)
-        self._lbl_valve_status.setText("valvola: non connessa")
-        self._lbl_valve_status.setStyleSheet(
-            "color:#8b8b8b;font-weight:bold;")
+    def _on_home(self):
+        self._safe_call(self._client.home)
 
-    def _on_configure_clicked(self):
-        if not self._valve:
+    def _on_configure(self):
+        if QMessageBox.question(
+                self, "Configura attuatore",
+                "Applico IFM1 + AM3 + SM A + NP10 e HM.\n"
+                "Procedere solo dopo aver eseguito AL a valvola smontata.\n\n"
+                "Continuare?",
+                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
             return
-        try:
-            self._valve.configure_multiposition(
-                n_positions=int(self._vs_cfg["n_positions"]),
-                go_home=True)
+        if self._safe_call(self._client.configure):
             QMessageBox.information(
-                self, "OK",
-                f"Attuatore configurato multipos ({self._vs_cfg['n_positions']} pos).")
-        except Exception as exc:
-            QMessageBox.warning(self, "Errore", str(exc))
+                self, "Configurazione eseguita",
+                "Attuatore configurato in modalità multiposizione "
+                "(AM3, NP10) e Home eseguita.\n"
+                "Posizione corrente: 1.")
 
-    def _on_home_clicked(self):
-        if self._valve:
-            try:
-                self._valve.home()
-            except Exception as exc:
-                QMessageBox.warning(self, "Errore", str(exc))
+    def _on_manual_go(self, position: int):
+        self._safe_call(self._client.go, int(position))
 
-    def _on_manual_go(self, position):
-        if not self._valve:
-            QMessageBox.warning(self, "Non connesso",
-                                "Apri prima la porta VICI.")
-            return
-        try:
-            self._valve.go_to(position)
-        except Exception as exc:
-            QMessageBox.warning(self, "Errore", str(exc))
-
-    # ── engine ───────────────────────────────────────────────────────────
     def _on_start(self):
-        if self._engine and self._engine.isRunning():
+        sched = self._tab_sched.get_schedule()
+        steps = [{"position": s.position,
+                  "minutes": s.minutes,
+                  "label": s.label} for s in sched.steps]
+        loop = self._tab_sched._chk_loop.isChecked()
+        if not steps:
+            QMessageBox.warning(self, "Schedule vuoto",
+                                "Aggiungi almeno uno step.")
             return
-        if not self._valve:
-            QMessageBox.warning(self, "Non connesso",
-                                "Apri prima la porta VICI.")
-            return
-        schedule = self._tab_sched.get_schedule()
-        errs = schedule.validate(int(self._vs_cfg["n_positions"]))
-        if errs:
-            QMessageBox.warning(
-                self, "Schedule non valido",
-                "Errori:\n - " + "\n - ".join(errs))
-            return
-        self._tab_sched._persist()
-        status_file = self._vs_cfg.get("status_file",
-                                        "service/valve_status.json")
-        if not Path(status_file).is_absolute():
-            status_file = self._program_dir / status_file
-        self._engine = ScheduleEngine(
-            valve=self._valve,
-            schedule=schedule,
-            loop_enabled=self._tab_sched._chk_loop.isChecked(),
-            status_file=Path(status_file),
-            mqtt_publish=(self._publisher.publish
-                          if self._publisher else None),
-            mqtt_topic=self._vs_cfg.get("mqtt_topic", "valve/status"),
-        )
-        self._engine.status_changed.connect(self._tab_sched.on_status)
-        self._engine.log_msg.connect(
-            lambda msg: self._log.info("[engine] %s", msg))
-        self._engine.start()
-        self._log.info("schedule avviato — %d step", len(schedule))
+        # Persiste localmente (autosave)
+        try:
+            self._tab_sched._persist()
+        except Exception:
+            pass
+        self._safe_call(self._client.start_schedule, steps, loop)
 
     def _on_stop(self):
-        if self._engine:
-            self._engine.stop()
+        self._safe_call(self._client.stop_schedule)
 
     def _on_pause(self):
-        if self._engine:
-            self._engine.pause()
+        self._safe_call(self._client.pause)
 
     def _on_resume(self):
-        if self._engine:
-            self._engine.resume()
+        self._safe_call(self._client.resume)
 
     def _on_skip(self):
-        if self._engine:
-            self._engine.skip_current_step()
+        self._safe_call(self._client.skip)
 
-    def _on_loop_toggled(self, enabled):
-        if self._vs_cfg:
-            self._vs_cfg["loop_enabled"] = enabled
-        if self._engine and self._engine.isRunning():
-            self._engine.set_loop_enabled(enabled)
+    def _on_loop_toggled(self, enabled: bool):
+        self._safe_call(self._client.set_loop, bool(enabled))
 
-    # ── cleanup ──────────────────────────────────────────────────────────
+    # ───────────────────────────── push label allo daemon (no start)
+    def _push_schedule_to_daemon(self, silent: bool = True) -> bool:
+        """Manda la schedule corrente (label per posizione) al daemon SENZA
+        avviarla. Permette all'IdlePoller di scrivere `step_label` corretta
+        nel JSON (e quindi nel file _min.raw) anche senza premere Start.
+
+        `silent=True` → non mostra dialog di errore (push automatico iniziale).
+        `silent=False` → mostra messaggi di errore (chiamata da pulsante)."""
+        try:
+            sched = self._tab_sched.get_schedule()
+        except Exception as exc:
+            if not silent:
+                QMessageBox.warning(self, "Errore",
+                                    f"Schedule non leggibile: {exc}")
+            return False
+        if not sched.steps:
+            if not silent:
+                QMessageBox.warning(self, "Schedule vuoto",
+                                    "Aggiungi almeno uno step prima.")
+            return False
+        steps = [{"position": s.position,
+                  "minutes": s.minutes,
+                  "label": s.label} for s in sched.steps]
+        try:
+            self._client.set_schedule(steps)
+            return True
+        except self._DaemonUnreachable:
+            if not silent:
+                QMessageBox.warning(self, "Daemon non raggiungibile",
+                                    "Controlla `systemctl status valve-daemon`.")
+            return False
+        except self._DaemonError as exc:
+            if not silent:
+                QMessageBox.warning(self, "Errore daemon", str(exc))
+            return False
+
+    def _on_sync_schedule(self) -> None:
+        if self._push_schedule_to_daemon(silent=False):
+            # autosave anche su CSV per persistenza tra restart
+            try:
+                self._tab_sched._persist()
+            except Exception:
+                pass
+            QMessageBox.information(
+                self, "Sincronizzato",
+                "Schedule inviata al daemon. La label è stata salvata anche\n"
+                "in _last_schedule.csv (riproposta al prossimo avvio).")
+
+    def _on_settings(self):
+        try:
+            current = self._client.get_config()
+        except (self._DaemonError, self._DaemonUnreachable) as exc:
+            QMessageBox.warning(self, "Daemon non disponibile",
+                                f"Impossibile leggere il config: {exc}")
+            return
+        dlg = DaemonSettingsDialog(current, parent=self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        new_cfg = dlg.values()
+        # Confronta con quello attuale: se identico, niente reload
+        if all(current.get(k) == v for k, v in new_cfg.items()):
+            QMessageBox.information(self, "Nessuna modifica",
+                                    "Le impostazioni sono invariate.")
+            return
+        try:
+            self._client.reload_config(new_cfg)
+        except self._DaemonError as exc:
+            QMessageBox.warning(self, "Reload fallito", str(exc))
+            return
+        except self._DaemonUnreachable as exc:
+            QMessageBox.warning(self, "Daemon non raggiungibile", str(exc))
+            return
+        QMessageBox.information(
+            self, "Impostazioni salvate",
+            "Config aggiornato. Daemon ha riaperto la porta seriale "
+            "con le nuove impostazioni.")
+        # Aggiorna n_positions nella tabella schedule (TabSchedule)
+        if hasattr(self._tab_sched, "set_n_positions"):
+            try:
+                self._tab_sched.set_n_positions(int(new_cfg["n_positions"]))
+            except Exception:
+                pass
+
+    # ─────────────────────────────────────────────────────────── cleanup
     def cleanup(self):
-        if self._engine and self._engine.isRunning():
-            self._engine.stop()
-            self._engine.wait(3000)
-        if self._publisher:
-            try:
-                self._publisher.stop()
-            except Exception:
-                pass
-        if self._valve:
-            try:
-                self._valve.close()
-            except Exception:
-                pass
+        # Niente da rilasciare: il client IPC apre/chiude socket per ogni call.
+        pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1204,6 +1921,10 @@ class GMP343Monitor(QMainWindow):
         self.timer.timeout.connect(self._tick)
         self.timer.start(UPDATE_MS)
         self._tick()  # primo aggiornamento immediato
+        # Tick rapido per i LED (legge valve_status.json, latenza ~2s)
+        self.timer_fast = QTimer(self)
+        self.timer_fast.timeout.connect(self._tick_fast)
+        self.timer_fast.start(1000)
 
     # ── configurazione ────────────────────────────────────────────────────────
 
@@ -1262,6 +1983,17 @@ class GMP343Monitor(QMainWindow):
         y  = self.guicfg.getint("window", "y",      fallback=50)
         self.setWindowTitle("GMP343 Monitor  v2")
         self.setGeometry(x, y, w, h)
+
+        # Menubar — Configurazione
+        mb = self.menuBar()
+        m_cfg = mb.addMenu("&Configurazione")
+        act_cfg_co2 = QAction("Impostazioni CO2 logger…", self)
+        act_cfg_co2.triggered.connect(self._open_co2_config)
+        m_cfg.addAction(act_cfg_co2)
+        if _HAS_VALVE_SCHEDULER:
+            act_cfg_valve = QAction("Impostazioni valve-daemon…", self)
+            act_cfg_valve.triggered.connect(self._open_valve_config)
+            m_cfg.addAction(act_cfg_valve)
 
         tabs = QTabWidget()
         self.setCentralWidget(tabs)
@@ -1400,6 +2132,15 @@ class GMP343Monitor(QMainWindow):
         sl.setFont(QFont("Arial", self.guicfg.getint("fonts","subtitle_size",fallback=9)))
         vt.addWidget(sl)
         hbox.addLayout(vt); hbox.addStretch()
+        # LED stato MEASURE/CALIB in alto a destra (replica quello della tab Grafico)
+        self.lbl_flag_top = QLabel("MEASURE")
+        self.lbl_flag_top.setFont(QFont("Arial", 11, QFont.Bold))
+        self.lbl_flag_top.setAlignment(Qt.AlignCenter)
+        self.lbl_flag_top.setStyleSheet(
+            "color:#2060c0;background:#ffffff;"
+            "border:1.5px solid #2060c0;border-radius:8px;"
+            "padding:4px 12px;")
+        hbox.addWidget(self.lbl_flag_top, 0, Qt.AlignTop)
         return hbox
 
     # ── tab grafico ───────────────────────────────────────────────────────────
@@ -1408,11 +2149,55 @@ class GMP343Monitor(QMainWindow):
         self.graph = GraphWidget(self.cfg)
         return self.graph
 
+    # ── menu Configurazione ──────────────────────────────────────────────────
+
+    def _open_co2_config(self):
+        dlg = MonitorConfigDialog(CONFIG_DIR, parent=self)
+        dlg.exec_()
+
+    def _open_valve_config(self):
+        if hasattr(self, "tab_valve") and self.tab_valve is not None:
+            self.tab_valve._on_settings()
+
     # ── tick timer ────────────────────────────────────────────────────────────
 
     def _tick(self):
         self._update_monitor()
         self.graph.refresh()
+
+    def _tick_fast(self):
+        """Tick rapido (1s) solo per i LED MEASURE/CALIB — leggono direttamente
+        valve_status.json per latenza ~2s (la posizione è già visibile in
+        tab Valvola VICI alla stessa cadenza)."""
+        live_pos, live_label, live_fresh = read_live_valve()
+        if not live_fresh or live_pos < 1:
+            return  # senza dato live, lasciamo lo stato del tick lento
+        last_pos = live_pos
+        last_flag = "measure" if live_pos == _MEASURE_POSITION else "calib"
+        if last_flag == "calib" and last_pos == 10:
+            color = "#c00000"; text = f"CALIB pos{last_pos}"
+        elif last_flag == "calib":
+            color = "#e06000"; text = f"CALIB pos{last_pos}"
+        else:
+            color = "#2060c0"; text = "MEASURE"
+        if live_label and live_label != "-":
+            text = f"{text} ({live_label})"
+        # Monitor tab — LED in alto a destra + footer "Ultima Acquisizione"
+        if hasattr(self, "lbl_flag_top"):
+            self.lbl_flag_top.setText(text)
+            self.lbl_flag_top.setStyleSheet(
+                f"color:{color};background:#ffffff;"
+                f"border:1.5px solid {color};border-radius:8px;padding:4px 12px;")
+        if hasattr(self, "lbl_flag"):
+            self.lbl_flag.setText(f"● {text}")
+            self.lbl_flag.setStyleSheet(
+                f"color:{color};font-weight:bold;font-size:10px")
+        # Tab Grafico — flag_label in alto a destra del plot
+        if hasattr(self, "graph") and hasattr(self.graph, "flag_label"):
+            self.graph.flag_label.set_text(text)
+            self.graph.flag_label.set_color(color)
+            self.graph.flag_label.get_bbox_patch().set_edgecolor(color)
+            self.graph.canvas.draw_idle()
 
     def _update_monitor(self):
         # Timestamp
@@ -1438,6 +2223,10 @@ class GMP343Monitor(QMainWindow):
             self.lbl_t.setText("--- °C"); self.lbl_rh.setText("--- %")
             self.lbl_ts.setText("Nessun dato")
             self.lbl_flag.setText("---"); self.lbl_flag.setStyleSheet("color:#888;font-size:9px")
+            self.lbl_flag_top.setText("---")
+            self.lbl_flag_top.setStyleSheet(
+                "color:#888;background:#ffffff;"
+                "border:1.5px solid #888;border-radius:8px;padding:4px 12px;")
             self.lbl_file.setText("file non trovato" if not path else path)
             self.lbl_min.setText("---"); self.lbl_max.setText("---")
             self.lbl_avg.setText("---"); self.lbl_cnt.setText("0")
@@ -1454,13 +2243,38 @@ class GMP343Monitor(QMainWindow):
         last_t    = float(t_arr[-1])
         last_rh   = float(rh_arr[-1])
 
-        # Label flag
-        if last_flag == "calib":
-            self.lbl_flag.setText("● CALIB")
-            self.lbl_flag.setStyleSheet("color:#e06000;font-weight:bold;font-size:10px")
+        # Label flag — fonte LIVE per aggiornamento immediato:
+        #   1) valve_status.json (latenza ~2s, scritta dall'IdlePoller)
+        #   2) fallback: ultimo flag/pos del file _min.raw (latenza ~60s)
+        live_pos, live_label, live_fresh = read_live_valve()
+        if live_fresh and live_pos >= 1:
+            last_pos = live_pos
+            last_flag = "measure" if live_pos == _MEASURE_POSITION else "calib"
+            label_for_text = live_label
         else:
-            self.lbl_flag.setText("● MEASURE")
-            self.lbl_flag.setStyleSheet("color:#2060c0;font-weight:bold;font-size:10px")
+            last_pos = int(valve_pos[-1]) if len(valve_pos) > 0 else -1
+            label_for_text = (valve_labels[-1] if len(valve_labels) > 0
+                              and valve_labels[-1] not in ("-", "")
+                              else "")
+        # Pos 10 → rosso (span-high), altre pos calib → arancione, pos 1 → blu.
+        if last_flag == "calib" and last_pos == 10:
+            color = "#c00000"
+            text_top = f"CALIB pos{last_pos}"
+        elif last_flag == "calib":
+            color = "#e06000"
+            text_top = f"CALIB pos{last_pos}" if last_pos >= 1 else "CALIB"
+        else:
+            color = "#2060c0"
+            text_top = "MEASURE"
+        if label_for_text and label_for_text != "-":
+            text_top = f"{text_top} ({label_for_text})"
+        self.lbl_flag.setText(f"● {text_top}")
+        self.lbl_flag.setStyleSheet(
+            f"color:{color};font-weight:bold;font-size:10px")
+        self.lbl_flag_top.setText(text_top)
+        self.lbl_flag_top.setStyleSheet(
+            f"color:{color};background:#ffffff;"
+            f"border:1.5px solid {color};border-radius:8px;padding:4px 12px;")
 
         # Filtra sentinella per statistiche (sia vecchia 999.99 che nuova -999.99)
         sent = self._thr("sentinel_value")

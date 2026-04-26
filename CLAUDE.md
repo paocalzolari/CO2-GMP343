@@ -274,14 +274,35 @@ Edit [`config/integration.ini`](config/integration.ini):
 
 ```ini
 [valve_scheduler]
-enabled       = true
-status_file   = ~/programs/valve-scheduler/service/valve_status.json
-stale_after_s = 10
+enabled          = true
+status_file      = ~/programs/valve-scheduler/service/valve_status.json
+stale_after_s    = 10
+calib_auto       = true
+measure_position = 1
+calib_labels     = zero,span,span-low,span-high
 ```
 
 Poi riavvia il backend: `sudo systemctl restart co2-logger` (il flag è
 letto una volta all'avvio; i file giornalieri esistenti mantengono il
 loro header, quelli nuovi avranno le 8 colonne).
+
+### Regola flag automatico (`calib_auto=true`)
+
+Il backend determina `measure`/`calib` così:
+
+1. **Posizionale** (primaria): se `valve_pos != measure_position` → `calib`.
+   La posizione di misura ambientale è una sola (default `1`); tutte le
+   altre sono per bombole di calibrazione (zero, span, ecc.).
+2. **Per label** (legacy, in OR): se `valve_label ∈ calib_labels` → `calib`.
+   Permette di forzare `calib` anche su `pos = measure_position`.
+3. **Fallback**: se valve-scheduler non risponde / file stale / engine
+   `idle|stopped` → mantiene l'**ultimo flag valido**. Stato interno al
+   modulo `gmp343_valve_state`, all'avvio inizializzato a `measure`.
+
+Il logger di calibrazione manuale (`gmp343_sht31_calib.py`) ha un **popup
+di conferma** sul pulsante toggle `measure ↔ calib`: ricorda all'utente
+che in modo automatico il flag è gestito dalla valvola e che il toggle
+manuale può creare incoerenze (flag scritto != posizione registrata).
 
 ### Sentinelle
 
@@ -305,6 +326,14 @@ run contiguo di posizione valvola, colorata tramite cmap `tab20` (fino a
 un'etichetta `<pos> <label>` sopra la striscia. Attivazione dalla
 checkbox **"Posizione valvola"** (default ON; no-op se i file non hanno
 le colonne valvola).
+
+Inoltre, quando i file hanno le colonne valvola, gli **scatter dei punti
+CO₂** sono colorati per posizione con la stessa palette `tab20`, con
+legenda dinamica `pos N (label)` per ogni posizione presente nei dati
+visibili. Marker: cerchio per la posizione di misura, diamante per le
+posizioni di calibrazione (basato sul flag prevalente in quella
+posizione). Per i file legacy senza colonne valvola si mantiene la
+visualizzazione a due colori (blu = `measure`, arancione = `calib`).
 
 ### Diagnosi rapida
 

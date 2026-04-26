@@ -12,6 +12,12 @@ ogni riga del file `_min.raw` contiene 2 colonne aggiuntive dopo il flag:
 `valve_pos` (intero 1..N o `-1` se sconosciuto) e `valve_label` (stringa
 senza spazi, `-` se vuota/sconosciuta).
 
+Regola flag (get_flag):
+  - flag = "calib" se valve_pos != measure_position (default 1)
+  - oppure se valve_label è in calib_labels (legacy, OR con la regola sopra)
+  - altrimenti "measure"
+  - se valve-scheduler non risponde → ultimo flag valido (stato interno)
+
 Progettato per Raspberry Pi 5 (bassa latenza, zero deps esterne):
   - solo stdlib (json, os, datetime)
   - cache per mtime: non riparsa se il file non è cambiato
@@ -22,7 +28,7 @@ Progettato per Raspberry Pi 5 (bassa latenza, zero deps esterne):
 Formato atteso del JSON prodotto da valve-scheduler:
 {
   "timestamp": "2026-04-23T10:30:45+00:00",
-  "state": "running",           // running|paused|stopped|idle
+  "state": "running",           // running|paused|stopped|idle|monitoring
   "step_index": 3,
   "step_total": 10,
   "step_label": "span-low",
@@ -32,6 +38,13 @@ Formato atteso del JSON prodotto da valve-scheduler:
   "loop_enabled": true,
   "cycle_count": 2
 }
+
+Lo stato `monitoring` è emesso dall'IdlePoller della GUI quando la valvola
+è connessa ma nessuno schedule è in esecuzione: ogni ~2s legge `CP` e
+pubblica la posizione corrente. Permette al logger di rilevare anche
+movimenti manuali della valvola (via comando `Go to position` o pannello
+fisico). Per il consumer è equivalente a `running`: importa solo il campo
+`position` + freschezza del `timestamp`.
 """
 from __future__ import annotations
 import json
@@ -112,7 +125,7 @@ def read_valve_status(path: str,
         pos_int = -1
 
     if pos_int < 1:
-        # posizione sconosciuta o engine in idle
+        # posizione sconosciuta (sentinella -1 dal poller / engine idle)
         return (None, "")
 
     # aggiorna cache
@@ -143,32 +156,57 @@ def format_for_raw(path: str,
     return pos_str, safe
 
 
+# Ultimo flag valido restituito da get_flag(): usato come fallback quando
+# il valve-scheduler non risponde. Inizializzato a "measure" (assunzione
+# di default all'avvio del logger, prima del primo dato valvola valido).
+_last_valid_flag: str = "measure"
+
+
 def get_flag(path: str,
              stale_after_s: float = 10.0,
-             calib_labels: list[str] | None = None
+             calib_labels: list[str] | None = None,
+             measure_position: int = 1,
              ) -> str:
-    """Determina il flag measure/calib in base alla valve_label corrente.
+    """Determina il flag measure/calib in base a posizione + label valvola.
+
+    Regola (OR logico):
+      - flag = "calib" se valve_pos != measure_position
+      - oppure flag = "calib" se valve_label è in calib_labels
+      - altrimenti flag = "measure"
+
+    Fallback: se il file è mancante/stale/corrotto la funzione restituisce
+    l'ULTIMO flag valido restituito da una chiamata precedente (stato
+    interno al modulo). All'avvio del processo, prima di ogni dato valido,
+    il fallback è "measure".
 
     Args:
         path: percorso al file valve_status.json.
         stale_after_s: soglia staleness (secondi).
-        calib_labels: lista di label (case-insensitive) che indicano "calib".
-            Se None o vuota, ritorna sempre "measure".
-
-    Returns:
-        "calib" se la label corrente è in calib_labels, "measure" altrimenti.
-        Se il file è mancante/stale/corrotto → "measure" (fallback sicuro).
+        calib_labels: lista di label (case-insensitive) che forzano "calib"
+            anche se la posizione è quella di misura. Lasciare None/vuota
+            per affidarsi solo alla regola posizionale.
+        measure_position: posizione della valvola che corrisponde alla
+            misura ambientale (default 1). Tutte le altre posizioni
+            classificano il dato come "calib".
     """
-    if not calib_labels:
-        return "measure"
+    global _last_valid_flag
     pos, label = read_valve_status(path, stale_after_s)
-    if pos is None or not label:
-        return "measure"
-    label_lower = label.lower()
-    for cl in calib_labels:
-        if cl.lower() == label_lower:
-            return "calib"
-    return "measure"
+    if pos is None:
+        # valve-scheduler non risponde / stato stale / engine idle
+        return _last_valid_flag
+
+    flag = "measure"
+    if pos != measure_position:
+        flag = "calib"
+    elif calib_labels and label:
+        label_lower = label.lower()
+        for cl in calib_labels:
+            if cl.lower() == label_lower:
+                flag = "calib"
+                break
+
+    _last_valid_flag = flag
+    return flag
 
 
 # ----------------------------------------------------------------- CLI helper

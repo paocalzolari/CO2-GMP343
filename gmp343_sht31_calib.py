@@ -32,7 +32,7 @@ except ImportError:
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QGroupBox
+    QPushButton, QGroupBox, QMessageBox
 )
 from PyQt5.QtCore  import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui   import QFont
@@ -603,10 +603,37 @@ class CalibLogger(QMainWindow):
         self.lbl_datetime.setText(now)
 
     def _toggle_mode(self):
-        if self.mode == FLAG_MEASURE:
-            self.mode = FLAG_CALIB
+        new_mode = FLAG_CALIB if self.mode == FLAG_MEASURE else FLAG_MEASURE
+        if new_mode == FLAG_CALIB:
+            title = "Conferma passaggio a CALIB"
+            text = (
+                "Stai per marcare i dati come <b>CALIB</b> (calibrazione).\n\n"
+                "Da ora in poi, ogni record scritto sui file giornalieri "
+                "sarà etichettato con flag <code>calib</code>.\n\n"
+                "Confermi solo se sai cosa stai facendo: in modalità "
+                "automatica il flag è già gestito dalla posizione della "
+                "valvola (vedi config/integration.ini → measure_position)."
+                "\n\nProcedere?"
+            )
         else:
-            self.mode = FLAG_MEASURE
+            title = "Conferma passaggio a MEASURE"
+            text = (
+                "Stai per marcare i dati come <b>MEASURE</b> (misura ambientale).\n\n"
+                "Da ora in poi, ogni record scritto sui file giornalieri "
+                "sarà etichettato con flag <code>measure</code>.\n\n"
+                "Assicurati di non essere ancora collegato a una bombola "
+                "di calibrazione: il dato verrebbe registrato come "
+                "ambiente quando in realtà è in calibrazione."
+                "\n\nProcedere?"
+            )
+        reply = QMessageBox.question(
+            self, title, text,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.mode = new_mode
         self.thread.set_flag(self.mode)
         self._apply_mode_style()
 

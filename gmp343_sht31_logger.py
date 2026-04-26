@@ -136,17 +136,21 @@ def read_sht31(bus):
 def load_valve_integration():
     """Carica la config integrazione valve-scheduler (opt-in, retrocompat).
 
-    Restituisce (enabled, status_file, stale_after_s, calib_auto, calib_labels).
+    Restituisce (enabled, status_file, stale_after_s, calib_auto,
+                 calib_labels, measure_position).
     Se integration.ini non esiste o il modulo valve_state non è importabile,
     enabled=False — il logger scrive nel formato storico senza colonne valvola.
-    Se calib_auto=True, il flag measure/calib è determinato dalla valve_label.
+    Se calib_auto=True, il flag measure/calib è determinato così:
+      - flag "calib" se valve_pos != measure_position (regola primaria)
+      - oppure se valve_label è in calib_labels (legacy, OR)
+      - se valve-scheduler non risponde → mantiene l'ultimo flag valido
     """
     if not _HAS_VALVE_MODULE or not os.path.exists(INTEGRATION_INI):
-        return (False, "", 10.0, False, [])
+        return (False, "", 10.0, False, [], 1)
     cp = configparser.ConfigParser()
     cp.read(INTEGRATION_INI)
     if not cp.has_section("valve_scheduler"):
-        return (False, "", 10.0, False, [])
+        return (False, "", 10.0, False, [], 1)
     enabled = cp.getboolean("valve_scheduler", "enabled", fallback=False)
     status_file = cp.get("valve_scheduler", "status_file",
                          fallback="~/programs/valve-scheduler/service/valve_status.json")
@@ -154,8 +158,9 @@ def load_valve_integration():
     calib_auto = cp.getboolean("valve_scheduler", "calib_auto", fallback=False)
     calib_labels_raw = cp.get("valve_scheduler", "calib_labels", fallback="")
     calib_labels = [s.strip() for s in calib_labels_raw.split(",") if s.strip()]
+    measure_position = cp.getint("valve_scheduler", "measure_position", fallback=1)
     return (enabled, os.path.expanduser(status_file), stale,
-            calib_auto, calib_labels)
+            calib_auto, calib_labels, measure_position)
 
 
 def get_data_dir(config) -> str:
@@ -185,13 +190,14 @@ def get_filenames(config):
 def write_headers_if_needed(raw_file, avg_file, config, valve_enabled=False):
     """
     Scrive header nei file se non esistono.
-    RAW: #date time CO2[PPM] T[C] RH[%] flag
+    RAW: #date time CO2[PPM] T[C] RH[%] flag [valve_pos valve_label]
     MIN: #date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag [valve_pos valve_label]
     """
-    raw_header = "#date time CO2[PPM] T[C] RH[%] flag"
     if valve_enabled:
+        raw_header = "#date time CO2[PPM] T[C] RH[%] flag valve_pos valve_label"
         avg_header = "#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag valve_pos valve_label"
     else:
+        raw_header = "#date time CO2[PPM] T[C] RH[%] flag"
         avg_header = "#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag"
 
     if not os.path.exists(raw_file):
@@ -244,15 +250,21 @@ def _valve_suffix(valve_enabled, valve_status_file, valve_stale_s):
         return " -1 -"
 
 
-def _auto_flag(calib_auto, valve_enabled, valve_status_file, valve_stale_s, calib_labels):
+def _auto_flag(calib_auto, valve_enabled, valve_status_file, valve_stale_s,
+               calib_labels, measure_position=1):
     """Determina il flag measure/calib in base alla valvola (se calib_auto attivo).
+
+    Regola (in valve_get_flag): "calib" se valve_pos != measure_position
+    OR valve_label ∈ calib_labels. Se valve-scheduler non risponde, viene
+    mantenuto l'ultimo flag valido.
 
     Se calib_auto è False o la valvola non è abilitata: ritorna 'measure'.
     """
     if not calib_auto or not valve_enabled:
         return "measure"
     try:
-        return valve_get_flag(valve_status_file, valve_stale_s, calib_labels)
+        return valve_get_flag(valve_status_file, valve_stale_s,
+                              calib_labels, measure_position)
     except Exception:
         return "measure"
 
@@ -263,11 +275,12 @@ def main():
 
     # Integrazione valve-scheduler (opt-in, letta una volta all'avvio)
     (valve_enabled, valve_status_file, valve_stale_s,
-     calib_auto, calib_labels) = load_valve_integration()
+     calib_auto, calib_labels, measure_position) = load_valve_integration()
     if valve_enabled:
         print(f"[integration] valve-scheduler ATTIVA — status_file={valve_status_file}")
         if calib_auto:
-            print(f"[integration] calib_auto ATTIVO — calib_labels={calib_labels}")
+            print(f"[integration] calib_auto ATTIVO — measure_position={measure_position}, "
+                  f"calib_labels={calib_labels}")
         else:
             print("[integration] calib_auto disattivo — flag sempre 'measure'")
     else:
@@ -334,10 +347,12 @@ def main():
                     t, rh = read_sht31(sht31_bus)
 
                     flag = _auto_flag(calib_auto, valve_enabled,
-                                      valve_status_file, valve_stale_s, calib_labels)
+                                      valve_status_file, valve_stale_s,
+                                      calib_labels, measure_position)
 
+                    valve_suf_raw = _valve_suffix(valve_enabled, valve_status_file, valve_stale_s)
                     with open(raw_file, 'a') as f_raw:
-                        f_raw.write(f"{ts_str} {co2:.2f} {t:.2f} {rh:.2f} {flag}\n")
+                        f_raw.write(f"{ts_str} {co2:.2f} {t:.2f} {rh:.2f} {flag}{valve_suf_raw}\n")
 
                     if current_timestamp.replace(second=0, microsecond=0) == current_minute:
                         co2_values.append(co2)
@@ -355,7 +370,8 @@ def main():
                             t_avg,  t_std  = mean_std_missing(t_values)
                             rh_avg, rh_std = mean_std_missing(rh_values)
                             flag = _auto_flag(calib_auto, valve_enabled,
-                                              valve_status_file, valve_stale_s, calib_labels)
+                                              valve_status_file, valve_stale_s,
+                                              calib_labels, measure_position)
                             valve_suf = _valve_suffix(valve_enabled, valve_status_file, valve_stale_s)
                             f_avg.write(
                                 f"{ts_avg} {co2_avg:.2f} {co2_std:.2f} "
@@ -376,7 +392,8 @@ def main():
                     with open(avg_file, 'a') as f_avg:
                         ts_avg = current_minute.strftime("%Y-%m-%d %H:%M:%S")
                         flag = _auto_flag(calib_auto, valve_enabled,
-                                          valve_status_file, valve_stale_s, calib_labels)
+                                          valve_status_file, valve_stale_s,
+                                          calib_labels, measure_position)
                         valve_suf = _valve_suffix(valve_enabled, valve_status_file, valve_stale_s)
                         f_avg.write(
                             f"{ts_avg} {MISSING:.2f} {MISSING:.2f} "
