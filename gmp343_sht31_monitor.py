@@ -23,7 +23,7 @@ from PyQt5.QtWidgets import (
     QComboBox, QDateEdit, QCheckBox, QFrame, QMessageBox,
     QDialog, QFormLayout, QSpinBox, QDoubleSpinBox, QLineEdit,
     QDialogButtonBox, QFileDialog, QToolButton,
-    QPlainTextEdit, QScrollArea, QAction
+    QPlainTextEdit, QScrollArea, QAction, QSizePolicy
 )
 from PyQt5.QtCore  import QTimer, Qt, QDate
 from PyQt5.QtGui   import QFont, QPixmap
@@ -139,6 +139,68 @@ def build_filename(cfg: configparser.ConfigParser, d: date_type) -> str:
     if not matches:
         return ""
     return max(matches, key=os.path.getmtime)
+
+
+def read_last_raw_sample(cfg: configparser.ConfigParser, d: date_type):
+    """Legge l'ultima riga del file `.raw` (campioni grezzi del giorno d).
+
+    Formati supportati:
+      - v3 (dal 2026-04-15): `date time CO2 T RH flag`  → 6 colonne
+      - v2 (prima):          `date time CO2 flag`       → 4 colonne (T/RH = None)
+    Timestamp `YYYY-MM-DD HH:MM:SS.fff`. Sentinella `-999.99` per
+    valori mancanti.
+
+    Returns: (ts_datetime|None, co2|None, t|None, rh|None, flag|None).
+    Tutto None se il file manca, è vuoto, o l'ultima riga non è parsabile.
+    """
+    import glob
+    ext = cfg.get("output", "extension", fallback="raw")
+    ddir = get_data_dir(cfg)
+    pattern = os.path.join(ddir, f"*_{d.strftime('%Y%m%d')}_p00.{ext}")
+    matches = [m for m in glob.glob(pattern)
+               if "_p00_min." not in os.path.basename(m)]
+    if not matches:
+        return (None, None, None, None, None)
+    path = max(matches, key=os.path.getmtime)
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            chunk = min(4096, size)
+            f.seek(max(0, size - chunk))
+            tail = f.read().decode("utf-8", errors="ignore")
+    except OSError:
+        return (None, None, None, None, None)
+    lines = [ln.strip() for ln in tail.splitlines()
+             if ln.strip() and not ln.startswith("#")]
+    if not lines:
+        return (None, None, None, None, None)
+    parts = lines[-1].split()
+    if len(parts) < 4:
+        return (None, None, None, None, None)
+    ts_str = f"{parts[0]} {parts[1]}"
+    ts = None
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            ts = datetime.strptime(ts_str, fmt)
+            break
+        except ValueError:
+            continue
+    try:
+        co2 = float(parts[2])
+    except (ValueError, IndexError):
+        return (ts, None, None, None, None)
+    if len(parts) >= 6:
+        # v3: date time CO2 T RH flag
+        try:
+            t = float(parts[3]); rh = float(parts[4]); flag = parts[5]
+        except (ValueError, IndexError):
+            t, rh, flag = None, None, None
+    else:
+        # v2: date time CO2 flag (no T/RH)
+        t, rh = None, None
+        flag = parts[3] if len(parts) >= 4 else None
+    return (ts, co2, t, rh, flag)
 
 
 def _startup_log():
@@ -405,8 +467,11 @@ class GraphWidget(QWidget):
         self._night_poly = []   # patch zone notturne
         self._valve_poly = []   # patch posizione valvola (striscia bassa)
         self._valve_text = []   # label testuali "pos=N" lungo la striscia
-        self._sc_by_pos  = []   # PathCollection scatter per posizione valvola
-        self._pos_legend = None # Legend handle (rimosso/ricreato a ogni reload)
+        self._sc_by_pos     = []   # PathCollection scatter per posizione valvola
+        self._pos_legend    = None # Legend handle (rimosso/ricreato a ogni reload)
+        self._errorbar      = None # ErrorbarContainer per σ sul grafico CO₂
+        self._errorbar_t    = None # ErrorbarContainer per σ sul grafico T
+        self._errorbar_rh   = None # ErrorbarContainer per σ sul grafico RH
         self._zoom_xlim  = None # None = vista libera
         self._zoom_ylim  = None
 
@@ -425,20 +490,20 @@ class GraphWidget(QWidget):
         # ── riga controlli ────────────────────────────────────────────────────
         bar = QHBoxLayout()
 
-        bar.addWidget(QLabel("Periodo:"))
+        bar.addWidget(QLabel("Period:"))
         self.combo = QComboBox()
-        self.combo.addItems(["24h", "48h", "7 giorni", "Personalizzato"])
+        self.combo.addItems(["24h", "48h", "7 days", "Custom"])
         self.combo.currentTextChanged.connect(self._on_period_change)
         bar.addWidget(self.combo)
 
-        self.lbl_from = QLabel("Da:")
+        self.lbl_from = QLabel("From:")
         bar.addWidget(self.lbl_from)
         self.date_from = QDateEdit(QDate.currentDate().addDays(-1))
         self.date_from.setCalendarPopup(True)
         self.date_from.dateChanged.connect(self._reload)
         bar.addWidget(self.date_from)
 
-        self.lbl_to = QLabel("A:")
+        self.lbl_to = QLabel("To:")
         bar.addWidget(self.lbl_to)
         self.date_to = QDateEdit(QDate.currentDate())
         self.date_to.setCalendarPopup(True)
@@ -448,7 +513,7 @@ class GraphWidget(QWidget):
         self._toggle_custom(False)
 
         if ASTRAL_OK:
-            self.chk_night = QCheckBox("Zone notturne")
+            self.chk_night = QCheckBox("Night zones")
             self.chk_night.setChecked(True)
             self.chk_night.stateChanged.connect(self._reload)
             bar.addWidget(self.chk_night)
@@ -456,18 +521,49 @@ class GraphWidget(QWidget):
         # Checkbox posizione valvola (striscia colorata in basso).
         # Default ON: se i dati non la contengono, il disegno è automaticamente
         # no-op (retrocompat con file _min.raw storici a 6 colonne).
-        self.chk_valve = QCheckBox("Posizione valvola")
+        self.chk_valve = QCheckBox("Valve position")
         self.chk_valve.setChecked(True)
         self.chk_valve.setToolTip(
-            "Mostra una striscia colorata in basso con la posizione della\n"
-            "valvola VICI (richiede integration.ini abilitato).")
+            "Show a colored strip at the bottom with the VICI valve\n"
+            "position (requires integration.ini enabled).")
         self.chk_valve.stateChanged.connect(self._reload)
         bar.addWidget(self.chk_valve)
 
         btn_home = QPushButton("⌂ Home")
-        btn_home.setToolTip("Torna alla vista completa")
+        btn_home.setToolTip("Reset to full view")
         btn_home.clicked.connect(self._reset_view)
         bar.addWidget(btn_home)
+
+        # — Live readouts (live, 1-min avg, σ) on the right of Home —
+        bar.addSpacing(10)
+        sep_live = QFrame(); sep_live.setFrameShape(QFrame.VLine); sep_live.setFrameShadow(QFrame.Sunken)
+        bar.addWidget(sep_live)
+        bar.addSpacing(6)
+        lbl_live_cap = QLabel("Live:")
+        lbl_live_cap.setStyleSheet("color:#666;font-weight:bold")
+        bar.addWidget(lbl_live_cap)
+        self.lbl_chart_live = QLabel("--- ppm")
+        self.lbl_chart_live.setFont(QFont("Arial", 11, QFont.Bold))
+        self.lbl_chart_live.setStyleSheet("color:#0066cc")
+        self.lbl_chart_live.setToolTip("Last raw sample (~1 Hz from .raw)")
+        bar.addWidget(self.lbl_chart_live)
+        bar.addSpacing(10)
+        lbl_avg_cap = QLabel("1-min avg:")
+        lbl_avg_cap.setStyleSheet("color:#666;font-weight:bold")
+        bar.addWidget(lbl_avg_cap)
+        self.lbl_chart_avg = QLabel("--- ppm")
+        self.lbl_chart_avg.setFont(QFont("Arial", 11, QFont.Bold))
+        self.lbl_chart_avg.setStyleSheet("color:#444")
+        self.lbl_chart_avg.setToolTip("Last 1-min average (from _min.raw)")
+        bar.addWidget(self.lbl_chart_avg)
+        bar.addSpacing(10)
+        lbl_std_cap = QLabel("σ:")
+        lbl_std_cap.setStyleSheet("color:#666;font-weight:bold")
+        bar.addWidget(lbl_std_cap)
+        self.lbl_chart_std = QLabel("---")
+        self.lbl_chart_std.setStyleSheet("color:#666")
+        self.lbl_chart_std.setToolTip("Std dev of the last 1-min average")
+        bar.addWidget(self.lbl_chart_std)
 
         bar.addStretch()
         root.addLayout(bar)
@@ -488,7 +584,40 @@ class GraphWidget(QWidget):
         root.addWidget(toolbar)
         root.addWidget(self.canvas)
 
+    def _load_graph_style(self):
+        """Legge da monitor.ini la sezione [graph] con default sicuri.
+
+        Restituisce un dict con:
+          - co2 line/scatter: style, point_size, line_width
+          - T/RH line/scatter: trh_style, trh_point_size, trh_line_width
+        """
+        gcp = configparser.ConfigParser()
+        if os.path.exists(MONITOR_INI):
+            gcp.read(MONITOR_INI)
+
+        def _norm_style(s):
+            s = (s or "").strip().lower()
+            return s if s in ("lines+points", "lines", "points") else "lines+points"
+
+        return {
+            "style":           _norm_style(gcp.get("graph", "style", fallback="lines+points")),
+            "point_size":      max(2, gcp.getint("graph", "point_size", fallback=18)),
+            "line_width":      max(0.2, gcp.getfloat("graph", "line_width", fallback=1.0)),
+            "trh_style":       _norm_style(gcp.get("graph", "trh_style", fallback="lines")),
+            "trh_point_size":  max(2, gcp.getint("graph", "trh_point_size", fallback=10)),
+            "trh_line_width":  max(0.2, gcp.getfloat("graph", "trh_line_width", fallback=1.0)),
+        }
+
     def _init_axes(self):
+        # Stile da monitor.ini → applicato a line/scatter alla creazione
+        gs_cfg = self._load_graph_style()
+        self._graph_style    = gs_cfg["style"]
+        self._point_size     = gs_cfg["point_size"]
+        self._line_width     = gs_cfg["line_width"]
+        self._trh_style      = gs_cfg["trh_style"]
+        self._trh_point_size = gs_cfg["trh_point_size"]
+        self._trh_line_width = gs_cfg["trh_line_width"]
+
         # 2 subplots con asse X condiviso: CO2 (grande sopra), T+RH (piccolo sotto)
         gs = self.fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.08)
         self.ax    = self.fig.add_subplot(gs[0])
@@ -502,16 +631,16 @@ class GraphWidget(QWidget):
         # ── CO2 (pannello principale) ─────────────────────────────────────
         self.line, = self.ax.plot(
             [], [], "-",
-            linewidth=1.0,
+            linewidth=self._line_width,
             color="#2060c0", zorder=2
         )
         # Scatter punti MEASURE (blu) e CALIB (arancione) — sopra la linea
         self.sc_measure = self.ax.scatter(
-            [], [], s=18, color="#2060c0",
+            [], [], s=self._point_size, color="#2060c0",
             zorder=3, label="measure"
         )
         self.sc_calib = self.ax.scatter(
-            [], [], s=28, color="#e06000",
+            [], [], s=self._point_size + 10, color="#e06000",
             zorder=4, marker="D", label="calib"
         )
 
@@ -519,8 +648,13 @@ class GraphWidget(QWidget):
         # T sull'asse Y sinistro (arancione)
         self.line_t, = self.ax_t.plot(
             [], [], "-",
-            linewidth=1.0,
+            linewidth=self._trh_line_width,
             color="#c05000", zorder=2, label="T"
+        )
+        # Scatter T (stessi colori della linea, sopra)
+        self.sc_t = self.ax_t.scatter(
+            [], [], s=self._trh_point_size, color="#c05000",
+            zorder=3, label="T"
         )
         self.ax_t.set_ylabel("T (°C)", fontsize=9, color="#c05000")
         self.ax_t.tick_params(axis="y", labelcolor="#c05000", labelsize=8)
@@ -529,8 +663,13 @@ class GraphWidget(QWidget):
         # RH sull'asse Y destro (verde-teal)
         self.line_rh, = self.ax_rh.plot(
             [], [], "-",
-            linewidth=1.0,
+            linewidth=self._trh_line_width,
             color="#007060", zorder=2, label="RH"
+        )
+        # Scatter RH (stessi colori della linea, sopra)
+        self.sc_rh = self.ax_rh.scatter(
+            [], [], s=self._trh_point_size, color="#007060",
+            zorder=3, label="RH"
         )
         self.ax_rh.set_ylabel("RH (%)", fontsize=9, color="#007060")
         self.ax_rh.tick_params(axis="y", labelcolor="#007060", labelsize=8)
@@ -581,6 +720,27 @@ class GraphWidget(QWidget):
         self.ax.callbacks.connect("xlim_changed", self._on_lim_changed)
         self.ax.callbacks.connect("ylim_changed", self._on_lim_changed)
 
+        # Applica visibilità in base allo stile (lines / points / lines+points)
+        self._apply_graph_style()
+
+    def _apply_graph_style(self):
+        """Show/hide line+scatter for CO₂ and T/RH per their own style."""
+        # CO₂ (pannello superiore) → self._graph_style
+        co2_lines  = self._graph_style != "points"
+        co2_points = self._graph_style != "lines"
+        self.line.set_visible(co2_lines)
+        for a in (self.sc_measure, self.sc_calib):
+            a.set_visible(co2_points)
+        for a in self._sc_by_pos:
+            a.set_visible(co2_points)
+        # T/RH (pannello inferiore) → self._trh_style
+        trh_lines  = self._trh_style != "points"
+        trh_points = self._trh_style != "lines"
+        for a in (self.line_t, self.line_rh):
+            a.set_visible(trh_lines)
+        for a in (self.sc_t, self.sc_rh):
+            a.set_visible(trh_points)
+
     # ── helper periodo ────────────────────────────────────────────────────────
 
     def _toggle_custom(self, show: bool):
@@ -590,7 +750,7 @@ class GraphWidget(QWidget):
         self.date_to.setVisible(show)
 
     def _on_period_change(self, txt):
-        self._toggle_custom(txt == "Personalizzato")
+        self._toggle_custom(txt == "Custom")
         self._reload()
 
     def _period_range(self):
@@ -601,7 +761,7 @@ class GraphWidget(QWidget):
             return today, 1
         elif txt == "48h":
             return today - timedelta(days=1), 2
-        elif txt == "7 giorni":
+        elif txt == "7 days":
             return today - timedelta(days=6), 7
         else:  # Personalizzato
             d0 = self.date_from.date().toPyDate()
@@ -654,23 +814,43 @@ class GraphWidget(QWidget):
                 pass
             self._pos_legend = None
 
+        # ── Pulisci errorbar precedenti (CO₂, T, RH) ─────────────────────
+        def _remove_eb(eb):
+            if eb is None:
+                return
+            try:
+                if eb[0] is not None:
+                    eb[0].remove()
+                for cap in eb[1]:
+                    cap.remove()
+                for bar in eb[2]:
+                    bar.remove()
+            except Exception:
+                pass
+
+        _remove_eb(self._errorbar);    self._errorbar = None
+        _remove_eb(self._errorbar_t);  self._errorbar_t = None
+        _remove_eb(self._errorbar_rh); self._errorbar_rh = None
+
         if result is None:
             self.line.set_data([], [])
             self.line_t.set_data([], [])
             self.line_rh.set_data([], [])
             self.sc_measure.set_offsets(np.empty((0, 2)))
             self.sc_calib.set_offsets(np.empty((0, 2)))
+            self.sc_t.set_offsets(np.empty((0, 2)))
+            self.sc_rh.set_offsets(np.empty((0, 2)))
             self.flag_label.set_text("MEASURE")
             self.flag_label.set_color("#2060c0")
             self.flag_label.get_bbox_patch().set_edgecolor("#2060c0")
-            self.ax.set_title("Nessun dato disponibile", fontsize=11, loc="left")
+            self.ax.set_title("No data available", fontsize=11, loc="left")
             self._set_x_axis(start, n_days)
             self.canvas.draw_idle()
             self._ignore_lim_change = False
             return
 
         (times, values, stds, counts, flags,
-         t_arr, _tstd, rh_arr, _rhstd,
+         t_arr, t_std_arr, rh_arr, rh_std_arr,
          valve_pos, valve_labels) = result
         xt = mdates.date2num(times)
         # Sostituisci MISSING con NaN per i plot (break nella linea, no Y axis esteso)
@@ -685,6 +865,18 @@ class GraphWidget(QWidget):
         self.line.set_data(xt, values_plot)
         self.line_t.set_data(xt, t_plot)
         self.line_rh.set_data(xt, rh_plot)
+
+        # ── Scatter punti T e RH (filtra MISSING) ─────────────────────────
+        mask_t  = t_arr  != MISSING
+        mask_rh = rh_arr != MISSING
+        if mask_t.any():
+            self.sc_t.set_offsets(np.column_stack([xt[mask_t], t_arr[mask_t]]))
+        else:
+            self.sc_t.set_offsets(np.empty((0, 2)))
+        if mask_rh.any():
+            self.sc_rh.set_offsets(np.column_stack([xt[mask_rh], rh_arr[mask_rh]]))
+        else:
+            self.sc_rh.set_offsets(np.empty((0, 2)))
 
         # ── Scatter dei punti CO₂ ─────────────────────────────────────────
         # Se i file hanno colonne valvola (formato "v3+valvola"), coloriamo
@@ -726,7 +918,7 @@ class GraphWidget(QWidget):
                 flags_here = flags[mask]
                 is_calib = np.any(flags_here == "calib")
                 marker = "D" if is_calib else "o"
-                size   = 28 if is_calib else 18
+                size   = self._point_size + 10 if is_calib else self._point_size
                 sc = self.ax.scatter(
                     xt[mask], values[mask],
                     s=size, color=color, marker=marker,
@@ -741,6 +933,8 @@ class GraphWidget(QWidget):
                     handles=legend_handles, loc="upper left",
                     fontsize=8, framealpha=0.85, ncol=1,
                 )
+            # Riallinea la visibilità degli scatter appena creati allo stile
+            self._apply_graph_style()
         else:
             # Retrocompat: file senza colonne valvola → blu/arancione su flag
             mask_m = mask_valid & (flags == "measure")
@@ -753,6 +947,38 @@ class GraphWidget(QWidget):
                 self.sc_calib.set_offsets(np.column_stack([xt[mask_c], values[mask_c]]))
             else:
                 self.sc_calib.set_offsets(np.empty((0, 2)))
+
+        # ── Errorbar (σ del minuto) sui punti CO₂ ──────────────────────────
+        # Disegnati sopra la linea ma sotto gli scatter, in grigio
+        # semi-trasparente per non oscurare i punti colorati.
+        eb_mask = mask_valid & (stds != MISSING) & (stds > 0)
+        if eb_mask.any():
+            self._errorbar = self.ax.errorbar(
+                xt[eb_mask], values[eb_mask],
+                yerr=stds[eb_mask],
+                fmt="none", ecolor="#666", elinewidth=0.8,
+                capsize=2, capthick=0.6, alpha=0.5, zorder=2.5,
+            )
+
+        # ── Errorbar T (σ del minuto, asse Y sinistro) ────────────────────
+        eb_mask_t = (t_arr != MISSING) & (t_std_arr != MISSING) & (t_std_arr > 0)
+        if eb_mask_t.any():
+            self._errorbar_t = self.ax_t.errorbar(
+                xt[eb_mask_t], t_arr[eb_mask_t],
+                yerr=t_std_arr[eb_mask_t],
+                fmt="none", ecolor="#c05000", elinewidth=0.7,
+                capsize=2, capthick=0.5, alpha=0.45, zorder=2.5,
+            )
+
+        # ── Errorbar RH (σ del minuto, asse Y destro twin) ────────────────
+        eb_mask_rh = (rh_arr != MISSING) & (rh_std_arr != MISSING) & (rh_std_arr > 0)
+        if eb_mask_rh.any():
+            self._errorbar_rh = self.ax_rh.errorbar(
+                xt[eb_mask_rh], rh_arr[eb_mask_rh],
+                yerr=rh_std_arr[eb_mask_rh],
+                fmt="none", ecolor="#007060", elinewidth=0.7,
+                capsize=2, capthick=0.5, alpha=0.45, zorder=2.5,
+            )
 
         # ── Label flag: fonte LIVE (valve_status.json, ~2s) con fallback ──
         live_pos, live_label, live_fresh = read_live_valve()
@@ -973,6 +1199,32 @@ class GraphWidget(QWidget):
         end   = start + timedelta(days=n_days - 1)
         if start <= today <= end:
             self._reload()
+        self._refresh_toolbar_readouts()
+
+    def _refresh_toolbar_readouts(self):
+        """Aggiorna i tre label "Live / 1-min avg / σ" nella toolbar grafico."""
+        today = datetime.utcnow().date()
+        # Live: ultima riga del .raw (~1 Hz)
+        _, live_co2, _, _, _ = read_last_raw_sample(self.cfg, today)
+        if live_co2 is None or live_co2 == MISSING:
+            self.lbl_chart_live.setText("--- ppm")
+        else:
+            self.lbl_chart_live.setText(f"{live_co2:.2f} ppm")
+        # Media 1 min + σ: ultima riga del _min.raw
+        result = load_period(self.cfg, today, 1)
+        if result is None:
+            self.lbl_chart_avg.setText("--- ppm")
+            self.lbl_chart_std.setText("---")
+            return
+        (_t, vals, stds, *_rest) = result
+        if len(vals) > 0 and vals[-1] != MISSING:
+            self.lbl_chart_avg.setText(f"{float(vals[-1]):.2f} ppm")
+        else:
+            self.lbl_chart_avg.setText("--- ppm")
+        if len(stds) > 0 and stds[-1] != MISSING:
+            self.lbl_chart_std.setText(f"{float(stds[-1]):.2f} ppm")
+        else:
+            self.lbl_chart_std.setText("---")
 
     # ── hover ────────────────────────────────────────────────────────────────
 
@@ -1049,17 +1301,17 @@ class DaemonSettingsDialog(QDialog):
 
     def __init__(self, current: dict, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Impostazioni valve-daemon")
+        self.setWindowTitle("Valve-daemon settings")
         self.setMinimumWidth(420)
         form = QFormLayout(self)
         form.setSpacing(8)
 
         ini_lbl = QLabel(current.get("ini_path", "—"))
         ini_lbl.setStyleSheet("color:#666;font-size:8pt")
-        form.addRow("File INI:", ini_lbl)
+        form.addRow("INI file:", ini_lbl)
 
         self.ed_port = QLineEdit(current.get("serial_port", "/dev/vici"))
-        form.addRow("Porta seriale:", self.ed_port)
+        form.addRow("Serial port:", self.ed_port)
 
         self.cb_baud = QComboBox()
         self.cb_baud.setEditable(True)
@@ -1077,48 +1329,48 @@ class DaemonSettingsDialog(QDialog):
 
         self.chk_rs485 = QCheckBox("RS-485 (default RS-232)")
         self.chk_rs485.setChecked(bool(current.get("serial_rs485", False)))
-        form.addRow("Modalità seriale:", self.chk_rs485)
+        form.addRow("Serial mode:", self.chk_rs485)
 
         self.ed_dev_id = QLineEdit(current.get("serial_dev_id", ""))
-        self.ed_dev_id.setPlaceholderText("(solo RS-485, default Z)")
+        self.ed_dev_id.setPlaceholderText("(RS-485 only, default Z)")
         form.addRow("Device ID:", self.ed_dev_id)
 
         self.sp_n = QSpinBox()
         self.sp_n.setRange(2, 40)
         self.sp_n.setValue(int(current.get("n_positions", 10)))
-        form.addRow("Numero posizioni:", self.sp_n)
+        form.addRow("Number of positions:", self.sp_n)
 
         self.sp_idle = QDoubleSpinBox()
         self.sp_idle.setRange(0.5, 30.0)
         self.sp_idle.setSingleStep(0.5)
         self.sp_idle.setValue(float(current.get("idle_poll_s", 2.0)))
         self.sp_idle.setSuffix(" s")
-        form.addRow("Polling CP idle:", self.sp_idle)
+        form.addRow("CP idle polling:", self.sp_idle)
 
-        self.chk_auto = QCheckBox("Apri valvola all'avvio del daemon")
+        self.chk_auto = QCheckBox("Open valve at daemon startup")
         self.chk_auto.setChecked(bool(current.get("auto_connect", True)))
         form.addRow("", self.chk_auto)
 
         self.chk_cfg_start = QCheckBox(
-            "Applica IFM1+AM3+SMA+NP all'apertura (avanzato)")
+            "Apply IFM1+AM3+SMA+NP at startup (advanced)")
         self.chk_cfg_start.setChecked(bool(current.get("configure_on_start", False)))
         form.addRow("", self.chk_cfg_start)
 
         self.chk_home_start = QCheckBox(
-            "HM (vai a pos 1) all'apertura")
+            "HM (go to pos 1) at startup")
         self.chk_home_start.setChecked(bool(current.get("go_home_on_start", False)))
         form.addRow("", self.chk_home_start)
 
-        # Sezione "File e cartelle" — separatore visivo
-        sep = QLabel("───── File e cartelle ─────")
+        # "Files and folders" — visual separator
+        sep = QLabel("───── Files and folders ─────")
         sep.setStyleSheet("color:#888;font-size:9pt;padding-top:8px")
         sep.setAlignment(Qt.AlignCenter)
         form.addRow(sep)
 
         prog_dir = "/home/misura/programs/valve-scheduler"
         path_hint = QLabel(
-            f"Path relativi sono risolti rispetto a {prog_dir}/.\n"
-            "Per usare cartelle in altri posti, scrivi un path assoluto.")
+            f"Relative paths are resolved against {prog_dir}/.\n"
+            "To use folders elsewhere, write an absolute path.")
         path_hint.setStyleSheet("color:#666;font-size:8pt")
         path_hint.setWordWrap(True)
         form.addRow(path_hint)
@@ -1126,14 +1378,14 @@ class DaemonSettingsDialog(QDialog):
         self.ed_status = QLineEdit(
             current.get("status_file", "service/valve_status.json"))
         self.ed_status.setToolTip(
-            "JSON di stato — scritto dal daemon, letto dal logger CO2.\n"
-            "Se cambi qui, aggiorna anche config/integration.ini del logger.")
-        form.addRow("File di stato JSON:", self.ed_status)
+            "Status JSON — written by the daemon, read by the CO2 logger.\n"
+            "If you change this, update config/integration.ini of the logger too.")
+        form.addRow("Status JSON file:", self.ed_status)
 
         h_log = QHBoxLayout()
         self.ed_logdir = QLineEdit(current.get("log_dir", "log"))
         self.ed_logdir.setToolTip(
-            "Directory per valve-daemon.log (rotazione 1MB × 5).")
+            "Directory for valve-daemon.log (rotation 1MB × 5).")
         h_log.addWidget(self.ed_logdir)
         btn_browse_log = QToolButton()
         btn_browse_log.setText("…")
@@ -1142,30 +1394,30 @@ class DaemonSettingsDialog(QDialog):
         h_log.addWidget(btn_browse_log)
         wrap_log = QWidget(); wrap_log.setLayout(h_log)
         h_log.setContentsMargins(0, 0, 0, 0)
-        form.addRow("Cartella log:", wrap_log)
+        form.addRow("Log folder:", wrap_log)
 
         h_sch = QHBoxLayout()
         self.ed_sched = QLineEdit(
             current.get("schedule_file", "schedule/schedule.csv"))
         self.ed_sched.setToolTip(
-            "Schedule CSV di default (caricato all'avvio della GUI).\n"
-            "Lo schedule attivo è quello editato in tabella.")
+            "Default schedule CSV (loaded at GUI startup).\n"
+            "The active schedule is the one edited in the table.")
         h_sch.addWidget(self.ed_sched)
         btn_browse_sched = QToolButton()
         btn_browse_sched.setText("…")
         btn_browse_sched.clicked.connect(
             lambda: self._browse_file(self.ed_sched, prog_dir,
-                                       "CSV (*.csv);;Tutti i file (*)"))
+                                       "CSV (*.csv);;All files (*)"))
         h_sch.addWidget(btn_browse_sched)
         wrap_sch = QWidget(); wrap_sch.setLayout(h_sch)
         h_sch.setContentsMargins(0, 0, 0, 0)
-        form.addRow("Schedule CSV default:", wrap_sch)
+        form.addRow("Default schedule CSV:", wrap_sch)
 
         warn = QLabel(
-            "Salvando, il daemon ferma l'IdlePoller e riapre la porta\n"
-            "con le nuove impostazioni (~1 s). Schedule in corso vanno\n"
-            "fermati prima. Il cambio di cartella log richiede un riavvio\n"
-            "del daemon (sudo systemctl restart valve-daemon).")
+            "On save, the daemon stops the IdlePoller and reopens the port\n"
+            "with the new settings (~1 s). Running schedules must be\n"
+            "stopped first. Changing the log folder requires a daemon\n"
+            "restart (sudo systemctl restart valve-daemon).")
         warn.setStyleSheet("color:#666;font-size:9pt")
         form.addRow(warn)
 
@@ -1180,7 +1432,7 @@ class DaemonSettingsDialog(QDialog):
         if not Path(start).is_absolute():
             start = str(Path(base) / start)
         d = QFileDialog.getExistingDirectory(
-            self, "Seleziona cartella", start)
+            self, "Select folder", start)
         if d:
             line_edit.setText(d)
 
@@ -1190,7 +1442,7 @@ class DaemonSettingsDialog(QDialog):
         if not Path(start).is_absolute():
             start = str(Path(base) / start)
         f, _ = QFileDialog.getOpenFileName(
-            self, "Seleziona file", start, filter_str)
+            self, "Select file", start, filter_str)
         if f:
             line_edit.setText(f)
 
@@ -1298,21 +1550,22 @@ class MonitorConfigDialog(QDialog, _IniMixin):
     def __init__(self, config_dir: str, parent=None):
         super().__init__(parent)
         self.config_dir = config_dir
-        self.setWindowTitle("Impostazioni CO2 logger")
+        self.setWindowTitle("CO2 logger settings")
         self.resize(640, 560)
 
         lay = QVBoxLayout(self)
         self._tabs = QTabWidget()
         self._tabs.addTab(self._build_output_tab(),    "Output")
-        self._tabs.addTab(self._build_serial_tab(),    "Seriale GMP343")
-        self._tabs.addTab(self._build_site_tab(),      "Sito")
-        self._tabs.addTab(self._build_sensors_tab(),   "Sensori I2C")
-        self._tabs.addTab(self._build_layout_tab(),    "Layout Pi 5")
+        self._tabs.addTab(self._build_serial_tab(),    "GMP343 Serial")
+        self._tabs.addTab(self._build_site_tab(),      "Site")
+        self._tabs.addTab(self._build_sensors_tab(),   "I2C Sensors")
+        self._tabs.addTab(self._build_layout_tab(),    "Pi 5 Layout")
+        self._tabs.addTab(self._build_aspetto_tab(),   "Appearance")
         lay.addWidget(self._tabs)
 
         warn = QLabel(
-            "Le modifiche a Output / Seriale richiedono il restart del "
-            "logger CO2 per avere effetto:\n"
+            "Changes to Output / Serial require a restart of the CO2 "
+            "logger to take effect:\n"
             "    sudo systemctl restart co2-logger")
         warn.setStyleSheet("color:#666;font-size:9pt")
         warn.setWordWrap(True)
@@ -1331,7 +1584,7 @@ class MonitorConfigDialog(QDialog, _IniMixin):
 
         w = QWidget(); form = QFormLayout(w)
         info = QLabel(
-            "Nomi e cartella dei file `.raw` e `_min.raw` scritti dal logger.")
+            "Filename and folder of the `.raw` and `_min.raw` files written by the logger.")
         info.setStyleSheet("color:#666;font-size:9pt")
         info.setWordWrap(True)
         form.addRow(info)
@@ -1343,23 +1596,23 @@ class MonitorConfigDialog(QDialog, _IniMixin):
         btn_d.clicked.connect(lambda: self._browse_dir(self.ed_data_path))
         h_dir.addWidget(btn_d)
         wrap = QWidget(); wrap.setLayout(h_dir); h_dir.setContentsMargins(0,0,0,0)
-        form.addRow("Cartella dati:", wrap)
+        form.addRow("Data folder:", wrap)
 
         self.ed_basename = QLineEdit(sec.get("basename", "carbocap343"))
-        form.addRow("Basename file:", self.ed_basename)
+        form.addRow("File basename:", self.ed_basename)
         self.ed_extension = QLineEdit(sec.get("extension", "raw"))
-        form.addRow("Estensione:", self.ed_extension)
+        form.addRow("Extension:", self.ed_extension)
 
         ex = QLabel(
-            f"Esempio file giornaliero:\n"
-            f"  {self.ed_basename.text()}_<sito>_<YYYYMMDD>_p00.{self.ed_extension.text()}")
+            f"Daily file example:\n"
+            f"  {self.ed_basename.text()}_<site>_<YYYYMMDD>_p00.{self.ed_extension.text()}")
         ex.setStyleSheet("color:#888;font-size:8pt;font-family:monospace")
         form.addRow("", ex)
-        # aggiorna esempio dinamicamente
+        # update example dynamically
         def _upd():
             ex.setText(
-                f"Esempio file giornaliero:\n"
-                f"  {self.ed_basename.text()}_<sito>_<YYYYMMDD>_p00.{self.ed_extension.text()}")
+                f"Daily file example:\n"
+                f"  {self.ed_basename.text()}_<site>_<YYYYMMDD>_p00.{self.ed_extension.text()}")
         self.ed_basename.textChanged.connect(_upd)
         self.ed_extension.textChanged.connect(_upd)
         return w
@@ -1371,13 +1624,13 @@ class MonitorConfigDialog(QDialog, _IniMixin):
 
         w = QWidget(); form = QFormLayout(w)
         info = QLabel(
-            "Porta seriale per il sensore Vaisala GMP343. Su Raspberry Pi 5 "
-            "il symlink udev `/dev/gmp343` è persistente; usa quello.")
+            "Serial port for the Vaisala GMP343 sensor. On Raspberry Pi 5 "
+            "the udev symlink `/dev/gmp343` is persistent; use that.")
         info.setStyleSheet("color:#666;font-size:9pt"); info.setWordWrap(True)
         form.addRow(info)
 
         self.ed_serial_port = QLineEdit(sec.get("port", "/dev/gmp343"))
-        form.addRow("Porta:", self.ed_serial_port)
+        form.addRow("Port:", self.ed_serial_port)
 
         self.cb_serial_baud = QComboBox(); self.cb_serial_baud.setEditable(True)
         for b in (1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200):
@@ -1412,23 +1665,23 @@ class MonitorConfigDialog(QDialog, _IniMixin):
 
         w = QWidget(); form = QFormLayout(w)
         info = QLabel(
-            "Identificazione della stazione e coordinate per il calcolo "
-            "alba/tramonto (zone notturne nel grafico).")
+            "Station identification and coordinates for sunrise/sunset "
+            "computation (night zones in the chart).")
         info.setStyleSheet("color:#666;font-size:9pt"); info.setWordWrap(True)
         form.addRow(info)
 
         self.ed_site_name = QLineEdit(sec.get("name", "ISACBO"))
-        form.addRow("Nome stazione:", self.ed_site_name)
+        form.addRow("Station name:", self.ed_site_name)
 
         self.sp_lat = QDoubleSpinBox()
         self.sp_lat.setRange(-90.0, 90.0); self.sp_lat.setDecimals(6)
         self.sp_lat.setValue(float(sec.get("latitude", 44.523624)))
-        form.addRow("Latitudine:", self.sp_lat)
+        form.addRow("Latitude:", self.sp_lat)
 
         self.sp_lon = QDoubleSpinBox()
         self.sp_lon.setRange(-180.0, 180.0); self.sp_lon.setDecimals(6)
         self.sp_lon.setValue(float(sec.get("longitude", 11.338379)))
-        form.addRow("Longitudine:", self.sp_lon)
+        form.addRow("Longitude:", self.sp_lon)
 
         self.cb_tz = QComboBox(); self.cb_tz.setEditable(True)
         for tz in ("UTC", "Europe/Rome", "Europe/London"):
@@ -1443,10 +1696,10 @@ class MonitorConfigDialog(QDialog, _IniMixin):
 
         w = QWidget(); lay = QVBoxLayout(w)
         warn = QLabel(
-            "⚠ Configurazione preview — il logger ATTUALE legge solo lo SHT31-D "
-            "primario hardcoded (bus 1, addr 0x44). Salvando qui prepari "
-            "sensors.ini per quando il logger sarà aggiornato a leggerlo "
-            "(Fase 2 del refactor).")
+            "⚠ Preview config — the CURRENT logger only reads the primary "
+            "SHT31-D hardcoded (bus 1, addr 0x44). Saving here prepares "
+            "sensors.ini for when the logger is updated to read it "
+            "(Phase 2 of the refactor).")
         warn.setWordWrap(True)
         warn.setStyleSheet(
             "background:#fff8e1;border:1px solid #f5b800;"
@@ -1456,9 +1709,9 @@ class MonitorConfigDialog(QDialog, _IniMixin):
         # SHT31 primario
         self._sens_widgets = {}
         for key, default in [
-            ("sht31_a",  {"label":"SHT31-D primario (T+RH)", "enabled":True,
+            ("sht31_a",  {"label":"Primary SHT31-D (T+RH)",  "enabled":True,
                           "bus":1, "addr":"0x44"}),
-            ("sht31_b",  {"label":"SHT31-D secondario (T+RH)","enabled":False,
+            ("sht31_b",  {"label":"Secondary SHT31-D (T+RH)","enabled":False,
                           "bus":1, "addr":"0x45"}),
             ("bmp388",   {"label":"BMP388 (P+T)",            "enabled":False,
                           "bus":1, "addr":"0x77"}),
@@ -1466,22 +1719,22 @@ class MonitorConfigDialog(QDialog, _IniMixin):
             sec = ini[key] if key in ini else {}
             grp = QGroupBox(default["label"])
             f = QFormLayout(grp)
-            chk = QCheckBox("Abilitato")
+            chk = QCheckBox("Enabled")
             chk.setChecked(self._cfg_bool(sec.get("enabled"), default["enabled"]))
             f.addRow("", chk)
             sp_bus = QSpinBox(); sp_bus.setRange(0, 9)
             sp_bus.setValue(int(sec.get("bus", default["bus"])))
             f.addRow("I2C bus:", sp_bus)
             ed_addr = QLineEdit(sec.get("addr", default["addr"]))
-            ed_addr.setPlaceholderText("es. 0x44")
+            ed_addr.setPlaceholderText("e.g. 0x44")
             f.addRow("I2C address:", ed_addr)
             lay.addWidget(grp)
             self._sens_widgets[key] = (chk, sp_bus, ed_addr)
 
         hint = QLabel(
-            "Suggerimento: prima di collegare un nuovo sensore, esegui "
-            "`i2cdetect -y 1` per verificare che il bus sia libero "
-            "all'indirizzo desiderato.")
+            "Tip: before connecting a new sensor, run "
+            "`i2cdetect -y 1` to make sure the bus is free at the "
+            "desired address.")
         hint.setStyleSheet("color:#666;font-size:8pt")
         hint.setWordWrap(True)
         lay.addWidget(hint)
@@ -1493,7 +1746,7 @@ class MonitorConfigDialog(QDialog, _IniMixin):
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
         inner = QWidget()
         vbox = QVBoxLayout(inner)
-        title = QLabel("Layout GPIO header — Raspberry Pi 5 (uguale a Pi 4/3/2)")
+        title = QLabel("GPIO header layout — Raspberry Pi 5 (same as Pi 4/3/2)")
         title.setStyleSheet("font-weight:bold;font-size:11pt")
         vbox.addWidget(title)
 
@@ -1507,6 +1760,94 @@ class MonitorConfigDialog(QDialog, _IniMixin):
         scroll.setWidget(inner)
         return scroll
 
+    # ────────────────────────────────────────────────── Tab Aspetto
+    def _build_aspetto_tab(self) -> QWidget:
+        ini = self._read_ini(MONITOR_INI)
+        fnt = ini["fonts"] if "fonts" in ini else {}
+        grp = ini["graph"] if "graph" in ini else {}
+
+        w = QWidget(); root = QVBoxLayout(w)
+
+        info = QLabel(
+            "Font sizes for the Monitor panel and CO₂ chart style.\n"
+            "Changes require a Monitor restart to take effect.")
+        info.setStyleSheet("color:#666;font-size:9pt"); info.setWordWrap(True)
+        root.addWidget(info)
+
+        # — Fonts —
+        g_font = QGroupBox("Font sizes (px)")
+        f1 = QFormLayout(g_font)
+
+        def _spin(initial, lo, hi):
+            sp = QSpinBox(); sp.setRange(lo, hi)
+            try: sp.setValue(int(float(initial)))
+            except (TypeError, ValueError): sp.setValue(lo)
+            return sp
+
+        self.sp_co2_value_size = _spin(fnt.get("co2_value_size", 24), 8, 72)
+        f1.addRow("CO₂ value (live + average):", self.sp_co2_value_size)
+        self.sp_label_size = _spin(fnt.get("label_size", 14), 6, 36)
+        f1.addRow("Panel labels:", self.sp_label_size)
+        self.sp_caption_size = _spin(fnt.get("caption_size", 14), 6, 32)
+        f1.addRow("'LIVE' / '1-MIN AVERAGE' captions:", self.sp_caption_size)
+        self.sp_file_path_size = _spin(fnt.get("file_path_size", 13), 6, 32)
+        f1.addRow("File path (Last Sample):", self.sp_file_path_size)
+        self.sp_title_size = _spin(fnt.get("title_size", 14), 8, 36)
+        f1.addRow("Title:", self.sp_title_size)
+        self.sp_subtitle_size = _spin(fnt.get("subtitle_size", 12), 6, 24)
+        f1.addRow("Subtitle (site):", self.sp_subtitle_size)
+        self.sp_small_size = _spin(fnt.get("small_size", 12), 6, 20)
+        f1.addRow("Small text:", self.sp_small_size)
+        root.addWidget(g_font)
+
+        # — Chart CO₂ —
+        g_graph = QGroupBox("CO₂ chart style")
+        f2 = QFormLayout(g_graph)
+        _style_to_idx = {"lines+points": 0, "lines": 1, "points": 2}
+        self.cb_graph_style = QComboBox()
+        self.cb_graph_style.addItems(["Lines + Points", "Lines only", "Points only"])
+        self.cb_graph_style.setCurrentIndex(
+            _style_to_idx.get(grp.get("style", "lines+points").strip().lower(), 0))
+        f2.addRow("Style:", self.cb_graph_style)
+
+        self.sp_point_size = QSpinBox(); self.sp_point_size.setRange(2, 200)
+        try: self.sp_point_size.setValue(int(float(grp.get("point_size", 18))))
+        except (TypeError, ValueError): self.sp_point_size.setValue(18)
+        f2.addRow("Point size (matplotlib s):", self.sp_point_size)
+
+        self.sp_line_width = QDoubleSpinBox()
+        self.sp_line_width.setRange(0.2, 6.0)
+        self.sp_line_width.setSingleStep(0.1); self.sp_line_width.setDecimals(2)
+        try: self.sp_line_width.setValue(float(grp.get("line_width", 1.0)))
+        except (TypeError, ValueError): self.sp_line_width.setValue(1.0)
+        f2.addRow("Line width (pt):", self.sp_line_width)
+        root.addWidget(g_graph)
+
+        # — Chart T/RH —
+        g_trh = QGroupBox("T / RH chart style (bottom panel)")
+        f3 = QFormLayout(g_trh)
+        self.cb_trh_style = QComboBox()
+        self.cb_trh_style.addItems(["Lines + Points", "Lines only", "Points only"])
+        self.cb_trh_style.setCurrentIndex(
+            _style_to_idx.get(grp.get("trh_style", "lines").strip().lower(), 1))
+        f3.addRow("Style:", self.cb_trh_style)
+
+        self.sp_trh_point_size = QSpinBox(); self.sp_trh_point_size.setRange(2, 200)
+        try: self.sp_trh_point_size.setValue(int(float(grp.get("trh_point_size", 10))))
+        except (TypeError, ValueError): self.sp_trh_point_size.setValue(10)
+        f3.addRow("Point size (matplotlib s):", self.sp_trh_point_size)
+
+        self.sp_trh_line_width = QDoubleSpinBox()
+        self.sp_trh_line_width.setRange(0.2, 6.0)
+        self.sp_trh_line_width.setSingleStep(0.1); self.sp_trh_line_width.setDecimals(2)
+        try: self.sp_trh_line_width.setValue(float(grp.get("trh_line_width", 1.0)))
+        except (TypeError, ValueError): self.sp_trh_line_width.setValue(1.0)
+        f3.addRow("Line width (pt):", self.sp_trh_line_width)
+        root.addWidget(g_trh)
+
+        root.addStretch()
+        return w
+
     # ────────────────────────────────────────────── helpers + save
     @staticmethod
     def _cfg_bool(v, default: bool = False) -> bool:
@@ -1516,7 +1857,7 @@ class MonitorConfigDialog(QDialog, _IniMixin):
 
     def _browse_dir(self, line_edit: QLineEdit) -> None:
         start = os.path.expanduser(line_edit.text().strip() or "~")
-        d = QFileDialog.getExistingDirectory(self, "Seleziona cartella", start)
+        d = QFileDialog.getExistingDirectory(self, "Select folder", start)
         if d:
             line_edit.setText(d)
 
@@ -1564,34 +1905,56 @@ class MonitorConfigDialog(QDialog, _IniMixin):
                 ini[key]["addr"]    = ed_addr.text().strip() or "0x44"
             self._write_ini(os.path.join(self.config_dir, "sensors.ini"), ini)
 
+            # monitor.ini — Aspetto (font + grafico)
+            mini = self._read_ini(MONITOR_INI)
+            if "fonts" not in mini:
+                mini["fonts"] = {}
+            mini["fonts"]["co2_value_size"] = str(self.sp_co2_value_size.value())
+            mini["fonts"]["label_size"]     = str(self.sp_label_size.value())
+            mini["fonts"]["caption_size"]   = str(self.sp_caption_size.value())
+            mini["fonts"]["file_path_size"] = str(self.sp_file_path_size.value())
+            mini["fonts"]["title_size"]     = str(self.sp_title_size.value())
+            mini["fonts"]["subtitle_size"]  = str(self.sp_subtitle_size.value())
+            mini["fonts"]["small_size"]     = str(self.sp_small_size.value())
+            if "graph" not in mini:
+                mini["graph"] = {}
+            _idx_to_style = {0: "lines+points", 1: "lines", 2: "points"}
+            mini["graph"]["style"]          = _idx_to_style[self.cb_graph_style.currentIndex()]
+            mini["graph"]["point_size"]     = str(self.sp_point_size.value())
+            mini["graph"]["line_width"]     = f"{self.sp_line_width.value():.2f}"
+            mini["graph"]["trh_style"]      = _idx_to_style[self.cb_trh_style.currentIndex()]
+            mini["graph"]["trh_point_size"] = str(self.sp_trh_point_size.value())
+            mini["graph"]["trh_line_width"] = f"{self.sp_trh_line_width.value():.2f}"
+            self._write_ini(MONITOR_INI, mini)
+
         except OSError as exc:
-            QMessageBox.critical(self, "Errore di scrittura", str(exc))
+            QMessageBox.critical(self, "Write error", str(exc))
             return
 
-        # Conferma + opzionale restart logger
+        # Confirm + optional logger restart
         reply = QMessageBox.question(
-            self, "Salvato",
-            "Configurazione scritta.\n\n"
-            "Per applicarla al backend logger CO2 (porta seriale, "
-            "cartella dati) serve un riavvio del service:\n\n"
+            self, "Saved",
+            "Configuration written.\n\n"
+            "To apply it to the CO2 logger backend (serial port, "
+            "data folder) a service restart is needed:\n\n"
             "  sudo systemctl restart co2-logger\n\n"
-            "Vuoi farlo adesso?",
+            "Do you want to do it now?",
             QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
             try:
                 subprocess.run(["sudo", "-n", "systemctl", "restart",
                                 "co2-logger"], check=True, timeout=10)
                 QMessageBox.information(
-                    self, "Restart eseguito",
-                    "co2-logger riavviato.")
+                    self, "Restart done",
+                    "co2-logger restarted.")
             except (subprocess.CalledProcessError,
                     subprocess.TimeoutExpired,
                     FileNotFoundError) as exc:
                 QMessageBox.warning(
-                    self, "Restart automatico fallito",
-                    f"Non posso riavviare automaticamente "
-                    f"(serve sudo senza password):\n{exc}\n\n"
-                    "Esegui manualmente da terminale:\n"
+                    self, "Automatic restart failed",
+                    f"Cannot automatically restart "
+                    f"(needs passwordless sudo):\n{exc}\n\n"
+                    "Run manually from a terminal:\n"
                     "  sudo systemctl restart co2-logger")
         self.accept()
 
@@ -1648,17 +2011,17 @@ class TabValve(QWidget):
         hdr.addStretch()
 
         self._btn_home = QPushButton("Home (HM)")
-        self._btn_home.setToolTip("Vai a posizione 1")
+        self._btn_home.setToolTip("Go to position 1")
         self._btn_home.clicked.connect(self._on_home)
         hdr.addWidget(self._btn_home)
-        self._btn_configure = QPushButton("Configura attuatore")
+        self._btn_configure = QPushButton("Configure actuator")
         self._btn_configure.setToolTip(
-            "IFM1 + AM3 + SM A + NP (valvola multipos)")
+            "IFM1 + AM3 + SM A + NP (multipos valve)")
         self._btn_configure.clicked.connect(self._on_configure)
         hdr.addWidget(self._btn_configure)
-        self._btn_settings = QPushButton("Impostazioni…")
+        self._btn_settings = QPushButton("Settings…")
         self._btn_settings.setToolTip(
-            "Modifica porta seriale, n_positions, polling, ecc.")
+            "Edit serial port, n_positions, polling, etc.")
         self._btn_settings.clicked.connect(self._on_settings)
         hdr.addWidget(self._btn_settings)
         lay.addLayout(hdr)
@@ -1677,11 +2040,11 @@ class TabValve(QWidget):
         # Inietta "Sincronizza schedule" nella riga pulsanti tabella, dopo
         # `Salva CSV…` e dopo lo stretch → allineato a destra.
         if hasattr(self._tab_sched, "_table_btn_row"):
-            self._btn_sync = QPushButton("⟳ Sincronizza schedule")
+            self._btn_sync = QPushButton("⟳ Sync schedule")
             self._btn_sync.setToolTip(
-                "Manda al daemon le label/posizioni/durate della tabella.\n"
-                "Da premere dopo aver editato celle: l'IdlePoller userà le\n"
-                "nuove label per `step_label` nel file _min.raw.")
+                "Send labels/positions/durations of the table to the daemon.\n"
+                "Press after editing cells: the IdlePoller will use the\n"
+                "new labels for `step_label` in the _min.raw file.")
             self._btn_sync.clicked.connect(self._on_sync_schedule)
             self._tab_sched._table_btn_row.addWidget(self._btn_sync)
         lay.addWidget(self._tab_sched, stretch=1)
@@ -1710,18 +2073,18 @@ class TabValve(QWidget):
         try:
             st = self._client.get_status()
         except self._DaemonError as exc:
-            self._lbl_daemon.setText(f"● daemon: errore ({exc})")
+            self._lbl_daemon.setText(f"● daemon: error ({exc})")
             self._lbl_daemon.setStyleSheet(
                 "color:#c00;font-weight:bold;font-size:10pt")
             return
         valve_open = bool(st.get("valve_open"))
         sched_running = bool(st.get("schedule_running"))
         if valve_open:
-            self._lbl_daemon.setText("● daemon: ONLINE • valvola aperta")
+            self._lbl_daemon.setText("● daemon: ONLINE • valve open")
             self._lbl_daemon.setStyleSheet(
                 "color:#1a7f37;font-weight:bold;font-size:10pt")
         else:
-            self._lbl_daemon.setText("● daemon: ONLINE • valvola chiusa")
+            self._lbl_daemon.setText("● daemon: ONLINE • valve closed")
             self._lbl_daemon.setStyleSheet(
                 "color:#b58900;font-weight:bold;font-size:10pt")
         # Position live
@@ -1753,12 +2116,12 @@ class TabValve(QWidget):
             fn(*args, **kwargs)
             return True
         except self._DaemonUnreachable:
-            QMessageBox.warning(self, "Daemon non raggiungibile",
-                                "Il valve-daemon non risponde. Controlla:\n"
+            QMessageBox.warning(self, "Daemon unreachable",
+                                "valve-daemon is not responding. Check:\n"
                                 "  systemctl status valve-daemon")
             return False
         except self._DaemonError as exc:
-            QMessageBox.warning(self, "Errore daemon", str(exc))
+            QMessageBox.warning(self, "Daemon error", str(exc))
             return False
 
     def _on_home(self):
@@ -1766,18 +2129,18 @@ class TabValve(QWidget):
 
     def _on_configure(self):
         if QMessageBox.question(
-                self, "Configura attuatore",
-                "Applico IFM1 + AM3 + SM A + NP10 e HM.\n"
-                "Procedere solo dopo aver eseguito AL a valvola smontata.\n\n"
-                "Continuare?",
+                self, "Configure actuator",
+                "Applying IFM1 + AM3 + SM A + NP10 and HM.\n"
+                "Proceed only after running AL with the valve removed.\n\n"
+                "Continue?",
                 QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
             return
         if self._safe_call(self._client.configure):
             QMessageBox.information(
-                self, "Configurazione eseguita",
-                "Attuatore configurato in modalità multiposizione "
-                "(AM3, NP10) e Home eseguita.\n"
-                "Posizione corrente: 1.")
+                self, "Configuration done",
+                "Actuator configured in multiposition mode "
+                "(AM3, NP10) and Home executed.\n"
+                "Current position: 1.")
 
     def _on_manual_go(self, position: int):
         self._safe_call(self._client.go, int(position))
@@ -1789,8 +2152,8 @@ class TabValve(QWidget):
                   "label": s.label} for s in sched.steps]
         loop = self._tab_sched._chk_loop.isChecked()
         if not steps:
-            QMessageBox.warning(self, "Schedule vuoto",
-                                "Aggiungi almeno uno step.")
+            QMessageBox.warning(self, "Empty schedule",
+                                "Add at least one step.")
             return
         # Persiste localmente (autosave)
         try:
@@ -1826,13 +2189,13 @@ class TabValve(QWidget):
             sched = self._tab_sched.get_schedule()
         except Exception as exc:
             if not silent:
-                QMessageBox.warning(self, "Errore",
-                                    f"Schedule non leggibile: {exc}")
+                QMessageBox.warning(self, "Error",
+                                    f"Schedule not readable: {exc}")
             return False
         if not sched.steps:
             if not silent:
-                QMessageBox.warning(self, "Schedule vuoto",
-                                    "Aggiungi almeno uno step prima.")
+                QMessageBox.warning(self, "Empty schedule",
+                                    "Add at least one step first.")
             return False
         steps = [{"position": s.position,
                   "minutes": s.minutes,
@@ -1842,54 +2205,54 @@ class TabValve(QWidget):
             return True
         except self._DaemonUnreachable:
             if not silent:
-                QMessageBox.warning(self, "Daemon non raggiungibile",
-                                    "Controlla `systemctl status valve-daemon`.")
+                QMessageBox.warning(self, "Daemon unreachable",
+                                    "Check `systemctl status valve-daemon`.")
             return False
         except self._DaemonError as exc:
             if not silent:
-                QMessageBox.warning(self, "Errore daemon", str(exc))
+                QMessageBox.warning(self, "Daemon error", str(exc))
             return False
 
     def _on_sync_schedule(self) -> None:
         if self._push_schedule_to_daemon(silent=False):
-            # autosave anche su CSV per persistenza tra restart
+            # autosave also to CSV for persistence across restart
             try:
                 self._tab_sched._persist()
             except Exception:
                 pass
             QMessageBox.information(
-                self, "Sincronizzato",
-                "Schedule inviata al daemon. La label è stata salvata anche\n"
-                "in _last_schedule.csv (riproposta al prossimo avvio).")
+                self, "Synced",
+                "Schedule sent to the daemon. The labels have also been saved\n"
+                "to _last_schedule.csv (restored on next launch).")
 
     def _on_settings(self):
         try:
             current = self._client.get_config()
         except (self._DaemonError, self._DaemonUnreachable) as exc:
-            QMessageBox.warning(self, "Daemon non disponibile",
-                                f"Impossibile leggere il config: {exc}")
+            QMessageBox.warning(self, "Daemon unavailable",
+                                f"Cannot read config: {exc}")
             return
         dlg = DaemonSettingsDialog(current, parent=self)
         if dlg.exec_() != QDialog.Accepted:
             return
         new_cfg = dlg.values()
-        # Confronta con quello attuale: se identico, niente reload
+        # Compare with current: if identical, no reload
         if all(current.get(k) == v for k, v in new_cfg.items()):
-            QMessageBox.information(self, "Nessuna modifica",
-                                    "Le impostazioni sono invariate.")
+            QMessageBox.information(self, "No changes",
+                                    "Settings are unchanged.")
             return
         try:
             self._client.reload_config(new_cfg)
         except self._DaemonError as exc:
-            QMessageBox.warning(self, "Reload fallito", str(exc))
+            QMessageBox.warning(self, "Reload failed", str(exc))
             return
         except self._DaemonUnreachable as exc:
-            QMessageBox.warning(self, "Daemon non raggiungibile", str(exc))
+            QMessageBox.warning(self, "Daemon unreachable", str(exc))
             return
         QMessageBox.information(
-            self, "Impostazioni salvate",
-            "Config aggiornato. Daemon ha riaperto la porta seriale "
-            "con le nuove impostazioni.")
+            self, "Settings saved",
+            "Config updated. Daemon has reopened the serial port "
+            "with the new settings.")
         # Aggiorna n_positions nella tabella schedule (TabSchedule)
         if hasattr(self._tab_sched, "set_n_positions"):
             try:
@@ -1984,24 +2347,52 @@ class GMP343Monitor(QMainWindow):
         self.setWindowTitle("GMP343 Monitor  v2")
         self.setGeometry(x, y, w, h)
 
-        # Menubar — Configurazione
+        # Menubar — Settings
         mb = self.menuBar()
-        m_cfg = mb.addMenu("&Configurazione")
-        act_cfg_co2 = QAction("Impostazioni CO2 logger…", self)
+        m_cfg = mb.addMenu("&Settings")
+        act_cfg_co2 = QAction("CO2 logger settings…", self)
         act_cfg_co2.triggered.connect(self._open_co2_config)
         m_cfg.addAction(act_cfg_co2)
         if _HAS_VALVE_SCHEDULER:
-            act_cfg_valve = QAction("Impostazioni valve-daemon…", self)
+            act_cfg_valve = QAction("Valve-daemon settings…", self)
             act_cfg_valve.triggered.connect(self._open_valve_config)
             m_cfg.addAction(act_cfg_valve)
+
+        # Top-right corner of the menubar: stacked UTC clock + last valid
+        # sample timestamp (two rows, compact format = HH:MM:SS only;
+        # full date is in the tooltip). The widget is allowed to shrink so
+        # it never blocks the window from being resized smaller.
+        corner = QWidget()
+        corner.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        c_lay = QVBoxLayout(corner)
+        c_lay.setContentsMargins(8, 1, 10, 1)
+        c_lay.setSpacing(0)
+        self.lbl_now = QLabel("Now ---")
+        self.lbl_now.setStyleSheet(
+            "font-family:monospace;font-size:9pt;font-weight:bold;color:#222")
+        self.lbl_now.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.lbl_now.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.lbl_now.setMinimumWidth(0)
+        self.lbl_now.setToolTip("Current UTC time")
+        c_lay.addWidget(self.lbl_now)
+        self.lbl_last_valid = QLabel("Last valid ---")
+        self.lbl_last_valid.setStyleSheet(
+            "font-family:monospace;font-size:9pt;color:#666")
+        self.lbl_last_valid.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.lbl_last_valid.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.lbl_last_valid.setMinimumWidth(0)
+        self.lbl_last_valid.setToolTip(
+            "Timestamp of the last 1-min average with a valid CO₂ value")
+        c_lay.addWidget(self.lbl_last_valid)
+        mb.setCornerWidget(corner, Qt.TopRightCorner)
 
         tabs = QTabWidget()
         self.setCentralWidget(tabs)
         tabs.addTab(self._build_monitor_tab(), "📊  Monitor")
-        tabs.addTab(self._build_graph_tab(),   "📈  Grafico")
+        tabs.addTab(self._build_graph_tab(),   "📈  Chart")
         if _HAS_VALVE_SCHEDULER:
             self.tab_valve = TabValve()
-            tabs.addTab(self.tab_valve, "🔧  Valvola VICI")
+            tabs.addTab(self.tab_valve, "🔧  VICI Valve")
         else:
             self.tab_valve = None
         tabs.setStyleSheet("QTabBar::tab { padding: 6px 18px; font-size: 11pt; }")
@@ -2016,9 +2407,9 @@ class GMP343Monitor(QMainWindow):
         vbox.addLayout(self._make_header())
 
         # seriale
-        grp_ser = QGroupBox("Seriale")
+        grp_ser = QGroupBox("Serial")
         h = QHBoxLayout()
-        h.addWidget(QLabel("Porta:"))
+        h.addWidget(QLabel("Port:"))
         self.lbl_port = QLabel("---"); h.addWidget(self.lbl_port)
         h.addWidget(QLabel("Baud:"))
         self.lbl_baud = QLabel(self.cfg.get("serial","baudrate",fallback="19200"))
@@ -2026,85 +2417,129 @@ class GMP343Monitor(QMainWindow):
         self.lbl_dot  = QLabel("●")
         self.lbl_dot.setStyleSheet("font-size:18px;color:#c00")
         h.addWidget(self.lbl_dot)
-        self.lbl_stat = QLabel("Disconnesso")
+        self.lbl_stat = QLabel("Disconnected")
         self.lbl_stat.setStyleSheet("font-weight:bold;color:#c00;font-size:10px")
         h.addWidget(self.lbl_stat)
         h.addStretch(); grp_ser.setLayout(h)
         vbox.addWidget(grp_ser)
 
-        # CO2
-        grp_co2 = QGroupBox("Dati Correnti")
-        vco2 = QVBoxLayout()
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("CO₂:"))
+        # Current Data — two columns side by side, separated by a vertical
+        # rule. Left = Live (last sample from .raw, ~1 Hz), Right = 1-min
+        # average (last row of _min.raw). σ and n live in the right column
+        # because they're statistics OF the 1-min average, not of the live.
+        grp_co2 = QGroupBox("Current Data")
         sz = self.guicfg.getint("fonts","co2_value_size",fallback=24)
-        self.lbl_co2 = QLabel("--- ppm")
-        self.lbl_co2.setFont(QFont("Arial", sz, QFont.Bold))
-        self.lbl_co2.setStyleSheet("color:#0066cc")
-        row1.addWidget(self.lbl_co2); row1.addStretch()
-        vco2.addLayout(row1)
+        cap_sz = self.guicfg.getint("fonts","caption_size",fallback=14)
+
+        def _make_value_row(prefix: str, value_size: int, color: str, unit: str):
+            """Returns (row_layout, value_label) → 'PREFIX:  VALUE unit'."""
+            row = QHBoxLayout()
+            lbl_p = QLabel(prefix)
+            lbl_p.setStyleSheet(f"font-weight:bold;font-size:{cap_sz}px")
+            row.addWidget(lbl_p)
+            lbl = QLabel(f"--- {unit}")
+            lbl.setFont(QFont("Arial", value_size, QFont.Bold))
+            lbl.setStyleSheet(f"color:{color}")
+            row.addWidget(lbl)
+            row.addStretch()
+            return row, lbl
+
+        def _make_column(title: str, title_color: str):
+            """Empty VBox with a colored bold title at the top."""
+            col = QVBoxLayout(); col.setSpacing(6)
+            head = QLabel(title)
+            head.setStyleSheet(
+                f"color:{title_color};font-weight:bold;font-size:{cap_sz+2}px;"
+                f"border-bottom:2px solid {title_color};padding-bottom:2px")
+            col.addWidget(head)
+            return col
+
+        # — LEFT COLUMN: Live —
+        col_live = _make_column("LIVE", "#0066cc")
+        row, self.lbl_co2_live = _make_value_row("CO₂:", sz,    "#0066cc", "ppm")
+        col_live.addLayout(row)
+        row, self.lbl_t_live   = _make_value_row("T:",   14,    "#c05000", "°C")
+        col_live.addLayout(row)
+        row, self.lbl_rh_live  = _make_value_row("RH:",  14,    "#007060", "%")
+        col_live.addLayout(row)
+        col_live.addStretch()
+
+        # — RIGHT COLUMN: 1-min average + σ + n (stats of the average) —
+        col_avg = _make_column("1-MIN AVERAGE", "#444")
+        row, self.lbl_co2 = _make_value_row("CO₂:", sz, "#0066cc", "ppm")
+        col_avg.addLayout(row)
+        # σ + n right under the CO₂ 1-min value
+        row_stats = QHBoxLayout()
+        lbl_sigma = QLabel("σ:"); lbl_sigma.setStyleSheet(f"font-weight:bold;font-size:{cap_sz}px")
+        row_stats.addWidget(lbl_sigma)
+        self.lbl_std = QLabel("---")
+        self.lbl_std.setStyleSheet(f"font-size:{cap_sz}px")
+        row_stats.addWidget(self.lbl_std)
+        row_stats.addSpacing(12)
+        lbl_n = QLabel("n:"); lbl_n.setStyleSheet(f"font-weight:bold;font-size:{cap_sz}px")
+        row_stats.addWidget(lbl_n)
+        self.lbl_n = QLabel("---")
+        self.lbl_n.setStyleSheet(f"font-size:{cap_sz}px")
+        row_stats.addWidget(self.lbl_n)
+        row_stats.addStretch()
+        col_avg.addLayout(row_stats)
+        row, self.lbl_t   = _make_value_row("T:",   14, "#c05000", "°C")
+        col_avg.addLayout(row)
+        row, self.lbl_rh  = _make_value_row("RH:",  14, "#007060", "%")
+        col_avg.addLayout(row)
+        col_avg.addStretch()
+
+        # — Outer HBox: live | vertical separator | 1-min —
+        outer = QHBoxLayout(); outer.setSpacing(14)
+        outer.addLayout(col_live, stretch=1)
+        sep = QFrame(); sep.setFrameShape(QFrame.VLine); sep.setFrameShadow(QFrame.Sunken)
+        sep.setStyleSheet("color:#999")
+        outer.addWidget(sep)
+        outer.addLayout(col_avg, stretch=1)
+
+        vco2 = QVBoxLayout()
+        vco2.addLayout(outer)
+        # Status line below (warnings on the live CO₂ value)
         self.lbl_status = QLabel("")
-        self.lbl_status.setFont(QFont("Arial", 8))
+        self.lbl_status.setFont(QFont("Arial", 9))
         vco2.addWidget(self.lbl_status)
-        row2 = QHBoxLayout()
-        row2.addWidget(QLabel("σ:")); self.lbl_std = QLabel("---"); row2.addWidget(self.lbl_std)
-        row2.addSpacing(8)
-        row2.addWidget(QLabel("n:")); self.lbl_n   = QLabel("---"); row2.addWidget(self.lbl_n)
-        row2.addStretch(); vco2.addLayout(row2)
-
-        # T e RH (SHT31-D)
-        row3 = QHBoxLayout()
-        row3.addWidget(QLabel("T:"))
-        self.lbl_t = QLabel("--- °C")
-        self.lbl_t.setFont(QFont("Arial", 14, QFont.Bold))
-        self.lbl_t.setStyleSheet("color:#c05000")
-        row3.addWidget(self.lbl_t)
-        row3.addSpacing(16)
-        row3.addWidget(QLabel("RH:"))
-        self.lbl_rh = QLabel("--- %")
-        self.lbl_rh.setFont(QFont("Arial", 14, QFont.Bold))
-        self.lbl_rh.setStyleSheet("color:#007060")
-        row3.addWidget(self.lbl_rh)
-        row3.addStretch()
-        vco2.addLayout(row3)
-
         grp_co2.setLayout(vco2); vbox.addWidget(grp_co2)
 
-        # statistiche
-        grp_st = QGroupBox("Statistiche")
+        # Daily statistics
+        grp_st = QGroupBox("Daily Statistics")
         g = QGridLayout(); g.setSpacing(3)
         g.addWidget(QLabel("Min:"),0,0)
         self.lbl_min = QLabel("---"); self.lbl_min.setStyleSheet("color:#090;font-weight:bold;font-size:10px"); g.addWidget(self.lbl_min,0,1)
         g.addWidget(QLabel("Max:"),0,2)
         self.lbl_max = QLabel("---"); self.lbl_max.setStyleSheet("color:#c00;font-weight:bold;font-size:10px"); g.addWidget(self.lbl_max,0,3)
-        g.addWidget(QLabel("Media:"),1,0)
+        g.addWidget(QLabel("Mean:"),1,0)
         self.lbl_avg = QLabel("---"); self.lbl_avg.setStyleSheet("color:#06c;font-weight:bold;font-size:10px"); g.addWidget(self.lbl_avg,1,1)
-        g.addWidget(QLabel("Letture:"),1,2)
+        g.addWidget(QLabel("Samples:"),1,2)
         self.lbl_cnt = QLabel("0"); self.lbl_cnt.setStyleSheet("font-size:10px"); g.addWidget(self.lbl_cnt,1,3)
         grp_st.setLayout(g); vbox.addWidget(grp_st)
 
-        # ultima lettura
-        grp_last = QGroupBox("Ultima Acquisizione")
+        # Last sample
+        grp_last = QGroupBox("Last Sample")
         vl = QVBoxLayout(); vl.setSpacing(2)
         self.lbl_ts   = QLabel("---"); self.lbl_ts.setFont(QFont("Arial",9,QFont.Bold)); vl.addWidget(self.lbl_ts)
-        # Flag MEASURE / CALIB
         self.lbl_flag = QLabel("---")
         self.lbl_flag.setFont(QFont("Arial", 9, QFont.Bold))
         self.lbl_flag.setAlignment(Qt.AlignLeft)
         vl.addWidget(self.lbl_flag)
         self.lbl_file = QLabel("---")
-        self.lbl_file.setStyleSheet("color:#666;font-size:8px")
+        fp_sz = self.guicfg.getint("fonts","file_path_size",fallback=13)
+        self.lbl_file.setStyleSheet(f"color:#666;font-size:{fp_sz}px")
         self.lbl_file.setWordWrap(True)
         vl.addWidget(self.lbl_file)
         grp_last.setLayout(vl); vbox.addWidget(grp_last)
 
-        # soglie
-        grp_thr = QGroupBox("Soglie")
+        # Thresholds
+        grp_thr = QGroupBox("Thresholds")
         ht = QHBoxLayout(); ht.setSpacing(5)
         lo = self._thr("low_warning"); hi = self._thr("high_warning")
         ht.addWidget(QLabel("OK:"))
         lb = QLabel(f"{lo:.0f}–{hi:.0f}"); lb.setStyleSheet("color:#06c;font-weight:bold;font-size:9px"); ht.addWidget(lb)
-        ht.addWidget(QLabel("Alto:"))
+        ht.addWidget(QLabel("High:"))
         la = QLabel(f">{hi:.0f}"); la.setStyleSheet("color:#c00;font-weight:bold;font-size:9px"); ht.addWidget(la)
         ht.addStretch(); grp_thr.setLayout(ht); vbox.addWidget(grp_thr)
 
@@ -2128,7 +2563,7 @@ class GMP343Monitor(QMainWindow):
         tl.setFont(QFont("Arial", ts, QFont.Bold))
         vt.addWidget(tl)
         site = self.cfg.get("location","name",fallback="Unknown")
-        sl = QLabel(f"Sito: {site}")
+        sl = QLabel(f"Site: {site}")
         sl.setFont(QFont("Arial", self.guicfg.getint("fonts","subtitle_size",fallback=9)))
         vt.addWidget(sl)
         hbox.addLayout(vt); hbox.addStretch()
@@ -2166,9 +2601,14 @@ class GMP343Monitor(QMainWindow):
         self.graph.refresh()
 
     def _tick_fast(self):
-        """Tick rapido (1s) solo per i LED MEASURE/CALIB — leggono direttamente
-        valve_status.json per latenza ~2s (la posizione è già visibile in
-        tab Valvola VICI alla stessa cadenza)."""
+        """Tick rapido (1s): orologio UTC nel corner della menubar + LED
+        MEASURE/CALIB letti direttamente da valve_status.json (latenza ~2s,
+        la posizione è già visibile nel tab VICI Valve alla stessa cadenza)."""
+        # UTC clock — formato compatto (HH:MM:SS); data completa nel tooltip
+        now = datetime.utcnow()
+        self.lbl_now.setText(now.strftime("Now %H:%M:%S"))
+        self.lbl_now.setToolTip(now.strftime("Current UTC: %Y-%m-%d %H:%M:%S"))
+
         live_pos, live_label, live_fresh = read_live_valve()
         if not live_fresh or live_pos < 1:
             return  # senza dato live, lasciamo lo stato del tick lento
@@ -2205,11 +2645,11 @@ class GMP343Monitor(QMainWindow):
         port = self.cfg.get("serial","port",fallback="/dev/ttyUSB0")
         if os.path.exists(port):
             self.lbl_dot.setStyleSheet("font-size:18px;color:#090")
-            self.lbl_stat.setText("Connesso"); self.lbl_stat.setStyleSheet("font-weight:bold;color:#090;font-size:10px")
+            self.lbl_stat.setText("Connected"); self.lbl_stat.setStyleSheet("font-weight:bold;color:#090;font-size:10px")
             self.lbl_port.setText(port)
         else:
             self.lbl_dot.setStyleSheet("font-size:18px;color:#c00")
-            self.lbl_stat.setText("Disconnesso"); self.lbl_stat.setStyleSheet("font-weight:bold;color:#c00;font-size:10px")
+            self.lbl_stat.setText("Disconnected"); self.lbl_stat.setStyleSheet("font-weight:bold;color:#c00;font-size:10px")
             self.lbl_port.setText(f"{port} (N/A)")
 
         # Ultimo dato
@@ -2217,23 +2657,43 @@ class GMP343Monitor(QMainWindow):
         path  = build_filename(self.cfg, today)   # glob → path reale o ""
         result = load_period(self.cfg, today, 1)
 
+        # Tempo reale: ultimo campione dal file .raw (indipendente da _min)
+        live_ts, live_co2, live_t, live_rh, _live_flag = read_last_raw_sample(
+            self.cfg, today)
+        dec = self.guicfg.getint("display","co2_decimals",fallback=2)
+        if live_co2 is None or live_co2 == MISSING:
+            self.lbl_co2_live.setText("--- ppm")
+        else:
+            col_live = self._color(live_co2)
+            self.lbl_co2_live.setText(f"{live_co2:.{dec}f} ppm")
+            self.lbl_co2_live.setStyleSheet(f"color:{col_live};font-weight:bold")
+        if live_t is None or live_t == MISSING:
+            self.lbl_t_live.setText("--- °C")
+        else:
+            self.lbl_t_live.setText(f"{live_t:.2f} °C")
+        if live_rh is None or live_rh == MISSING:
+            self.lbl_rh_live.setText("--- %")
+        else:
+            self.lbl_rh_live.setText(f"{live_rh:.2f} %")
+
         if result is None:
             self.lbl_co2.setText("--- ppm"); self.lbl_status.setText("")
             self.lbl_std.setText("---"); self.lbl_n.setText("---")
             self.lbl_t.setText("--- °C"); self.lbl_rh.setText("--- %")
-            self.lbl_ts.setText("Nessun dato")
+            self.lbl_ts.setText("No data")
             self.lbl_flag.setText("---"); self.lbl_flag.setStyleSheet("color:#888;font-size:9px")
             self.lbl_flag_top.setText("---")
             self.lbl_flag_top.setStyleSheet(
                 "color:#888;background:#ffffff;"
                 "border:1.5px solid #888;border-radius:8px;padding:4px 12px;")
-            self.lbl_file.setText("file non trovato" if not path else path)
+            self.lbl_file.setText("file not found" if not path else path)
             self.lbl_min.setText("---"); self.lbl_max.setText("---")
             self.lbl_avg.setText("---"); self.lbl_cnt.setText("0")
+            self.lbl_last_valid.setText("Last valid: ---")
             return
 
         (times, values, stds, counts, flags,
-         t_arr, _tstd, rh_arr, _rhstd,
+         t_arr, t_std_arr, rh_arr, rh_std_arr,
          valve_pos, valve_labels) = result
         last_co2  = float(values[-1])
         last_std  = float(stds[-1])
@@ -2241,7 +2701,9 @@ class GMP343Monitor(QMainWindow):
         last_ts   = times[-1].strftime("%Y/%m/%d %H:%M:%S")
         last_flag = flags[-1] if len(flags) > 0 else "measure"
         last_t    = float(t_arr[-1])
+        last_t_std  = float(t_std_arr[-1])
         last_rh   = float(rh_arr[-1])
+        last_rh_std = float(rh_std_arr[-1])
 
         # Label flag — fonte LIVE per aggiornamento immediato:
         #   1) valve_status.json (latenza ~2s, scritta dall'IdlePoller)
@@ -2282,29 +2744,52 @@ class GMP343Monitor(QMainWindow):
 
         dec = self.guicfg.getint("display","co2_decimals",fallback=2)
         col = self._color(last_co2)
-        self.lbl_co2.setText(f"{last_co2:.{dec}f} ppm")
+        if last_std == MISSING or last_co2 == MISSING:
+            self.lbl_co2.setText(f"{last_co2:.{dec}f} ppm")
+        else:
+            self.lbl_co2.setText(f"{last_co2:.{dec}f} ± {last_std:.{dec}f} ppm")
         self.lbl_co2.setStyleSheet(f"color:{col};font-weight:bold")
         self.lbl_std.setText(f"{last_std:.2f} ppm")
         self.lbl_n.setText(str(last_n))
-        # T e RH: se MISSING mostra placeholder
-        if last_t == MISSING:
-            self.lbl_t.setText("--- °C")
-        else:
-            self.lbl_t.setText(f"{last_t:.2f} °C")
-        if last_rh == MISSING:
-            self.lbl_rh.setText("--- %")
-        else:
-            self.lbl_rh.setText(f"{last_rh:.2f} %")
+        # T and RH 1-min average: show "value ± std unit" (placeholder if MISSING).
+        # If T_std/RH_std are MISSING but the value is valid (legacy v2 file or
+        # n=1 minute) we show only the value, no ±.
+        def _fmt(v, sd, unit, dec=2):
+            if v == MISSING:
+                return f"--- {unit}"
+            if sd == MISSING:
+                return f"{v:.{dec}f} {unit}"
+            return f"{v:.{dec}f} ± {sd:.{dec}f} {unit}"
+
+        self.lbl_t.setText(_fmt(last_t, last_t_std, "°C"))
+        self.lbl_rh.setText(_fmt(last_rh, last_rh_std, "%"))
         self.lbl_ts.setText(last_ts)
         self.lbl_file.setText(path)
+
+        # Last valid sample time (last index where CO₂ != MISSING).
+        # Compact format: HH:MM:SS (today) o YYYY-MM-DD HH:MM (older).
+        valid_idx = np.where(values != MISSING)[0]
+        if valid_idx.size:
+            ts = times[valid_idx[-1]]
+            if ts.date() == datetime.utcnow().date():
+                short = ts.strftime("Last valid %H:%M:%S")
+            else:
+                short = ts.strftime("Last valid %m-%d %H:%M")
+            self.lbl_last_valid.setText(short)
+            self.lbl_last_valid.setToolTip(
+                ts.strftime("Last valid 1-min sample: %Y-%m-%d %H:%M:%S UTC"))
+        else:
+            self.lbl_last_valid.setText("Last valid ---")
+            self.lbl_last_valid.setToolTip(
+                "No valid 1-min sample found in current data window")
 
         # Stato
         hi = self._thr("high_warning"); lo = self._thr("low_warning")
         if last_co2 > hi:
-            self.lbl_status.setText(f"⚠ Sopra soglia ({hi:.0f} ppm)")
+            self.lbl_status.setText(f"⚠ Above threshold ({hi:.0f} ppm)")
             self.lbl_status.setStyleSheet("color:#c00;font-weight:bold")
         elif last_co2 < lo:
-            self.lbl_status.setText(f"⚠ Sotto soglia ({lo:.0f} ppm)")
+            self.lbl_status.setText(f"⚠ Below threshold ({lo:.0f} ppm)")
             self.lbl_status.setStyleSheet("color:#f90;font-weight:bold")
         else:
             self.lbl_status.setText(""); self.lbl_status.setStyleSheet("")
