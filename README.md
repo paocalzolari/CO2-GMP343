@@ -1,5 +1,14 @@
 # GMP343 CO₂ Acquisition System
 
+> 🚨 **PC nuovo? Non clonare questo repo a mano.**
+> Esiste un setup unificato che fa tutto (clone repo + dipendenze + Claude
+> Code + .desktop + alias):
+> ```
+> git clone git@github.com:paocalzolari/acq-pc-setup.git ~/acq-pc-setup
+> sudo bash ~/acq-pc-setup/install.sh
+> ```
+> Vedi [paocalzolari/acq-pc-setup](https://github.com/paocalzolari/acq-pc-setup).
+
 ## Struttura
 
 ```
