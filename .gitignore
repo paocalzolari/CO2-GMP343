@@ -10,3 +10,4 @@ co2-calib
 *.tar.gz
 *.egg-info/
 .eggs/
+config/.backup/
