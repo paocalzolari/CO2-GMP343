@@ -21,7 +21,9 @@ Formato file v3 (dal 2026-04-15, con T/RH):
 import serial
 import time
 import json
+import math
 import tempfile
+from collections import Counter
 from datetime import datetime, timezone
 import os
 import sys
@@ -177,35 +179,143 @@ def load_config():
     return config
 
 def get_filenames(config):
-    """Genera i nomi file raw e _min per il giorno corrente (underscore nei nomi)."""
+    """Genera i nomi file giornalieri.
+
+    Restituisce (raw, min, 10min, 30min, 60min) per il giorno corrente.
+    Underscore nei nomi (formato v3, in uso dal 2026-04-15).
+    """
     today     = datetime.utcnow().strftime("%Y%m%d")
     basename  = config.get("output", "basename",  fallback="carbocap343")
     extension = config.get("output", "extension", fallback="raw")
     site_name = config.get("location", "name",    fallback="unknown")
     data_dir  = get_data_dir(config)
-    raw_file  = os.path.join(data_dir, f"{basename}_{site_name}_{today}_p00.{extension}")
-    avg_file  = os.path.join(data_dir, f"{basename}_{site_name}_{today}_p00_min.{extension}")
-    return raw_file, avg_file
+    base = os.path.join(data_dir, f"{basename}_{site_name}_{today}_p00")
+    return (
+        f"{base}.{extension}",            # campioni grezzi (~1 Hz)
+        f"{base}_min.{extension}",        # medie 1 min
+        f"{base}_10min.{extension}",      # medie 10 min
+        f"{base}_30min.{extension}",      # medie 30 min
+        f"{base}_60min.{extension}",      # medie 60 min
+    )
 
-def write_headers_if_needed(raw_file, avg_file, config, valve_enabled=False):
-    """
-    Scrive header nei file se non esistono.
-    RAW: #date time CO2[PPM] T[C] RH[%] flag [valve_pos valve_label]
-    MIN: #date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag [valve_pos valve_label]
+
+def write_headers_if_needed(raw_file, avg_file, file_10, file_30, file_60,
+                            config, valve_enabled=False):
+    """Scrive l'header nei file giornalieri se non esistono.
+
+    RAW : #date time CO2 T RH flag [valve_pos valve_label]
+    MIN : #date time CO2 CO2_std T T_std RH RH_std ndata_60s_mean flag [...]
+    10/30/60 min: come MIN ma `ndata` rappresenta il TOTALE di campioni nel
+    bucket (somma dei `ndata_60s_mean` dei minuti aggregati).
     """
     if valve_enabled:
         raw_header = "#date time CO2[PPM] T[C] RH[%] flag valve_pos valve_label"
         avg_header = "#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag valve_pos valve_label"
+        agg_header = "#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata flag valve_pos valve_label"
     else:
         raw_header = "#date time CO2[PPM] T[C] RH[%] flag"
         avg_header = "#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag"
+        agg_header = "#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata flag"
 
-    if not os.path.exists(raw_file):
-        with open(raw_file, 'w') as f:
-            f.write(f"{raw_header}\n")
-    if not os.path.exists(avg_file):
-        with open(avg_file, 'w') as f:
-            f.write(f"{avg_header}\n")
+    pairs = [
+        (raw_file, raw_header),
+        (avg_file, avg_header),
+        (file_10,  agg_header),
+        (file_30,  agg_header),
+        (file_60,  agg_header),
+    ]
+    for path, header in pairs:
+        if not os.path.exists(path):
+            with open(path, 'w') as f:
+                f.write(f"{header}\n")
+
+
+# ──────────────────────────────────────────────────── pooled aggregation
+def _pooled_mean_std(values, stds, ns):
+    """Pooled mean & std using law of total variance.
+
+    Skips MISSING entries (any of value/std == MISSING or n<=0).
+    Returns (M, S, N_total). If no usable rows: (MISSING, MISSING, 0).
+    """
+    use = [(v, s, n) for v, s, n in zip(values, stds, ns)
+           if v != MISSING and s != MISSING and n > 0]
+    if not use:
+        return MISSING, MISSING, 0
+    N = sum(n for _, _, n in use)
+    if N <= 0:
+        return MISSING, MISSING, 0
+    M = sum(n * v for v, _, n in use) / N
+    # Var[X] = E[Var[X|i]] + Var[E[X|i]]
+    inner = sum(n * s * s for _, s, n in use) / N
+    outer = sum(n * (v - M) ** 2 for v, _, n in use) / N
+    var = inner + outer
+    if N > 1:
+        var = var * N / (N - 1)   # unbiased estimator
+    S = math.sqrt(var) if var > 0 else 0.0
+    return M, S, N
+
+
+def _slot_start(t, granularity_min):
+    """Aligned slot start for a clock-aligned bucket of given size in minutes."""
+    return t.replace(
+        minute=(t.minute // granularity_min) * granularity_min,
+        second=0, microsecond=0,
+    )
+
+
+def _flush_slot(path, slot_ts, buf, valve_enabled):
+    """Write one aggregated record summarising the minute records in `buf`.
+
+    `buf` is a list of dicts (output of `_make_minute_record`). Empty `buf`
+    is a no-op. Computes pooled CO2/T/RH stats, sums n, sticky-calib flag,
+    most-frequent valve_pos/label.
+    """
+    if not buf:
+        return
+    co2_v  = [r["co2"]      for r in buf]
+    co2_s  = [r["co2_std"]  for r in buf]
+    co2_n  = [r["n"]        for r in buf]
+    M_c, S_c, N = _pooled_mean_std(co2_v, co2_s, co2_n)
+    M_t, S_t, _ = _pooled_mean_std(
+        [r["t"]  for r in buf], [r["t_std"]  for r in buf], co2_n)
+    M_r, S_r, _ = _pooled_mean_std(
+        [r["rh"] for r in buf], [r["rh_std"] for r in buf], co2_n)
+    flag = "calib" if any(r["flag"] == "calib" for r in buf) else "measure"
+    if valve_enabled:
+        # mode (most-frequent); ties broken by most recent
+        vpos = Counter(r["valve_pos"]   for r in buf).most_common(1)[0][0]
+        vlab = Counter(r["valve_label"] for r in buf).most_common(1)[0][0]
+        valve_suf = f" {vpos} {vlab}"
+    else:
+        valve_suf = ""
+    ts = slot_ts.strftime("%Y-%m-%d %H:%M:%S")
+    with open(path, "a") as f:
+        f.write(
+            f"{ts} {M_c:.2f} {S_c:.2f} "
+            f"{M_t:.2f} {S_t:.2f} "
+            f"{M_r:.2f} {S_r:.2f} "
+            f"{N} {flag}{valve_suf}\n"
+        )
+
+
+def _make_minute_record(co2, co2_std, n_co2, t, t_std, rh, rh_std,
+                        flag, valve_enabled, valve_status_file, valve_stale_s):
+    """Pack the just-closed minute aggregate into a dict for slot buffers."""
+    if valve_enabled:
+        try:
+            vpos_str, vlabel_str = valve_format_for_raw(
+                valve_status_file, valve_stale_s)
+        except Exception:
+            vpos_str, vlabel_str = "-1", "-"
+    else:
+        vpos_str, vlabel_str = "-1", "-"
+    return {
+        "co2": co2, "co2_std": co2_std, "n": n_co2,
+        "t":   t,   "t_std":   t_std,
+        "rh":  rh,  "rh_std":  rh_std,
+        "flag": flag,
+        "valve_pos": vpos_str, "valve_label": vlabel_str,
+    }
 
 def timestamp_now():
     now = datetime.utcnow()
@@ -320,45 +430,105 @@ def main():
     _last_co2 = None  # ultimo valore per status.json
     _last_t   = None
     _last_rh  = None
+    # Dedup-by-value: il GMP343 emette a 1 Hz ma aggiorna internamente ogni
+    # ~2 s, quindi vediamo run di campioni identici. Saltiamo le ripetizioni
+    # per non oversamplare e rendere onesta la σ del minuto.
+    last_co2_value = None
     current_minute = datetime.utcnow().replace(second=0, microsecond=0)
 
-    raw_file, avg_file = get_filenames(config)
-    write_headers_if_needed(raw_file, avg_file, config, valve_enabled)
+    raw_file, avg_file, file_10, file_30, file_60 = get_filenames(config)
+    write_headers_if_needed(raw_file, avg_file, file_10, file_30, file_60,
+                            config, valve_enabled)
+
+    # Slot-aligned buffers per le aggregazioni 10/30/60 minuti.
+    # Si flushano quando il minuto appena chiuso entra in un nuovo slot,
+    # così il record del bucket precedente viene scritto subito dopo
+    # la fine del bucket (latenza ~1 minuto).
+    buf_10  = []; slot_10  = _slot_start(current_minute, 10)
+    buf_30  = []; slot_30  = _slot_start(current_minute, 30)
+    buf_60  = []; slot_60  = _slot_start(current_minute, 60)
 
     print(f"Logging started. Raw: {raw_file}, Min: {avg_file}")
+    print(f"Aggregates: 10/{file_10}  30/{file_30}  60/{file_60}")
     print(f"Serial: {device} @ {baudrate} bps; I2C bus {SHT31_BUS} addr 0x{SHT31_ADDR:02x}")
+
+    def _on_minute_closed(min_record):
+        """Hook called right after a 1-min record is written.
+
+        Updates the 10/30/60-min slot buffers and flushes any buffer whose
+        slot the just-closed minute has crossed. Captures `buf_*` and
+        `slot_*` as nonlocal so we don't have to thread them through.
+        """
+        nonlocal buf_10, slot_10, buf_30, slot_30, buf_60, slot_60
+        # 10-min
+        this_slot10 = _slot_start(current_minute, 10)
+        if this_slot10 != slot_10:
+            _flush_slot(file_10, slot_10, buf_10, valve_enabled)
+            buf_10 = []
+            slot_10 = this_slot10
+        buf_10.append(min_record)
+        # 30-min
+        this_slot30 = _slot_start(current_minute, 30)
+        if this_slot30 != slot_30:
+            _flush_slot(file_30, slot_30, buf_30, valve_enabled)
+            buf_30 = []
+            slot_30 = this_slot30
+        buf_30.append(min_record)
+        # 60-min
+        this_slot60 = _slot_start(current_minute, 60)
+        if this_slot60 != slot_60:
+            _flush_slot(file_60, slot_60, buf_60, valve_enabled)
+            buf_60 = []
+            slot_60 = this_slot60
+        buf_60.append(min_record)
 
     while True:
         try:
             line = ser.readline().decode(errors='ignore').strip()
             now = datetime.utcnow()
 
-            new_raw_file, new_avg_file = get_filenames(config)
-            if new_raw_file != raw_file or new_avg_file != avg_file:
-                raw_file, avg_file = new_raw_file, new_avg_file
-                write_headers_if_needed(raw_file, avg_file, config, valve_enabled)
-                print(f"New day. New files: {raw_file}, {avg_file}")
+            new_files = get_filenames(config)
+            if new_files != (raw_file, avg_file, file_10, file_30, file_60):
+                raw_file, avg_file, file_10, file_30, file_60 = new_files
+                write_headers_if_needed(raw_file, avg_file, file_10, file_30, file_60,
+                                        config, valve_enabled)
+                print(f"New day. Files rotated: {raw_file}, {avg_file}, ...")
 
             if line:
                 ts_str, current_timestamp = timestamp_now()
                 co2 = parse_co2_from_line(line)
 
                 if co2 is not None:
-                    t, rh = read_sht31(sht31_bus)
+                    # Dedup-by-value: il sensore aggiorna ~ogni 2 s.
+                    # Se il valore CO₂ è identico al precedente non aggiunge
+                    # informazione nuova → saltiamo la scrittura sul .raw e
+                    # NON lo conteggiamo nelle statistiche del minuto.
+                    is_duplicate = (last_co2_value is not None
+                                    and co2 == last_co2_value)
+                    if is_duplicate:
+                        # Avanzamento del minuto va comunque gestito
+                        # (anche senza letture indipendenti) — vedi sotto.
+                        pass
+                    else:
+                        t, rh = read_sht31(sht31_bus)
+                        last_co2_value = co2
+                        flag = _auto_flag(calib_auto, valve_enabled,
+                                          valve_status_file, valve_stale_s,
+                                          calib_labels, measure_position)
 
-                    flag = _auto_flag(calib_auto, valve_enabled,
-                                      valve_status_file, valve_stale_s,
-                                      calib_labels, measure_position)
-
-                    valve_suf_raw = _valve_suffix(valve_enabled, valve_status_file, valve_stale_s)
-                    with open(raw_file, 'a') as f_raw:
-                        f_raw.write(f"{ts_str} {co2:.2f} {t:.2f} {rh:.2f} {flag}{valve_suf_raw}\n")
+                        valve_suf_raw = _valve_suffix(valve_enabled, valve_status_file, valve_stale_s)
+                        with open(raw_file, 'a') as f_raw:
+                            f_raw.write(f"{ts_str} {co2:.2f} {t:.2f} {rh:.2f} {flag}{valve_suf_raw}\n")
 
                     if current_timestamp.replace(second=0, microsecond=0) == current_minute:
-                        co2_values.append(co2)
-                        t_values.append(t)
-                        rh_values.append(rh)
+                        # Stesso minuto: aggiorna i buffer (solo se non duplicato)
+                        if not is_duplicate:
+                            co2_values.append(co2)
+                            t_values.append(t)
+                            rh_values.append(rh)
                     else:
+                        # Cambio minuto: chiudi il minuto corrente e scrivi
+                        # il record _min.raw, poi gli aggregati 10/30/60.
                         with open(avg_file, 'a') as f_avg:
                             ts_avg = current_minute.strftime("%Y-%m-%d %H:%M:%S")
                             if co2_values:
@@ -379,14 +549,27 @@ def main():
                                 f"{rh_avg:.2f} {rh_std:.2f} "
                                 f"{n_co2} {flag}{valve_suf}\n"
                             )
+                        # Aggrega nei bucket 10/30/60 min
+                        _on_minute_closed(_make_minute_record(
+                            co2_avg, co2_std, n_co2,
+                            t_avg, t_std, rh_avg, rh_std,
+                            flag, valve_enabled, valve_status_file, valve_stale_s))
+
                         _last_co2 = co2_avg if co2_avg != MISSING else None
                         _last_t   = t_avg   if t_avg   != MISSING else None
                         _last_rh  = rh_avg  if rh_avg  != MISSING else None
                         _write_status_json(True, _last_co2, _last_t, _last_rh)
                         current_minute = current_timestamp.replace(second=0, microsecond=0)
-                        co2_values = [co2]
-                        t_values   = [t]
-                        rh_values  = [rh]
+                        # Avvia il nuovo minuto: includi il campione corrente
+                        # solo se non è un duplicato.
+                        if is_duplicate:
+                            co2_values = []
+                            t_values   = []
+                            rh_values  = []
+                        else:
+                            co2_values = [co2]
+                            t_values   = [t]
+                            rh_values  = [rh]
             else:
                 if now.replace(second=0, microsecond=0) != current_minute:
                     with open(avg_file, 'a') as f_avg:
@@ -401,6 +584,13 @@ def main():
                             f"{MISSING:.2f} {MISSING:.2f} "
                             f"0 {flag}{valve_suf}\n"
                         )
+                    # Anche un minuto vuoto va nei buffer: la pooling salta
+                    # i MISSING ma il minuto conta come "trascorso" per gli
+                    # slot 10/30/60.
+                    _on_minute_closed(_make_minute_record(
+                        MISSING, MISSING, 0,
+                        MISSING, MISSING, MISSING, MISSING,
+                        flag, valve_enabled, valve_status_file, valve_stale_s))
                     current_minute = now.replace(second=0, microsecond=0)
                     co2_values = []
                     t_values   = []
