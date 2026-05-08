@@ -125,16 +125,20 @@ def get_data_dir(cfg: configparser.ConfigParser) -> str:
     return os.path.expanduser(raw)
 
 
-def build_filename(cfg: configparser.ConfigParser, d: date_type) -> str:
+def build_filename(cfg: configparser.ConfigParser, d: date_type,
+                   suffix: str = "min") -> str:
     """
-    Trova il file _min per la data d usando glob (underscore nei nomi).
-    Pattern: *_<YYYYMMDD>_p00_min.ext
+    Trova il file aggregato per la data d e la finestra temporale `suffix`.
+
+    suffix ∈ {"min" (1-min), "10min", "30min", "60min"}.
+    Pattern: *_<YYYYMMDD>_p00_<suffix>.ext
     Restituisce stringa vuota se nessun file trovato.
     """
     import glob
     ext  = cfg.get("output", "extension", fallback="raw")
     ddir = get_data_dir(cfg)
-    pattern = os.path.join(ddir, f"*_{d.strftime('%Y%m%d')}_p00_min.{ext}")
+    pattern = os.path.join(ddir,
+                           f"*_{d.strftime('%Y%m%d')}_p00_{suffix}.{ext}")
     matches = glob.glob(pattern)
     if not matches:
         return ""
@@ -330,9 +334,11 @@ def read_file(path: str):
 
 
 def load_period(cfg: configparser.ConfigParser,
-                start: date_type, n_days: int):
+                start: date_type, n_days: int,
+                suffix: str = "min"):
     """
-    Carica n_days giorni a partire da start; ritorna array numpy ordinati.
+    Carica n_days giorni a partire da start dalla finestra `suffix`
+    (default `min` = medie 1 minuto). Restituisce array numpy ordinati.
     Tuple: (times, values, stds, counts, flags, t, t_std, rh, rh_std,
             valve_pos, valve_labels)
     valve_pos/valve_labels sono array vuoti se nessun file ha colonne valvola.
@@ -343,7 +349,8 @@ def load_period(cfg: configparser.ConfigParser,
     n_with_valve = 0
     for i in range(n_days):
         d = start + timedelta(days=i)
-        t, v, s, c, f, tt, tstd, rh, rhstd, vp, vl = read_file(build_filename(cfg, d))
+        t, v, s, c, f, tt, tstd, rh, rhstd, vp, vl = read_file(
+            build_filename(cfg, d, suffix))
         all_t.extend(t)
         all_v.extend(v)
         all_s.extend(s)
@@ -529,6 +536,26 @@ class GraphWidget(QWidget):
         self.chk_valve.stateChanged.connect(self._reload)
         bar.addWidget(self.chk_valve)
 
+        # Window selector: 4 checkboxes (1m / 10m / 30m / 60m). Multi-select.
+        # Default state from monitor.ini → [graph] → windows.
+        bar.addSpacing(8)
+        bar.addWidget(QLabel("Show:"))
+        self.chk_windows = {}
+        # gs_cfg loaded later in _init_axes; here we read once standalone
+        gcp_init = configparser.ConfigParser()
+        if os.path.exists(MONITOR_INI):
+            gcp_init.read(MONITOR_INI)
+        wraw_init = gcp_init.get("graph", "windows", fallback="1m").strip()
+        wset_init = {w.strip() for w in wraw_init.split(",")
+                     if w.strip() in {"1m", "10m", "30m", "60m"}} or {"1m"}
+        for w in ("1m", "10m", "30m", "60m"):
+            cb = QCheckBox(w)
+            cb.setChecked(w in wset_init)
+            cb.setToolTip(f"Overlay the {w} averaged series on the chart")
+            cb.stateChanged.connect(self._on_windows_changed)
+            bar.addWidget(cb)
+            self.chk_windows[w] = cb
+
         btn_home = QPushButton("⌂ Home")
         btn_home.setToolTip("Reset to full view")
         btn_home.clicked.connect(self._reset_view)
@@ -590,6 +617,8 @@ class GraphWidget(QWidget):
         Restituisce un dict con:
           - co2 line/scatter: style, point_size, line_width
           - T/RH line/scatter: trh_style, trh_point_size, trh_line_width
+          - windows: set delle finestre temporali da mostrare nei plot
+            (sottoinsieme di {'1m','10m','30m','60m'}, default {'1m'})
         """
         gcp = configparser.ConfigParser()
         if os.path.exists(MONITOR_INI):
@@ -599,6 +628,12 @@ class GraphWidget(QWidget):
             s = (s or "").strip().lower()
             return s if s in ("lines+points", "lines", "points") else "lines+points"
 
+        wraw = gcp.get("graph", "windows", fallback="1m").strip()
+        valid = {"1m", "10m", "30m", "60m"}
+        wset = {w.strip() for w in wraw.split(",") if w.strip() in valid}
+        if not wset:
+            wset = {"1m"}
+
         return {
             "style":           _norm_style(gcp.get("graph", "style", fallback="lines+points")),
             "point_size":      max(2, gcp.getint("graph", "point_size", fallback=18)),
@@ -606,6 +641,7 @@ class GraphWidget(QWidget):
             "trh_style":       _norm_style(gcp.get("graph", "trh_style", fallback="lines")),
             "trh_point_size":  max(2, gcp.getint("graph", "trh_point_size", fallback=10)),
             "trh_line_width":  max(0.2, gcp.getfloat("graph", "trh_line_width", fallback=1.0)),
+            "windows":         wset,
         }
 
     def _init_axes(self):
@@ -617,6 +653,10 @@ class GraphWidget(QWidget):
         self._trh_style      = gs_cfg["trh_style"]
         self._trh_point_size = gs_cfg["trh_point_size"]
         self._trh_line_width = gs_cfg["trh_line_width"]
+        self._enabled_windows = gs_cfg["windows"]   # set
+        # Lista artist matplotlib creati per le finestre non-primarie;
+        # ricreati a ogni reload e ripuliti qui sotto.
+        self._overlay_lines = []
 
         # 2 subplots con asse X condiviso: CO2 (grande sopra), T+RH (piccolo sotto)
         gs = self.fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.08)
@@ -774,7 +814,15 @@ class GraphWidget(QWidget):
     def _reload(self):
         """Ricarica dati e ridisegna. Preserva zoom se attivo."""
         start, n_days = self._period_range()
-        result = load_period(self.cfg, start, n_days)
+        # Primary window (smallest selected): drives the main line + scatter +
+        # errorbars. Other selected windows are added as overlay lines.
+        _suffix_for = {"1m": "min", "10m": "10min",
+                       "30m": "30min", "60m": "60min"}
+        _priority = ["1m", "10m", "30m", "60m"]
+        primary_w = next((w for w in _priority if w in self._enabled_windows),
+                         "1m")
+        result = load_period(self.cfg, start, n_days,
+                             suffix=_suffix_for[primary_w])
 
         self._ignore_lim_change = True  # evita loop callback
 
@@ -831,6 +879,14 @@ class GraphWidget(QWidget):
         _remove_eb(self._errorbar);    self._errorbar = None
         _remove_eb(self._errorbar_t);  self._errorbar_t = None
         _remove_eb(self._errorbar_rh); self._errorbar_rh = None
+
+        # Pulisci linee overlay delle finestre non-primarie (ricreate sotto)
+        for ln in self._overlay_lines:
+            try:
+                ln.remove()
+            except Exception:
+                pass
+        self._overlay_lines = []
 
         if result is None:
             self.line.set_data([], [])
@@ -1058,6 +1114,47 @@ class GraphWidget(QWidget):
                     self._valve_text.append(txt)
                 i = j
 
+        # ── Overlay lines per le finestre temporali NON primarie ──────────
+        # CO₂ (pannello principale) + T/RH (pannello secondario), ognuna con
+        # un proprio shade (più scuro) e linewidth proporzionale alla finestra.
+        # Niente scatter, niente errorbar: la finestra primaria già li ha,
+        # qui vogliamo solo la "tendenza" del bucket più largo.
+        _shades = {
+            "1m":  {"co2": "#2060c0", "t": "#c05000", "rh": "#007060",
+                    "lw_bonus": 0.0, "alpha": 0.55},
+            "10m": {"co2": "#1a4a99", "t": "#983c00", "rh": "#00554a",
+                    "lw_bonus": 0.8, "alpha": 0.85},
+            "30m": {"co2": "#0c2d66", "t": "#6b2900", "rh": "#003a32",
+                    "lw_bonus": 1.4, "alpha": 0.92},
+            "60m": {"co2": "#000033", "t": "#401900", "rh": "#001f1a",
+                    "lw_bonus": 2.0, "alpha": 1.00},
+        }
+        for w in _priority:
+            if w == primary_w or w not in self._enabled_windows:
+                continue
+            res_w = load_period(self.cfg, start, n_days, suffix=_suffix_for[w])
+            if res_w is None:
+                continue
+            (t_w, v_w, _, _, _, tt_w, _, rh_w, _, _, _) = res_w
+            xt_w = mdates.date2num(t_w)
+            v_plot  = np.where(v_w  == MISSING, np.nan, v_w)
+            tt_plot = np.where(tt_w == MISSING, np.nan, tt_w)
+            rh_plot = np.where(rh_w == MISSING, np.nan, rh_w)
+            sh = _shades[w]
+            lw_co2 = self._line_width    + sh["lw_bonus"]
+            lw_trh = self._trh_line_width + sh["lw_bonus"]
+            ln_co2, = self.ax.plot(
+                xt_w, v_plot, "-", linewidth=lw_co2,
+                color=sh["co2"], alpha=sh["alpha"], zorder=2.6,
+                label=f"CO₂ {w}")
+            ln_t, = self.ax_t.plot(
+                xt_w, tt_plot, "-", linewidth=lw_trh,
+                color=sh["t"], alpha=sh["alpha"], zorder=2.6)
+            ln_rh, = self.ax_rh.plot(
+                xt_w, rh_plot, "-", linewidth=lw_trh,
+                color=sh["rh"], alpha=sh["alpha"], zorder=2.6)
+            self._overlay_lines.extend([ln_co2, ln_t, ln_rh])
+
         # ── Zone notturne ─────────────────────────────────────────────────
         want_night = ASTRAL_OK and hasattr(self, "chk_night") and self.chk_night.isChecked()
         if want_night:
@@ -1191,6 +1288,32 @@ class GraphWidget(QWidget):
         self._reload()
 
     # ── aggiornamento real-time ───────────────────────────────────────────────
+
+    def _on_windows_changed(self, _state=None):
+        """Aggiorna self._enabled_windows + persiste in monitor.ini, poi reload."""
+        wset = {w for w, cb in self.chk_windows.items() if cb.isChecked()}
+        if not wset:
+            # Almeno una finestra deve essere visibile; fallback a 1m senza loop:
+            # rimettiamo la checkbox 1m e usciamo (lo stateChanged ricondurrà qui).
+            self.chk_windows["1m"].blockSignals(True)
+            self.chk_windows["1m"].setChecked(True)
+            self.chk_windows["1m"].blockSignals(False)
+            wset = {"1m"}
+        self._enabled_windows = wset
+        # Persisti su monitor.ini → [graph] → windows
+        try:
+            gcp = configparser.ConfigParser()
+            if os.path.exists(MONITOR_INI):
+                gcp.read(MONITOR_INI)
+            if "graph" not in gcp:
+                gcp["graph"] = {}
+            ordered = [w for w in ("1m", "10m", "30m", "60m") if w in wset]
+            gcp["graph"]["windows"] = ",".join(ordered)
+            with open(MONITOR_INI, "w") as f:
+                gcp.write(f)
+        except OSError:
+            pass
+        self._reload()
 
     def refresh(self):
         """Chiamato dal timer: aggiorna solo se il periodo include oggi."""
