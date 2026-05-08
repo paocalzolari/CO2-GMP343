@@ -22,11 +22,11 @@ from PyQt5.QtWidgets import (
     QGridLayout, QTabWidget, QPushButton,
     QComboBox, QDateEdit, QCheckBox, QFrame, QMessageBox,
     QDialog, QFormLayout, QSpinBox, QDoubleSpinBox, QLineEdit,
-    QDialogButtonBox, QFileDialog, QToolButton,
+    QDialogButtonBox, QFileDialog, QToolButton, QColorDialog,
     QPlainTextEdit, QScrollArea, QAction, QSizePolicy
 )
 from PyQt5.QtCore  import QTimer, Qt, QDate
-from PyQt5.QtGui   import QFont, QPixmap
+from PyQt5.QtGui   import QFont, QPixmap, QColor
 import serial, serial.tools.list_ports
 
 import matplotlib
@@ -110,6 +110,20 @@ else:
 SENSOR_IMG = os.path.join(_INSTALL_DIR, "gmp343_sensor.png")
 
 UPDATE_MS       = 5000   # refresh timer (ms)
+
+# Default per-window styling — shared between GraphWidget (rendering) and
+# MonitorConfigDialog Appearance tab (form). Keep in sync with the
+# GraphWidget._WINDOW_DEFAULTS class attribute (which mirrors this).
+MonitorWindow_PER_WINDOW_DEFAULTS = {
+    "1m":  {"color_co2": "#2060c0", "color_t": "#c05000", "color_rh": "#007060",
+            "linestyle": "-", "line_width": 1.0, "alpha": 0.55},
+    "10m": {"color_co2": "#1a4a99", "color_t": "#983c00", "color_rh": "#00554a",
+            "linestyle": "-", "line_width": 1.8, "alpha": 0.85},
+    "30m": {"color_co2": "#0c2d66", "color_t": "#6b2900", "color_rh": "#003a32",
+            "linestyle": "-", "line_width": 2.4, "alpha": 0.92},
+    "60m": {"color_co2": "#000033", "color_t": "#401900", "color_rh": "#001f1a",
+            "linestyle": "-", "line_width": 3.0, "alpha": 1.00},
+}
 MIN_Y_RANGE     = 20.0   # range Y minimo (ppm)
 Y_MARGIN_FACTOR = 0.10   # margine verticale relativo
 
@@ -595,6 +609,16 @@ class GraphWidget(QWidget):
         bar.addStretch()
         root.addLayout(bar)
 
+        # ── striscia legenda finestre (sopra il grafico) ──────────────────
+        # Mostra "■ Nm" per ogni finestra abilitata; usa il colore CO₂ della
+        # finestra. Si aggiorna in self._refresh_legend_strip() chiamata da
+        # _on_windows_changed e a fine _reload.
+        self._legend_bar = QHBoxLayout()
+        self._legend_bar.setContentsMargins(8, 0, 8, 0)
+        self._legend_bar.setSpacing(12)
+        self._legend_bar.addStretch()  # placeholder per primo build
+        root.addLayout(self._legend_bar)
+
         # ── figura ────────────────────────────────────────────────────────────
         self.fig = Figure(facecolor="white")
         # tight_layout gestisce automaticamente i margini incluso asse Y
@@ -611,14 +635,20 @@ class GraphWidget(QWidget):
         root.addWidget(toolbar)
         root.addWidget(self.canvas)
 
+    # Default per-window styling — riferimento alla costante module-level
+    # (la stessa usata dal dialog Appearance per gli stessi default).
+    _WINDOW_DEFAULTS = MonitorWindow_PER_WINDOW_DEFAULTS
+    _LINESTYLES = ("-", "--", ":", "-.")
+
     def _load_graph_style(self):
         """Legge da monitor.ini la sezione [graph] con default sicuri.
 
         Restituisce un dict con:
           - co2 line/scatter: style, point_size, line_width
           - T/RH line/scatter: trh_style, trh_point_size, trh_line_width
-          - windows: set delle finestre temporali da mostrare nei plot
-            (sottoinsieme di {'1m','10m','30m','60m'}, default {'1m'})
+          - windows: set delle finestre temporali abilitate
+          - per_window: dict {window: {color_co2, color_t, color_rh,
+                                        linestyle, line_width, alpha}}
         """
         gcp = configparser.ConfigParser()
         if os.path.exists(MONITOR_INI):
@@ -634,6 +664,27 @@ class GraphWidget(QWidget):
         if not wset:
             wset = {"1m"}
 
+        # Per-window: legge le chiavi <attr>_<window> con fallback al default
+        per_window = {}
+        for w, defaults in self._WINDOW_DEFAULTS.items():
+            ls = gcp.get("graph", f"linestyle_{w}",
+                         fallback=defaults["linestyle"]).strip()
+            if ls not in self._LINESTYLES:
+                ls = defaults["linestyle"]
+            per_window[w] = {
+                "color_co2":  gcp.get("graph", f"color_co2_{w}",
+                                      fallback=defaults["color_co2"]).strip(),
+                "color_t":    gcp.get("graph", f"color_t_{w}",
+                                      fallback=defaults["color_t"]).strip(),
+                "color_rh":   gcp.get("graph", f"color_rh_{w}",
+                                      fallback=defaults["color_rh"]).strip(),
+                "linestyle":  ls,
+                "line_width": max(0.2, gcp.getfloat(
+                    "graph", f"line_width_{w}", fallback=defaults["line_width"])),
+                "alpha":      min(1.0, max(0.05, gcp.getfloat(
+                    "graph", f"alpha_{w}", fallback=defaults["alpha"]))),
+            }
+
         return {
             "style":           _norm_style(gcp.get("graph", "style", fallback="lines+points")),
             "point_size":      max(2, gcp.getint("graph", "point_size", fallback=18)),
@@ -642,6 +693,7 @@ class GraphWidget(QWidget):
             "trh_point_size":  max(2, gcp.getint("graph", "trh_point_size", fallback=10)),
             "trh_line_width":  max(0.2, gcp.getfloat("graph", "trh_line_width", fallback=1.0)),
             "windows":         wset,
+            "per_window":      per_window,
         }
 
     def _init_axes(self):
@@ -654,6 +706,7 @@ class GraphWidget(QWidget):
         self._trh_point_size = gs_cfg["trh_point_size"]
         self._trh_line_width = gs_cfg["trh_line_width"]
         self._enabled_windows = gs_cfg["windows"]   # set
+        self._per_window      = gs_cfg["per_window"]
         # Lista artist matplotlib creati per le finestre non-primarie;
         # ricreati a ogni reload e ripuliti qui sotto.
         self._overlay_lines = []
@@ -762,6 +815,9 @@ class GraphWidget(QWidget):
 
         # Applica visibilità in base allo stile (lines / points / lines+points)
         self._apply_graph_style()
+        # Legenda iniziale (se la striscia è già stata costruita in _build_ui)
+        if hasattr(self, "_legend_bar"):
+            self._refresh_legend_strip()
 
     def _apply_graph_style(self):
         """Show/hide line+scatter for CO₂ and T/RH per their own style."""
@@ -1115,20 +1171,8 @@ class GraphWidget(QWidget):
                 i = j
 
         # ── Overlay lines per le finestre temporali NON primarie ──────────
-        # CO₂ (pannello principale) + T/RH (pannello secondario), ognuna con
-        # un proprio shade (più scuro) e linewidth proporzionale alla finestra.
-        # Niente scatter, niente errorbar: la finestra primaria già li ha,
-        # qui vogliamo solo la "tendenza" del bucket più largo.
-        _shades = {
-            "1m":  {"co2": "#2060c0", "t": "#c05000", "rh": "#007060",
-                    "lw_bonus": 0.0, "alpha": 0.55},
-            "10m": {"co2": "#1a4a99", "t": "#983c00", "rh": "#00554a",
-                    "lw_bonus": 0.8, "alpha": 0.85},
-            "30m": {"co2": "#0c2d66", "t": "#6b2900", "rh": "#003a32",
-                    "lw_bonus": 1.4, "alpha": 0.92},
-            "60m": {"co2": "#000033", "t": "#401900", "rh": "#001f1a",
-                    "lw_bonus": 2.0, "alpha": 1.00},
-        }
+        # Ogni finestra ha i propri colori/linewidth/linestyle/alpha letti
+        # da self._per_window (configurabile dal dialog Appearance).
         for w in _priority:
             if w == primary_w or w not in self._enabled_windows:
                 continue
@@ -1140,19 +1184,19 @@ class GraphWidget(QWidget):
             v_plot  = np.where(v_w  == MISSING, np.nan, v_w)
             tt_plot = np.where(tt_w == MISSING, np.nan, tt_w)
             rh_plot = np.where(rh_w == MISSING, np.nan, rh_w)
-            sh = _shades[w]
-            lw_co2 = self._line_width    + sh["lw_bonus"]
-            lw_trh = self._trh_line_width + sh["lw_bonus"]
+            ws = self._per_window[w]
             ln_co2, = self.ax.plot(
-                xt_w, v_plot, "-", linewidth=lw_co2,
-                color=sh["co2"], alpha=sh["alpha"], zorder=2.6,
-                label=f"CO₂ {w}")
+                xt_w, v_plot, ws["linestyle"],
+                linewidth=ws["line_width"], color=ws["color_co2"],
+                alpha=ws["alpha"], zorder=2.6, label=f"CO₂ {w}")
             ln_t, = self.ax_t.plot(
-                xt_w, tt_plot, "-", linewidth=lw_trh,
-                color=sh["t"], alpha=sh["alpha"], zorder=2.6)
+                xt_w, tt_plot, ws["linestyle"],
+                linewidth=ws["line_width"], color=ws["color_t"],
+                alpha=ws["alpha"], zorder=2.6)
             ln_rh, = self.ax_rh.plot(
-                xt_w, rh_plot, "-", linewidth=lw_trh,
-                color=sh["rh"], alpha=sh["alpha"], zorder=2.6)
+                xt_w, rh_plot, ws["linestyle"],
+                linewidth=ws["line_width"], color=ws["color_rh"],
+                alpha=ws["alpha"], zorder=2.6)
             self._overlay_lines.extend([ln_co2, ln_t, ln_rh])
 
         # ── Zone notturne ─────────────────────────────────────────────────
@@ -1289,6 +1333,32 @@ class GraphWidget(QWidget):
 
     # ── aggiornamento real-time ───────────────────────────────────────────────
 
+    def _refresh_legend_strip(self):
+        """Pulisce e ricostruisce la striscia legenda con un riquadro per
+        ogni finestra abilitata. Colore = colore CO₂ della finestra (è
+        l'identificativo visivo principale)."""
+        # Rimuovi tutti i widget esistenti dal layout
+        while self._legend_bar.count() > 0:
+            item = self._legend_bar.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        title = QLabel("Averages:")
+        title.setStyleSheet("color:#666;font-size:9pt;font-weight:bold")
+        self._legend_bar.addWidget(title)
+        for w in ("1m", "10m", "30m", "60m"):
+            if w not in self._enabled_windows:
+                continue
+            ws = self._per_window[w]
+            swatch = QLabel("■")
+            swatch.setStyleSheet(
+                f"color:{ws['color_co2']};font-size:14pt;font-weight:bold")
+            self._legend_bar.addWidget(swatch)
+            lbl = QLabel(w)
+            lbl.setStyleSheet("color:#333;font-size:9pt;font-weight:bold")
+            self._legend_bar.addWidget(lbl)
+        self._legend_bar.addStretch()
+
     def _on_windows_changed(self, _state=None):
         """Aggiorna self._enabled_windows + persiste in monitor.ini, poi reload."""
         wset = {w for w, cb in self.chk_windows.items() if cb.isChecked()}
@@ -1313,6 +1383,7 @@ class GraphWidget(QWidget):
                 gcp.write(f)
         except OSError:
             pass
+        self._refresh_legend_strip()
         self._reload()
 
     def refresh(self):
@@ -1889,10 +1960,12 @@ class MonitorConfigDialog(QDialog, _IniMixin):
         fnt = ini["fonts"] if "fonts" in ini else {}
         grp = ini["graph"] if "graph" in ini else {}
 
-        w = QWidget(); root = QVBoxLayout(w)
+        # Scroll area: la tab cresce con la sezione per-finestra (4 box)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        inner = QWidget(); root = QVBoxLayout(inner)
 
         info = QLabel(
-            "Font sizes for the Monitor panel and CO₂ chart style.\n"
+            "Font sizes for the Monitor panel and chart styling.\n"
             "Changes require a Monitor restart to take effect.")
         info.setStyleSheet("color:#666;font-size:9pt"); info.setWordWrap(True)
         root.addWidget(info)
@@ -1968,8 +2041,81 @@ class MonitorConfigDialog(QDialog, _IniMixin):
         f3.addRow("Line width (pt):", self.sp_trh_line_width)
         root.addWidget(g_trh)
 
+        # — Per-window overlay styles (1m / 10m / 30m / 60m) —
+        # Note: la finestra "primaria" (più piccola selezionata) usa lo stile
+        # CO₂/T-RH sopra; queste impostazioni sono usate per gli OVERLAY
+        # (le finestre non-primarie disegnate come linee sovrapposte).
+        info_w = QLabel(
+            "<b>Per-window overlay styles</b> — colors, line style,"
+            " line width and alpha for each averaging window. The"
+            " smallest enabled window uses the chart styles above;"
+            " the others are drawn as overlays with these settings.")
+        info_w.setStyleSheet("color:#444;font-size:9pt;padding-top:6px")
+        info_w.setWordWrap(True)
+        root.addWidget(info_w)
+
+        # Salva i widget per finestra in un dict per facile accesso da _on_save
+        self.window_widgets = {}
+
+        defaults = MonitorWindow_PER_WINDOW_DEFAULTS  # alias outside class
+        for w_key in ("1m", "10m", "30m", "60m"):
+            d = defaults[w_key]
+            gbox = QGroupBox(f"{w_key} overlay")
+            form = QFormLayout(gbox)
+
+            def _color_button(initial_hex):
+                btn = QPushButton("    ")
+                btn.setFixedSize(60, 22)
+                btn.setStyleSheet(
+                    f"background-color:{initial_hex};"
+                    f"border:1px solid #888;border-radius:3px")
+                btn._hex = initial_hex
+                def pick():
+                    c = QColorDialog.getColor(QColor(btn._hex), self,
+                                              "Pick color")
+                    if c.isValid():
+                        btn._hex = c.name()
+                        btn.setStyleSheet(
+                            f"background-color:{btn._hex};"
+                            f"border:1px solid #888;border-radius:3px")
+                btn.clicked.connect(pick)
+                return btn
+
+            btn_co2 = _color_button(grp.get(f"color_co2_{w_key}", d["color_co2"]))
+            form.addRow("CO₂ color:", btn_co2)
+            btn_t = _color_button(grp.get(f"color_t_{w_key}", d["color_t"]))
+            form.addRow("T color:", btn_t)
+            btn_rh = _color_button(grp.get(f"color_rh_{w_key}", d["color_rh"]))
+            form.addRow("RH color:", btn_rh)
+
+            cb_ls = QComboBox()
+            cb_ls.addItems(["solid (-)", "dashed (--)", "dotted (:)", "dash-dot (-.)"])
+            ls_to_idx = {"-": 0, "--": 1, ":": 2, "-.": 3}
+            cb_ls.setCurrentIndex(ls_to_idx.get(
+                grp.get(f"linestyle_{w_key}", d["linestyle"]).strip(), 0))
+            form.addRow("Line style:", cb_ls)
+
+            sp_lw = QDoubleSpinBox()
+            sp_lw.setRange(0.2, 8.0); sp_lw.setSingleStep(0.1); sp_lw.setDecimals(2)
+            try: sp_lw.setValue(float(grp.get(f"line_width_{w_key}", d["line_width"])))
+            except (TypeError, ValueError): sp_lw.setValue(d["line_width"])
+            form.addRow("Line width (pt):", sp_lw)
+
+            sp_alpha = QDoubleSpinBox()
+            sp_alpha.setRange(0.05, 1.0); sp_alpha.setSingleStep(0.05); sp_alpha.setDecimals(2)
+            try: sp_alpha.setValue(float(grp.get(f"alpha_{w_key}", d["alpha"])))
+            except (TypeError, ValueError): sp_alpha.setValue(d["alpha"])
+            form.addRow("Alpha (0..1):", sp_alpha)
+
+            self.window_widgets[w_key] = {
+                "btn_co2": btn_co2, "btn_t": btn_t, "btn_rh": btn_rh,
+                "cb_ls": cb_ls, "sp_lw": sp_lw, "sp_alpha": sp_alpha,
+            }
+            root.addWidget(gbox)
+
         root.addStretch()
-        return w
+        scroll.setWidget(inner)
+        return scroll
 
     # ────────────────────────────────────────────── helpers + save
     @staticmethod
@@ -2048,6 +2194,15 @@ class MonitorConfigDialog(QDialog, _IniMixin):
             mini["graph"]["trh_style"]      = _idx_to_style[self.cb_trh_style.currentIndex()]
             mini["graph"]["trh_point_size"] = str(self.sp_trh_point_size.value())
             mini["graph"]["trh_line_width"] = f"{self.sp_trh_line_width.value():.2f}"
+            # Per-window overlay styles
+            _idx_to_ls = {0: "-", 1: "--", 2: ":", 3: "-."}
+            for w_key, widgets in self.window_widgets.items():
+                mini["graph"][f"color_co2_{w_key}"]  = widgets["btn_co2"]._hex
+                mini["graph"][f"color_t_{w_key}"]    = widgets["btn_t"]._hex
+                mini["graph"][f"color_rh_{w_key}"]   = widgets["btn_rh"]._hex
+                mini["graph"][f"linestyle_{w_key}"]  = _idx_to_ls[widgets["cb_ls"].currentIndex()]
+                mini["graph"][f"line_width_{w_key}"] = f"{widgets['sp_lw'].value():.2f}"
+                mini["graph"][f"alpha_{w_key}"]      = f"{widgets['sp_alpha'].value():.2f}"
             self._write_ini(MONITOR_INI, mini)
 
         except OSError as exc:
