@@ -880,6 +880,32 @@ class GraphWidget(QWidget):
         result = load_period(self.cfg, start, n_days,
                              suffix=_suffix_for[primary_w])
 
+        # Applica lo styling per-window al PRIMARY (line + scatter + T/RH).
+        # Forziamo alpha=1.0 per il primary (gli alpha < 1 dei default sono
+        # pensati per gli overlay sovrapposti, non per la traccia principale).
+        ws_p = self._per_window[primary_w]
+        self.line.set_color(ws_p["color_co2"])
+        self.line.set_linestyle(ws_p["linestyle"])
+        self.line.set_linewidth(ws_p["line_width"])
+        self.line.set_alpha(1.0)
+        self.sc_measure.set_facecolor(ws_p["color_co2"])
+        self.sc_measure.set_edgecolor(ws_p["color_co2"])
+        # sc_calib resta arancione: ha semantica fissa (calibration diamond)
+
+        self.line_t.set_color(ws_p["color_t"])
+        self.line_t.set_linestyle(ws_p["linestyle"])
+        self.line_t.set_linewidth(ws_p["line_width"])
+        self.line_t.set_alpha(1.0)
+        self.sc_t.set_facecolor(ws_p["color_t"])
+        self.sc_t.set_edgecolor(ws_p["color_t"])
+
+        self.line_rh.set_color(ws_p["color_rh"])
+        self.line_rh.set_linestyle(ws_p["linestyle"])
+        self.line_rh.set_linewidth(ws_p["line_width"])
+        self.line_rh.set_alpha(1.0)
+        self.sc_rh.set_facecolor(ws_p["color_rh"])
+        self.sc_rh.set_edgecolor(ws_p["color_rh"])
+
         self._ignore_lim_change = True  # evita loop callback
 
         # ── Pulisci zone notturne ──────────────────────────────────────────
