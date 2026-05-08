@@ -140,18 +140,35 @@ sudo chmod 440 /etc/sudoers.d/misura-tailscale
 
 ### Icone sul Desktop
 
-Tre lanciatori grafici in `~/Desktop/` (sorgenti versionati nella radice
+Lanciatori grafici in `~/Desktop/` (sorgenti versionati nella radice
 `programs/CO2/`):
 
 | Icona | Cosa fa | Script invocato |
 |---|---|---|
+| **CO2 Launcher** | Dialog yad con stato live + Start/Stop/Restart backend, Open/Close Monitor, Status terminal | `bin/co2-launcher.sh` |
 | **CO2 Monitor** | Apre la GUI di visualizzazione | `gmp343_sht31_monitor.py` |
-| **CO2 Calibration** | Procedura calibrazione completa: stop service → GUI calib → restart service | `bin/co2-calib-mode.sh` |
 | **CO2 Status** | Apre un terminale con stato + log live del service | `bin/co2-status.sh` |
 
-`CO2 Calibration` e `CO2 Status` aprono un terminale (`Terminal=true`) in
-modo che l'utente veda cosa succede e possa digitare la password sudo
-quando necessario. `CO2 Monitor` non apre terminale (è solo una GUI Qt).
+> `CO2 Calibration` (manuale) è stato rimosso dal Desktop perché il flusso
+> principale è ora **automatico** via `valve-scheduler` (regola posizionale
+> `valve_pos != 1 → calib`). Lo script `bin/co2-calib-mode.sh` resta
+> invocabile da CLI per calibrazioni manuali estemporanee.
+
+`CO2 Status` apre un terminale (`Terminal=true`) per mostrare il `journalctl
+-f`. `CO2 Monitor` e `CO2 Launcher` non aprono terminale.
+
+#### Autostart al login X
+
+Il **CO2 Launcher** viene lanciato anche automaticamente all'apertura della
+sessione X tramite `~/.config/autostart/CO2-Launcher.desktop` (stesso file
+`.desktop` in `programs/CO2/CO2-Launcher.desktop` con
+`X-GNOME-Autostart-enabled=true`). Sopra il dock c'è quindi sempre la
+finestra del launcher pronta per Apply/Refresh.
+
+Anche **Monitor-GMP343** continua a partire automaticamente al login
+(`autoexec/Monitor-GMP343.desktop` → `~/.config/autostart/`). Se preferisci
+lanciarlo solo dal yad launcher, sposta il `.desktop` di Monitor in
+`Hidden=true` o rimuovilo da `~/.config/autostart/`.
 
 ---
 
