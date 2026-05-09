@@ -114,15 +114,28 @@ UPDATE_MS       = 5000   # refresh timer (ms)
 # Default per-window styling — shared between GraphWidget (rendering) and
 # MonitorConfigDialog Appearance tab (form). Keep in sync with the
 # GraphWidget._WINDOW_DEFAULTS class attribute (which mirrors this).
+# "60m-med" = mediana 60-min (legge il file _60min.raw con metric=median).
 MonitorWindow_PER_WINDOW_DEFAULTS = {
-    "1m":  {"color_co2": "#2060c0", "color_t": "#c05000", "color_rh": "#007060",
-            "linestyle": "-", "line_width": 1.0, "alpha": 0.55},
-    "10m": {"color_co2": "#1a4a99", "color_t": "#983c00", "color_rh": "#00554a",
-            "linestyle": "-", "line_width": 1.8, "alpha": 0.85},
-    "30m": {"color_co2": "#0c2d66", "color_t": "#6b2900", "color_rh": "#003a32",
-            "linestyle": "-", "line_width": 2.4, "alpha": 0.92},
-    "60m": {"color_co2": "#000033", "color_t": "#401900", "color_rh": "#001f1a",
-            "linestyle": "-", "line_width": 3.0, "alpha": 1.00},
+    "1m":     {"color_co2": "#2060c0", "color_t": "#c05000", "color_rh": "#007060",
+               "linestyle": "-", "line_width": 1.0, "alpha": 0.55},
+    "10m":    {"color_co2": "#1a4a99", "color_t": "#983c00", "color_rh": "#00554a",
+               "linestyle": "-", "line_width": 1.8, "alpha": 0.85},
+    "30m":    {"color_co2": "#0c2d66", "color_t": "#6b2900", "color_rh": "#003a32",
+               "linestyle": "-", "line_width": 2.4, "alpha": 0.92},
+    "60m":    {"color_co2": "#000033", "color_t": "#401900", "color_rh": "#001f1a",
+               "linestyle": "-", "line_width": 3.0, "alpha": 1.00},
+    "60m-med":{"color_co2": "#a40000", "color_t": "#a05000", "color_rh": "#0d6e60",
+               "linestyle": "--", "line_width": 2.4, "alpha": 1.00},
+}
+# Ordered list of all available windows
+MonitorWindow_PRIORITY = ["1m", "10m", "30m", "60m", "60m-med"]
+# Map window keys → (file_suffix, metric)
+MonitorWindow_SUFFIX_METRIC = {
+    "1m":     ("min",    "mean"),
+    "10m":    ("10min",  "mean"),
+    "30m":    ("30min",  "mean"),
+    "60m":    ("60min",  "mean"),
+    "60m-med":("60min",  "median"),
 }
 MIN_Y_RANGE     = 20.0   # range Y minimo (ppm)
 Y_MARGIN_FACTOR = 0.10   # margine verticale relativo
@@ -254,15 +267,23 @@ def _startup_log():
 MISSING = -999.99
 
 
-def read_file(path: str):
+def read_file(path: str, metric: str = "mean"):
     """
-    Legge un file dati _min.
-    Supporta sia formato v3 (con T/RH, 10+ colonne) sia v2 (solo CO2, 6+ colonne):
-      v3: date time CO2 CO2_std T T_std RH RH_std n flag [valve_pos valve_label]
+    Legge un file dati `_min.raw` (1-min) o `_Nmin.raw` (10/30/60-min).
+    Supporta v2/v3/v4:
       v2: date time CO2 CO2_std n flag [valve_pos valve_label]
-    Per i file v2 T e RH sono restituiti come MISSING.
-    Colonne valvola opzionali (integrazione valve-scheduler).
-    Timestamp: YYYY-MM-DD HH:MM:SS
+      v3: date time CO2 CO2_std T T_std RH RH_std n flag [valve_pos valve_label]
+      v4: date time CO2 CO2_std CO2_med T T_std T_med RH RH_std RH_med n flag [valve_pos valve_label]
+          (file 60-min con mediane calcolate dai sample raw)
+
+    `metric`:
+      - "mean" (default): le colonne 'values'/'t'/'rh' contengono CO2/T/RH
+        media (compatibile con tutto).
+      - "median": per file v4 sostituisce le medie con le mediane;
+        per file v2/v3 (no mediana disponibile) cade a mean.
+
+    Per i file v2 T/RH sono restituiti come MISSING. Colonne valvola
+    opzionali. Timestamp: YYYY-MM-DD HH:MM:SS.
     Ritorna: (times, values, stds, counts, flags, t, t_std, rh, rh_std,
               valve_pos, valve_labels)
     """
@@ -285,12 +306,28 @@ def read_file(path: str):
                 try:
                     dt  = datetime.strptime(f"{p[0]} {p[1]}", "%Y-%m-%d %H:%M:%S")
                     co2 = float(p[2])
-                    # Discriminazione formato: v3 ha 9 colonne (ts=2 parole), v2 ne ha 5.
-                    # Dopo ts+CO2 restano len(p)-3 colonne:
-                    #   v3 → 7 (CO2_std T T_std RH RH_std n flag)
-                    #   v2 → 3 (CO2_std n flag)  o 2 (n flag)  o 1 (flag)
+                    # Discriminazione formato: v4 ha 11 colonne dati (CO2_std
+                    # CO2_med T T_std T_med RH RH_std RH_med n flag), v3 ha 7
+                    # (CO2_std T T_std RH RH_std n flag), v2 fino a 3.
                     remaining = len(p) - 3
-                    if remaining >= 7:
+                    if remaining >= 10:
+                        # v4: CO2_std CO2_med T T_std T_med RH RH_std RH_med n flag
+                        co2_std    = float(p[3])
+                        co2_median = float(p[4])
+                        t_val      = float(p[5])
+                        t_std      = float(p[6])
+                        t_median   = float(p[7])
+                        rh_val     = float(p[8])
+                        rh_std     = float(p[9])
+                        rh_median  = float(p[10])
+                        n          = int(p[11])
+                        flag       = p[12].lower() if len(p) >= 13 else "measure"
+                        if metric == "median":
+                            co2    = co2_median
+                            t_val  = t_median
+                            rh_val = rh_median
+                        valve_idx = 13
+                    elif remaining >= 7:
                         # v3: CO2_std T T_std RH RH_std n flag
                         co2_std = float(p[3])
                         t_val   = float(p[4])
@@ -299,22 +336,16 @@ def read_file(path: str):
                         rh_std  = float(p[7])
                         n       = int(p[8])
                         flag    = p[9].lower() if len(p) >= 10 else "measure"
+                        valve_idx = 10
                     else:
                         # v2: [CO2_std [n [flag]]]
                         co2_std = float(p[3]) if len(p) >= 4 else 0.0
                         n       = int(p[4])   if len(p) >= 5 else 1
                         flag    = p[5].lower() if len(p) >= 6 else "measure"
                         t_val, t_std, rh_val, rh_std = MISSING, MISSING, MISSING, MISSING
+                        valve_idx = 6
                     if flag not in ("measure", "calib"):
                         flag = "measure"
-                    # Colonne opzionali valve-scheduler (dopo il flag)
-                    # v3: posizioni p[10], p[11]; v2: posizioni p[6], p[7]
-                    if remaining >= 7:
-                        # v3: valve dopo flag a p[9]
-                        valve_idx = 10
-                    else:
-                        # v2: valve dopo flag a p[5]
-                        valve_idx = 6
                     if len(p) >= valve_idx + 2:
                         has_valve_cols = True
                         try:
@@ -349,10 +380,13 @@ def read_file(path: str):
 
 def load_period(cfg: configparser.ConfigParser,
                 start: date_type, n_days: int,
-                suffix: str = "min"):
+                suffix: str = "min",
+                metric: str = "mean"):
     """
     Carica n_days giorni a partire da start dalla finestra `suffix`
-    (default `min` = medie 1 minuto). Restituisce array numpy ordinati.
+    (default `min` = medie 1 minuto). `metric="median"` ritorna le mediane
+    al posto delle medie (solo per file v4, es. `_60min.raw`). Per file
+    v2/v3 cade silenziosamente a mean (non c'è la colonna mediana).
     Tuple: (times, values, stds, counts, flags, t, t_std, rh, rh_std,
             valve_pos, valve_labels)
     valve_pos/valve_labels sono array vuoti se nessun file ha colonne valvola.
@@ -364,7 +398,7 @@ def load_period(cfg: configparser.ConfigParser,
     for i in range(n_days):
         d = start + timedelta(days=i)
         t, v, s, c, f, tt, tstd, rh, rhstd, vp, vl = read_file(
-            build_filename(cfg, d, suffix))
+            build_filename(cfg, d, suffix), metric=metric)
         all_t.extend(t)
         all_v.extend(v)
         all_s.extend(s)
@@ -561,11 +595,20 @@ class GraphWidget(QWidget):
             gcp_init.read(MONITOR_INI)
         wraw_init = gcp_init.get("graph", "windows", fallback="1m").strip()
         wset_init = {w.strip() for w in wraw_init.split(",")
-                     if w.strip() in {"1m", "10m", "30m", "60m"}} or {"1m"}
-        for w in ("1m", "10m", "30m", "60m"):
-            cb = QCheckBox(w)
+                     if w.strip() in {"1m", "10m", "30m", "60m", "60m-med"}} or {"1m"}
+        _wlabels = {"1m": "1m", "10m": "10m", "30m": "30m",
+                    "60m": "60m", "60m-med": "60m med"}
+        _wtips = {
+            "1m":      "1-min average (raw rate)",
+            "10m":     "10-min average (pooled from 1-min)",
+            "30m":     "30-min average (pooled from 1-min)",
+            "60m":     "60-min mean — computed from raw samples",
+            "60m-med": "60-min MEDIAN — computed from raw samples (robust to outliers)",
+        }
+        for w in ("1m", "10m", "30m", "60m", "60m-med"):
+            cb = QCheckBox(_wlabels[w])
             cb.setChecked(w in wset_init)
-            cb.setToolTip(f"Overlay the {w} averaged series on the chart")
+            cb.setToolTip(_wtips[w])
             cb.stateChanged.connect(self._on_windows_changed)
             bar.addWidget(cb)
             self.chk_windows[w] = cb
@@ -659,7 +702,7 @@ class GraphWidget(QWidget):
             return s if s in ("lines+points", "lines", "points") else "lines+points"
 
         wraw = gcp.get("graph", "windows", fallback="1m").strip()
-        valid = {"1m", "10m", "30m", "60m"}
+        valid = {"1m", "10m", "30m", "60m", "60m-med"}
         wset = {w.strip() for w in wraw.split(",") if w.strip() in valid}
         if not wset:
             wset = {"1m"}
@@ -872,13 +915,14 @@ class GraphWidget(QWidget):
         start, n_days = self._period_range()
         # Primary window (smallest selected): drives the main line + scatter +
         # errorbars. Other selected windows are added as overlay lines.
-        _suffix_for = {"1m": "min", "10m": "10min",
-                       "30m": "30min", "60m": "60min"}
-        _priority = ["1m", "10m", "30m", "60m"]
+        # 60m-med (median) is treated as "wider than 60m" in the priority so
+        # if both 60m and 60m-med are checked, 60m mean is the primary.
+        _priority = MonitorWindow_PRIORITY
         primary_w = next((w for w in _priority if w in self._enabled_windows),
                          "1m")
+        suf, met = MonitorWindow_SUFFIX_METRIC[primary_w]
         result = load_period(self.cfg, start, n_days,
-                             suffix=_suffix_for[primary_w])
+                             suffix=suf, metric=met)
 
         # Salva il dict per-window del primary; lo applichiamo agli artist
         # DOPO set_data/set_offsets (vedi _apply_primary_window_style sotto).
@@ -1207,7 +1251,9 @@ class GraphWidget(QWidget):
         for w in _priority:
             if w == primary_w or w not in self._enabled_windows:
                 continue
-            res_w = load_period(self.cfg, start, n_days, suffix=_suffix_for[w])
+            suf_w, met_w = MonitorWindow_SUFFIX_METRIC[w]
+            res_w = load_period(self.cfg, start, n_days,
+                                suffix=suf_w, metric=met_w)
             if res_w is None:
                 continue
             (t_w, v_w, _, _, _, tt_w, _, rh_w, _, _, _) = res_w
@@ -1377,7 +1423,9 @@ class GraphWidget(QWidget):
         title = QLabel("Averages:")
         title.setStyleSheet("color:#666;font-size:9pt;font-weight:bold")
         self._legend_bar.addWidget(title)
-        for w in ("1m", "10m", "30m", "60m"):
+        _legend_labels = {"1m": "1m", "10m": "10m", "30m": "30m",
+                          "60m": "60m mean", "60m-med": "60m median"}
+        for w in ("1m", "10m", "30m", "60m", "60m-med"):
             if w not in self._enabled_windows:
                 continue
             ws = self._per_window[w]
@@ -1385,7 +1433,7 @@ class GraphWidget(QWidget):
             swatch.setStyleSheet(
                 f"color:{ws['color_co2']};font-size:14pt;font-weight:bold")
             self._legend_bar.addWidget(swatch)
-            lbl = QLabel(w)
+            lbl = QLabel(_legend_labels[w])
             lbl.setStyleSheet("color:#333;font-size:9pt;font-weight:bold")
             self._legend_bar.addWidget(lbl)
         self._legend_bar.addStretch()
@@ -1408,7 +1456,7 @@ class GraphWidget(QWidget):
                 gcp.read(MONITOR_INI)
             if "graph" not in gcp:
                 gcp["graph"] = {}
-            ordered = [w for w in ("1m", "10m", "30m", "60m") if w in wset]
+            ordered = [w for w in ("1m", "10m", "30m", "60m", "60m-med") if w in wset]
             gcp["graph"]["windows"] = ",".join(ordered)
             with open(MONITOR_INI, "w") as f:
                 gcp.write(f)
@@ -2089,9 +2137,12 @@ class MonitorConfigDialog(QDialog, _IniMixin):
         self.window_widgets = {}
 
         defaults = MonitorWindow_PER_WINDOW_DEFAULTS  # alias outside class
-        for w_key in ("1m", "10m", "30m", "60m"):
+        for w_key in ("1m", "10m", "30m", "60m", "60m-med"):
             d = defaults[w_key]
-            gbox = QGroupBox(f"{w_key} overlay")
+            _gbox_titles = {"1m": "1m overlay", "10m": "10m overlay",
+                            "30m": "30m overlay", "60m": "60m mean overlay",
+                            "60m-med": "60m MEDIAN overlay"}
+            gbox = QGroupBox(_gbox_titles.get(w_key, f"{w_key} overlay"))
             form = QFormLayout(gbox)
 
             def _color_button(initial_hex):

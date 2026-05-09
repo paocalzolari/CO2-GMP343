@@ -205,24 +205,27 @@ def write_headers_if_needed(raw_file, avg_file, file_10, file_30, file_60,
 
     RAW : #date time CO2 T RH flag [valve_pos valve_label]
     MIN : #date time CO2 CO2_std T T_std RH RH_std ndata_60s_mean flag [...]
-    10/30/60 min: come MIN ma `ndata` rappresenta il TOTALE di campioni nel
-    bucket (somma dei `ndata_60s_mean` dei minuti aggregati).
+    10/30 min: come MIN ma `ndata` = totale campioni nel bucket.
+    60   min: come MIN ma con MEDIANE aggiunte (calcolate da raw):
+              CO2 CO2_std CO2_median T T_std T_median RH RH_std RH_median.
     """
     if valve_enabled:
-        raw_header = "#date time CO2[PPM] T[C] RH[%] flag valve_pos valve_label"
-        avg_header = "#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag valve_pos valve_label"
-        agg_header = "#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata flag valve_pos valve_label"
+        raw_header  = "#date time CO2[PPM] T[C] RH[%] flag valve_pos valve_label"
+        avg_header  = "#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag valve_pos valve_label"
+        agg_header  = "#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata flag valve_pos valve_label"
+        agg60_header= "#date time CO2[PPM] CO2_std[PPM] CO2_median[PPM] T[C] T_std[C] T_median[C] RH[%] RH_std[%] RH_median[%] ndata flag valve_pos valve_label"
     else:
-        raw_header = "#date time CO2[PPM] T[C] RH[%] flag"
-        avg_header = "#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag"
-        agg_header = "#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata flag"
+        raw_header  = "#date time CO2[PPM] T[C] RH[%] flag"
+        avg_header  = "#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag"
+        agg_header  = "#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata flag"
+        agg60_header= "#date time CO2[PPM] CO2_std[PPM] CO2_median[PPM] T[C] T_std[C] T_median[C] RH[%] RH_std[%] RH_median[%] ndata flag"
 
     pairs = [
         (raw_file, raw_header),
         (avg_file, avg_header),
         (file_10,  agg_header),
         (file_30,  agg_header),
-        (file_60,  agg_header),
+        (file_60,  agg60_header),   # extended format with medians
     ]
     for path, header in pairs:
         if not os.path.exists(path):
@@ -294,6 +297,49 @@ def _flush_slot(path, slot_ts, buf, valve_enabled):
             f"{ts} {M_c:.2f} {S_c:.2f} "
             f"{M_t:.2f} {S_t:.2f} "
             f"{M_r:.2f} {S_r:.2f} "
+            f"{N} {flag}{valve_suf}\n"
+        )
+
+
+def _flush_60min_with_median(path, slot_ts, buf_minutes,
+                             raw_co2, raw_t, raw_rh, valve_enabled):
+    """Write a 60-min row computing mean/std/median directly from raw samples.
+
+    `raw_co2/_t/_rh` are flat lists of all per-sample readings collected
+    during the past hour (MISSING values are filtered per quantity at
+    aggregation time). `buf_minutes` is reused only for flag/valve-pos
+    metadata (sticky-calib + most-frequent), since those are already
+    decimated per-minute and that level of granularity is enough.
+    """
+    if not raw_co2 and not buf_minutes:
+        return
+
+    def _stats(values):
+        clean = [v for v in values if v != MISSING]
+        if not clean:
+            return MISSING, MISSING, MISSING
+        m = sum(clean) / len(clean)
+        s = statistics.stdev(clean) if len(clean) > 1 else 0.0
+        med = statistics.median(clean)
+        return m, s, med
+
+    M_c, S_c, Med_c = _stats(raw_co2)
+    M_t, S_t, Med_t = _stats(raw_t)
+    M_r, S_r, Med_r = _stats(raw_rh)
+    N = sum(1 for v in raw_co2 if v != MISSING)
+    flag = "calib" if any(r["flag"] == "calib" for r in buf_minutes) else "measure"
+    if valve_enabled and buf_minutes:
+        vpos = Counter(r["valve_pos"]   for r in buf_minutes).most_common(1)[0][0]
+        vlab = Counter(r["valve_label"] for r in buf_minutes).most_common(1)[0][0]
+        valve_suf = f" {vpos} {vlab}"
+    else:
+        valve_suf = ""
+    ts = slot_ts.strftime("%Y-%m-%d %H:%M:%S")
+    with open(path, "a") as f:
+        f.write(
+            f"{ts} {M_c:.2f} {S_c:.2f} {Med_c:.2f} "
+            f"{M_t:.2f} {S_t:.2f} {Med_t:.2f} "
+            f"{M_r:.2f} {S_r:.2f} {Med_r:.2f} "
             f"{N} {flag}{valve_suf}\n"
         )
 
@@ -447,6 +493,13 @@ def main():
     buf_10  = []; slot_10  = _slot_start(current_minute, 10)
     buf_30  = []; slot_30  = _slot_start(current_minute, 30)
     buf_60  = []; slot_60  = _slot_start(current_minute, 60)
+    # Raw sample buffer per la mediana 60-min: vi accumuliamo OGNI singolo
+    # campione (post-dedup) dell'ora corrente; al boundary 60-min
+    # calcoliamo mean/std/median direttamente dai sample (non dai pooled
+    # 1-min, così la mediana è quella vera dei dati grezzi).
+    buf_60_raw_co2 = []
+    buf_60_raw_t   = []
+    buf_60_raw_rh  = []
 
     print(f"Logging started. Raw: {raw_file}, Min: {avg_file}")
     print(f"Aggregates: 10/{file_10}  30/{file_30}  60/{file_60}")
@@ -456,10 +509,11 @@ def main():
         """Hook called right after a 1-min record is written.
 
         Updates the 10/30/60-min slot buffers and flushes any buffer whose
-        slot the just-closed minute has crossed. Captures `buf_*` and
-        `slot_*` as nonlocal so we don't have to thread them through.
+        slot the just-closed minute has crossed. The 60-min flush also
+        computes mean/std/median straight from the raw sample buffer.
         """
         nonlocal buf_10, slot_10, buf_30, slot_30, buf_60, slot_60
+        nonlocal buf_60_raw_co2, buf_60_raw_t, buf_60_raw_rh
         # 10-min
         this_slot10 = _slot_start(current_minute, 10)
         if this_slot10 != slot_10:
@@ -474,11 +528,17 @@ def main():
             buf_30 = []
             slot_30 = this_slot30
         buf_30.append(min_record)
-        # 60-min
+        # 60-min: usa i RAW sample dell'ora per mean/std/median
         this_slot60 = _slot_start(current_minute, 60)
         if this_slot60 != slot_60:
-            _flush_slot(file_60, slot_60, buf_60, valve_enabled)
+            _flush_60min_with_median(
+                file_60, slot_60, buf_60,
+                buf_60_raw_co2, buf_60_raw_t, buf_60_raw_rh,
+                valve_enabled)
             buf_60 = []
+            buf_60_raw_co2 = []
+            buf_60_raw_t   = []
+            buf_60_raw_rh  = []
             slot_60 = this_slot60
         buf_60.append(min_record)
 
@@ -526,6 +586,11 @@ def main():
                             co2_values.append(co2)
                             t_values.append(t)
                             rh_values.append(rh)
+                            # Raw buffer per la mediana 60-min (un sample
+                            # per chiamata, post-dedup)
+                            buf_60_raw_co2.append(co2)
+                            buf_60_raw_t.append(t)
+                            buf_60_raw_rh.append(rh)
                     else:
                         # Cambio minuto: chiudi il minuto corrente e scrivi
                         # il record _min.raw, poi gli aggregati 10/30/60.
@@ -570,6 +635,15 @@ def main():
                             co2_values = [co2]
                             t_values   = [t]
                             rh_values  = [rh]
+                            # Il sample corrente appartiene già al nuovo
+                            # minuto: includilo anche nel raw buffer 60-min
+                            # (se il flush 60 è stato appena eseguito,
+                            # buf_60_raw_* è già stato azzerato in
+                            # _on_minute_closed e questo è il primo sample
+                            # del nuovo bucket; altrimenti si accumula).
+                            buf_60_raw_co2.append(co2)
+                            buf_60_raw_t.append(t)
+                            buf_60_raw_rh.append(rh)
             else:
                 if now.replace(second=0, microsecond=0) != current_minute:
                     with open(avg_file, 'a') as f_avg:
