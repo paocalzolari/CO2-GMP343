@@ -2397,6 +2397,16 @@ class TabValve(QWidget):
         service_dir.mkdir(parents=True, exist_ok=True)
         self._tab_sched = self._TabSchedule(
             service_dir=service_dir, n_positions=10)
+        # Auto-carica l'ultimo schedule usato (priorità _last_schedule.csv,
+        # fallback schedule/schedule.csv, fallback default 1..N). Senza
+        # questo l'utente avrebbe dovuto ricaricare il CSV ad ogni avvio
+        # della GUI Monitor.
+        try:
+            default_csv = service_dir.parent / "schedule" / "schedule.csv"
+            self._tab_sched.load_initial(
+                default_csv if default_csv.exists() else None)
+        except Exception as exc:
+            self._log.warning("auto-load schedule failed: %s", exc)
         # Inietta "Sincronizza schedule" nella riga pulsanti tabella, dopo
         # `Salva CSV…` e dopo lo stretch → allineato a destra.
         if hasattr(self._tab_sched, "_table_btn_row"):
