@@ -49,6 +49,7 @@ fisico). Per il consumer è equivalente a `running`: importa solo il campo
 from __future__ import annotations
 import json
 import os
+import tempfile
 from datetime import datetime, timezone
 from typing import Optional, Tuple
 
@@ -58,6 +59,53 @@ SENTINEL_LABEL = "-"
 
 # Cache interna: evita re-parse se mtime invariato.
 _cache: dict = {"path": None, "mtime": 0.0, "pos": None, "label": ""}
+
+# ───────────────────────────── stato calibrazione persistente
+# Salvato su disco così sopravvive a restart del logger E al passaggio
+# di giorno UTC. La regola di flag è ricalcolata in real-time da
+# get_flag(); questo file serve solo come fallback quando la fonte
+# primaria (valve_status.json) non risponde — ad esempio nei primi
+# secondi dopo il restart del logger, prima che il valve-scheduler
+# pubblichi un nuovo status, oppure quando il valve-daemon è giù.
+_CALIB_STATE_FILE = os.path.expanduser(
+    "~/programs/CO2/shared/ipc_co2/calib_state.json")
+
+
+def _load_persisted_flag() -> str:
+    """Read the last persisted calibration flag from disk.
+
+    Returns 'measure' or 'calib'. Defaults to 'measure' on any error
+    (file missing, JSON corrupted, unexpected value).
+    """
+    try:
+        with open(_CALIB_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        flag = data.get("flag", "measure")
+        if flag in ("measure", "calib"):
+            return flag
+    except (OSError, ValueError, UnicodeDecodeError):
+        pass
+    return "measure"
+
+
+def _save_persisted_flag(flag: str) -> None:
+    """Atomically write the current calibration flag to disk.
+
+    No-op on filesystem errors (best-effort). Atomic via tmp+rename so
+    readers never see a half-written file.
+    """
+    try:
+        os.makedirs(os.path.dirname(_CALIB_STATE_FILE), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            dir=os.path.dirname(_CALIB_STATE_FILE), suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump({
+                "flag": flag,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }, f)
+        os.replace(tmp, _CALIB_STATE_FILE)
+    except OSError:
+        pass
 
 
 def _is_stale(ts_str: str, stale_after_s: float) -> bool:
@@ -157,9 +205,16 @@ def format_for_raw(path: str,
 
 
 # Ultimo flag valido restituito da get_flag(): usato come fallback quando
-# il valve-scheduler non risponde. Inizializzato a "measure" (assunzione
-# di default all'avvio del logger, prima del primo dato valvola valido).
-_last_valid_flag: str = "measure"
+# il valve-scheduler non risponde. Inizializzato dallo STATE FILE su
+# disco così l'identità calibrazione/misura sopravvive a:
+#   - restart del logger
+#   - rotazione giornaliera del file (passaggio del giorno UTC)
+# Se il file non esiste / è corrotto, default "measure".
+_last_valid_flag: str = _load_persisted_flag()
+
+# Garantisce che il file di stato esista sempre dopo l'import del modulo
+# (anche al primo avvio, prima della prima transizione). Idempotente.
+_save_persisted_flag(_last_valid_flag)
 
 
 def get_flag(path: str,
@@ -205,7 +260,12 @@ def get_flag(path: str,
                 flag = "calib"
                 break
 
-    _last_valid_flag = flag
+    # Persisti su disco SOLO sulle transizioni measure↔calib per evitare
+    # writes inutili (filesystem thrashing). Il valore in memoria è
+    # sempre aggiornato a ogni chiamata.
+    if flag != _last_valid_flag:
+        _last_valid_flag = flag
+        _save_persisted_flag(flag)
     return flag
 
 

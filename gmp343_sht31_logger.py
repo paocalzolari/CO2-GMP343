@@ -178,18 +178,27 @@ def load_config():
     config.read([NAME_INI, SERIAL_INI, SITE_INI])
     return config
 
-def get_filenames(config):
-    """Genera i nomi file giornalieri.
+def get_filenames(config, day=None):
+    """Genera i nomi file giornalieri per la data `day` (UTC).
 
-    Restituisce (raw, min, 10min, 30min, 60min) per il giorno corrente.
+    `day=None` → oggi (UTC). Accetta anche un oggetto datetime (.date()
+    viene preso) o una date.
+
+    Restituisce (raw, min, 10min, 30min, 60min) per quella data.
     Underscore nei nomi (formato v3, in uso dal 2026-04-15).
     """
-    today     = datetime.utcnow().strftime("%Y%m%d")
+    if day is None:
+        d = datetime.utcnow().date()
+    elif isinstance(day, datetime):
+        d = day.date()
+    else:
+        d = day
+    yyyymmdd  = d.strftime("%Y%m%d")
     basename  = config.get("output", "basename",  fallback="carbocap343")
     extension = config.get("output", "extension", fallback="raw")
     site_name = config.get("location", "name",    fallback="unknown")
     data_dir  = get_data_dir(config)
-    base = os.path.join(data_dir, f"{basename}_{site_name}_{today}_p00")
+    base = os.path.join(data_dir, f"{basename}_{site_name}_{yyyymmdd}_p00")
     return (
         f"{base}.{extension}",            # campioni grezzi (~1 Hz)
         f"{base}_min.{extension}",        # medie 1 min
@@ -547,34 +556,52 @@ def main():
     print(f"Aggregates: 10/{file_10}  30/{file_30}  60/{file_60}")
     print(f"Serial: {device} @ {baudrate} bps; I2C bus {SHT31_BUS} addr 0x{SHT31_ADDR:02x}")
 
+    def _files_for_day(day):
+        """Restituisce le 5 path giornaliere per `day` e ne crea gli header
+        se mancanti. Usato sia per la rotazione del giorno corrente sia
+        per scrivere flush "in ritardo" sul file del giorno precedente
+        (es. slot 23:00 chiuso a 00:00 del giorno dopo)."""
+        files = get_filenames(config, day)
+        write_headers_if_needed(*files, config=config,
+                                valve_enabled=valve_enabled)
+        return files
+
     def _on_minute_closed(min_record):
         """Hook called right after a 1-min record is written.
 
         Updates the 10/30/60-min slot buffers and flushes any buffer whose
         slot the just-closed minute has crossed. The 60-min flush also
         computes mean/std/median straight from the raw sample buffer.
+
+        IMPORTANT: each flush writes to the file matching the SLOT'S DATE,
+        not the current day's, so a slot that closes after midnight UTC
+        (e.g. slot 23:00 → flushed at 00:00 the next day) ends up in the
+        correct daily file.
         """
         nonlocal buf_10, slot_10, buf_30, slot_30, buf_60, slot_60
         nonlocal buf_60_raw_co2, buf_60_raw_t, buf_60_raw_rh, buf_60_raw_flag
         # 10-min
         this_slot10 = _slot_start(current_minute, 10)
         if this_slot10 != slot_10:
-            _flush_slot(file_10, slot_10, buf_10, valve_enabled)
+            slot_files = _files_for_day(slot_10)
+            _flush_slot(slot_files[2], slot_10, buf_10, valve_enabled)
             buf_10 = []
             slot_10 = this_slot10
         buf_10.append(min_record)
         # 30-min
         this_slot30 = _slot_start(current_minute, 30)
         if this_slot30 != slot_30:
-            _flush_slot(file_30, slot_30, buf_30, valve_enabled)
+            slot_files = _files_for_day(slot_30)
+            _flush_slot(slot_files[3], slot_30, buf_30, valve_enabled)
             buf_30 = []
             slot_30 = this_slot30
         buf_30.append(min_record)
         # 60-min: usa i RAW sample dell'ora per mean/std/median
         this_slot60 = _slot_start(current_minute, 60)
         if this_slot60 != slot_60:
+            slot_files = _files_for_day(slot_60)
             _flush_60min_with_median(
-                file_60, slot_60, buf_60,
+                slot_files[4], slot_60, buf_60,
                 buf_60_raw_co2, buf_60_raw_t, buf_60_raw_rh,
                 buf_60_raw_flag, valve_enabled)
             buf_60 = []
@@ -640,7 +667,12 @@ def main():
                     else:
                         # Cambio minuto: chiudi il minuto corrente e scrivi
                         # il record _min.raw, poi gli aggregati 10/30/60.
-                        with open(avg_file, 'a') as f_avg:
+                        # IMPORTANTE: scrivi sul file del giorno del MINUTO
+                        # CHIUSO (current_minute), non del giorno corrente:
+                        # il record di 23:59 chiuso a 00:00 del giorno dopo
+                        # deve restare nel _min.raw del giorno vecchio.
+                        files_for_min = _files_for_day(current_minute)
+                        with open(files_for_min[1], 'a') as f_avg:
                             ts_avg = current_minute.strftime("%Y-%m-%d %H:%M:%S")
                             if co2_values:
                                 co2_avg = sum(co2_values) / len(co2_values)
@@ -693,7 +725,8 @@ def main():
                             buf_60_raw_flag.append(flag)
             else:
                 if now.replace(second=0, microsecond=0) != current_minute:
-                    with open(avg_file, 'a') as f_avg:
+                    files_for_min = _files_for_day(current_minute)
+                    with open(files_for_min[1], 'a') as f_avg:
                         ts_avg = current_minute.strftime("%Y-%m-%d %H:%M:%S")
                         flag = _auto_flag(calib_auto, valve_enabled,
                                           valve_status_file, valve_stale_s,
