@@ -270,24 +270,42 @@ def _flush_slot(path, slot_ts, buf, valve_enabled):
     """Write one aggregated record summarising the minute records in `buf`.
 
     `buf` is a list of dicts (output of `_make_minute_record`). Empty `buf`
-    is a no-op. Computes pooled CO2/T/RH stats, sums n, sticky-calib flag,
-    most-frequent valve_pos/label.
+    is a no-op.
+
+    GAW-style filtering: stats are computed ONLY from minutes with
+    flag != "calib" (calibration data must not pollute atmospheric
+    means). The slot keeps a "sticky-calib" flag if any underlying
+    minute was calib, so downstream consumers can identify slots that
+    overlap with calibration events.
+
+    If the whole slot is calib, writes a row with MISSING values + n=0
+    + flag=calib + valve metadata (mode over all minutes).
     """
     if not buf:
         return
-    co2_v  = [r["co2"]      for r in buf]
-    co2_s  = [r["co2_std"]  for r in buf]
-    co2_n  = [r["n"]        for r in buf]
-    M_c, S_c, N = _pooled_mean_std(co2_v, co2_s, co2_n)
-    M_t, S_t, _ = _pooled_mean_std(
-        [r["t"]  for r in buf], [r["t_std"]  for r in buf], co2_n)
-    M_r, S_r, _ = _pooled_mean_std(
-        [r["rh"] for r in buf], [r["rh_std"] for r in buf], co2_n)
+    measure_buf = [r for r in buf if r["flag"] != "calib"]
+    if measure_buf:
+        co2_n = [r["n"] for r in measure_buf]
+        M_c, S_c, N = _pooled_mean_std(
+            [r["co2"]     for r in measure_buf],
+            [r["co2_std"] for r in measure_buf],
+            co2_n)
+        M_t, S_t, _ = _pooled_mean_std(
+            [r["t"]     for r in measure_buf],
+            [r["t_std"] for r in measure_buf], co2_n)
+        M_r, S_r, _ = _pooled_mean_std(
+            [r["rh"]     for r in measure_buf],
+            [r["rh_std"] for r in measure_buf], co2_n)
+    else:
+        M_c = S_c = M_t = S_t = M_r = S_r = MISSING
+        N = 0
     flag = "calib" if any(r["flag"] == "calib" for r in buf) else "measure"
     if valve_enabled:
-        # mode (most-frequent); ties broken by most recent
-        vpos = Counter(r["valve_pos"]   for r in buf).most_common(1)[0][0]
-        vlab = Counter(r["valve_label"] for r in buf).most_common(1)[0][0]
+        # mode over MEASURE minutes preferred; if all calib, fall back
+        # to all minutes so the row still carries a valve-pos hint.
+        ref_buf = measure_buf if measure_buf else buf
+        vpos = Counter(r["valve_pos"]   for r in ref_buf).most_common(1)[0][0]
+        vlab = Counter(r["valve_label"] for r in ref_buf).most_common(1)[0][0]
         valve_suf = f" {vpos} {vlab}"
     else:
         valve_suf = ""
@@ -302,17 +320,33 @@ def _flush_slot(path, slot_ts, buf, valve_enabled):
 
 
 def _flush_60min_with_median(path, slot_ts, buf_minutes,
-                             raw_co2, raw_t, raw_rh, valve_enabled):
+                             raw_co2, raw_t, raw_rh, raw_flag,
+                             valve_enabled):
     """Write a 60-min row computing mean/std/median directly from raw samples.
 
-    `raw_co2/_t/_rh` are flat lists of all per-sample readings collected
-    during the past hour (MISSING values are filtered per quantity at
-    aggregation time). `buf_minutes` is reused only for flag/valve-pos
-    metadata (sticky-calib + most-frequent), since those are already
-    decimated per-minute and that level of granularity is enough.
+    `raw_co2/_t/_rh` are flat lists of per-sample readings collected
+    during the past hour, `raw_flag` is the parallel list of per-sample
+    flags ('measure'/'calib').
+
+    GAW-style filtering: stats are computed ONLY from samples with
+    flag != "calib" (calibration data must not contaminate atmospheric
+    statistics). The hour keeps a "sticky-calib" flag if any underlying
+    sample/minute was calib, so consumers can mark contaminated hours.
+
+    `buf_minutes` is used only for flag/valve-pos metadata (decimated
+    to per-minute granularity is enough for that).
     """
     if not raw_co2 and not buf_minutes:
         return
+
+    # Filter raw samples to MEASURE only
+    if raw_flag and len(raw_flag) == len(raw_co2):
+        m_co2 = [c for c, fl in zip(raw_co2, raw_flag) if fl != "calib"]
+        m_t   = [t for t, fl in zip(raw_t,   raw_flag) if fl != "calib"]
+        m_rh  = [r for r, fl in zip(raw_rh,  raw_flag) if fl != "calib"]
+    else:
+        # No flag list (legacy path): assume all measure
+        m_co2, m_t, m_rh = raw_co2, raw_t, raw_rh
 
     def _stats(values):
         clean = [v for v in values if v != MISSING]
@@ -323,14 +357,19 @@ def _flush_60min_with_median(path, slot_ts, buf_minutes,
         med = statistics.median(clean)
         return m, s, med
 
-    M_c, S_c, Med_c = _stats(raw_co2)
-    M_t, S_t, Med_t = _stats(raw_t)
-    M_r, S_r, Med_r = _stats(raw_rh)
-    N = sum(1 for v in raw_co2 if v != MISSING)
-    flag = "calib" if any(r["flag"] == "calib" for r in buf_minutes) else "measure"
+    M_c, S_c, Med_c = _stats(m_co2)
+    M_t, S_t, Med_t = _stats(m_t)
+    M_r, S_r, Med_r = _stats(m_rh)
+    N = sum(1 for v in m_co2 if v != MISSING)
+    # Sticky-calib: any minute or any sample = calib
+    has_calib_minute = any(r["flag"] == "calib" for r in buf_minutes)
+    has_calib_sample = bool(raw_flag) and any(fl == "calib" for fl in raw_flag)
+    flag = "calib" if (has_calib_minute or has_calib_sample) else "measure"
     if valve_enabled and buf_minutes:
-        vpos = Counter(r["valve_pos"]   for r in buf_minutes).most_common(1)[0][0]
-        vlab = Counter(r["valve_label"] for r in buf_minutes).most_common(1)[0][0]
+        # Mode over MEASURE minutes; fall back to all if no measure
+        ref_buf = [r for r in buf_minutes if r["flag"] != "calib"] or buf_minutes
+        vpos = Counter(r["valve_pos"]   for r in ref_buf).most_common(1)[0][0]
+        vlab = Counter(r["valve_label"] for r in ref_buf).most_common(1)[0][0]
         valve_suf = f" {vpos} {vlab}"
     else:
         valve_suf = ""
@@ -497,9 +536,12 @@ def main():
     # campione (post-dedup) dell'ora corrente; al boundary 60-min
     # calcoliamo mean/std/median direttamente dai sample (non dai pooled
     # 1-min, così la mediana è quella vera dei dati grezzi).
-    buf_60_raw_co2 = []
-    buf_60_raw_t   = []
-    buf_60_raw_rh  = []
+    # `buf_60_raw_flag` traccia il flag per-sample così possiamo escludere
+    # i sample di calibrazione dalle statistiche atmosferiche.
+    buf_60_raw_co2  = []
+    buf_60_raw_t    = []
+    buf_60_raw_rh   = []
+    buf_60_raw_flag = []
 
     print(f"Logging started. Raw: {raw_file}, Min: {avg_file}")
     print(f"Aggregates: 10/{file_10}  30/{file_30}  60/{file_60}")
@@ -513,7 +555,7 @@ def main():
         computes mean/std/median straight from the raw sample buffer.
         """
         nonlocal buf_10, slot_10, buf_30, slot_30, buf_60, slot_60
-        nonlocal buf_60_raw_co2, buf_60_raw_t, buf_60_raw_rh
+        nonlocal buf_60_raw_co2, buf_60_raw_t, buf_60_raw_rh, buf_60_raw_flag
         # 10-min
         this_slot10 = _slot_start(current_minute, 10)
         if this_slot10 != slot_10:
@@ -534,11 +576,12 @@ def main():
             _flush_60min_with_median(
                 file_60, slot_60, buf_60,
                 buf_60_raw_co2, buf_60_raw_t, buf_60_raw_rh,
-                valve_enabled)
+                buf_60_raw_flag, valve_enabled)
             buf_60 = []
-            buf_60_raw_co2 = []
-            buf_60_raw_t   = []
-            buf_60_raw_rh  = []
+            buf_60_raw_co2  = []
+            buf_60_raw_t    = []
+            buf_60_raw_rh   = []
+            buf_60_raw_flag = []
             slot_60 = this_slot60
         buf_60.append(min_record)
 
@@ -587,10 +630,13 @@ def main():
                             t_values.append(t)
                             rh_values.append(rh)
                             # Raw buffer per la mediana 60-min (un sample
-                            # per chiamata, post-dedup)
+                            # per chiamata, post-dedup). `flag` per-sample
+                            # serve a escludere i sample di calibrazione
+                            # dalle statistiche atmosferiche dell'ora.
                             buf_60_raw_co2.append(co2)
                             buf_60_raw_t.append(t)
                             buf_60_raw_rh.append(rh)
+                            buf_60_raw_flag.append(flag)
                     else:
                         # Cambio minuto: chiudi il minuto corrente e scrivi
                         # il record _min.raw, poi gli aggregati 10/30/60.
@@ -644,6 +690,7 @@ def main():
                             buf_60_raw_co2.append(co2)
                             buf_60_raw_t.append(t)
                             buf_60_raw_rh.append(rh)
+                            buf_60_raw_flag.append(flag)
             else:
                 if now.replace(second=0, microsecond=0) != current_minute:
                     with open(avg_file, 'a') as f_avg:
