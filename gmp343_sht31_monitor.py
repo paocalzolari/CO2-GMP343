@@ -11,7 +11,7 @@ Formato file v3 (dal 2026-04-15, con T/RH):
   - Parser retrocompatibile col formato v2 (5 colonne, senza T/RH).
 """
 
-import sys, os, json, signal, subprocess, logging
+import sys, os, json, signal, subprocess, logging, time
 from datetime import datetime, timedelta, timezone, date as date_type
 import configparser
 from pathlib import Path
@@ -2967,13 +2967,53 @@ class GMP343Monitor(QMainWindow):
     # ── tick timer ────────────────────────────────────────────────────────────
 
     def _tick(self):
-        self._update_monitor()
-        self.graph.refresh()
+        # Wrap tutto in try/except: una qualsiasi eccezione qui dentro
+        # NON deve uccidere il QTimer (sintomo classico: GUI freeze con
+        # grafico fermo a uno stato precedente). Loggiamo su stderr che
+        # finisce in /tmp/co2monitor.log per diagnosi.
+        t0 = time.monotonic()
+        try:
+            self._update_monitor()
+        except Exception as exc:
+            self._log_tick_error("update_monitor", exc)
+        try:
+            self.graph.refresh()
+        except Exception as exc:
+            self._log_tick_error("graph.refresh", exc)
+        # Reload count + GC periodico per liberare riferimenti matplotlib
+        # morti accumulati nelle finestre overlay (worst case: 17k reload
+        # al giorno con 4 overlay → vale la pena un gc.collect() ogni
+        # tanto per evitare crescita di RAM nel tempo).
+        self._tick_count = getattr(self, "_tick_count", 0) + 1
+        if self._tick_count % 100 == 0:
+            import gc
+            gc.collect()
+        # Diagnostica: se il tick è stato molto lento, segnalalo
+        dt = time.monotonic() - t0
+        if dt > 2.0:
+            print(f"WARN: _tick took {dt:.2f}s (#{self._tick_count})",
+                  file=sys.stderr, flush=True)
+
+    def _log_tick_error(self, where: str, exc: Exception) -> None:
+        """Log a tick exception to stderr (visible in /tmp/co2monitor.log)
+        without killing the timer."""
+        import traceback
+        print(f"ERROR in {where}: {type(exc).__name__}: {exc}",
+              file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
 
     def _tick_fast(self):
         """Tick rapido (1s): orologio UTC nel corner della menubar + LED
         MEASURE/CALIB letti direttamente da valve_status.json (latenza ~2s,
-        la posizione è già visibile nel tab VICI Valve alla stessa cadenza)."""
+        la posizione è già visibile nel tab VICI Valve alla stessa cadenza).
+        Wrapped in try/except so a single failure doesn't stop the QTimer
+        (symptom: clock freezes at the failure time)."""
+        try:
+            self._tick_fast_impl()
+        except Exception as exc:
+            self._log_tick_error("tick_fast", exc)
+
+    def _tick_fast_impl(self):
         # UTC clock — formato compatto (HH:MM:SS); data completa nel tooltip
         now = datetime.utcnow()
         self.lbl_now.setText(now.strftime("Now %H:%M:%S"))
