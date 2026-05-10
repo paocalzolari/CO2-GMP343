@@ -116,6 +116,15 @@ monitor_close() {
     fi
 }
 
+free_ram() {
+    # Best-effort RAM cleanup: SIGUSR1 to Monitor + drop_caches.
+    # Output captured for inspection in /tmp/co2-free-ram.log.
+    "$HOME/programs/CO2/bin/co2-free-ram.sh" \
+        > /tmp/co2-free-ram.log 2>&1 &
+    disown
+    notify "Free RAM started — see /tmp/co2-free-ram.log"
+}
+
 status_term() {
     # Open a terminal showing co2-status.sh (re-uses existing script)
     for term in lxterminal x-terminal-emulator xterm gnome-terminal konsole; do
@@ -140,6 +149,7 @@ dispatch() {
             monitor_open)    monitor_open    ;;
             monitor_close)   monitor_close   ;;
             status_term)     status_term     ;;
+            free_ram)        free_ram        ;;
         esac
     done
 }
@@ -171,6 +181,7 @@ while true; do
         FALSE ""        "Monitor"  "✖  Close GUI"    "monitor_close"   \
         FALSE ""        ""         ""                "$SEP"            \
         FALSE "—"       "Status"   "📜  Terminal status + journal -f"  "status_term" \
+        FALSE "—"       "System"   "🧹  Free RAM (gc + drop_caches)"   "free_ram" \
         2>/dev/null)
     RC=$?
 

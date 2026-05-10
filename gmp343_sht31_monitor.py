@@ -2650,6 +2650,15 @@ class GMP343Monitor(QMainWindow):
         self._ports_cache_age = 0    # tick counter
         self._build_ui()
 
+        # File-based trigger per il free-RAM on-demand. PyQt5 non
+        # propaga i Python signals quando app.exec_() è in corso, e
+        # SIGUSR1 di default fa terminate → quindi NIENTE signal.
+        # Lo script bin/co2-free-ram.sh crea questo file; _tick lo
+        # rileva, lo cancella ed esegue il cleanup.
+        # IMPORTANT: deve essere assegnato PRIMA di self._tick() perché
+        # _tick lo legge.
+        self._free_ram_trigger = "/tmp/co2-monitor-free-ram.trigger"
+        self._tick_count = 0
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.start(UPDATE_MS)
@@ -2658,6 +2667,25 @@ class GMP343Monitor(QMainWindow):
         self.timer_fast = QTimer(self)
         self.timer_fast.timeout.connect(self._tick_fast)
         self.timer_fast.start(1000)
+
+    def _free_ram_now(self):
+        """Best-effort RAM cleanup. Conservative on purpose: only gc.collect.
+
+        We deliberately DO NOT call plt.close("all") here — even though
+        we use Figure() and not pyplot, the FigureCanvasQTAgg backend
+        has cross-references with pyplot's manager and closing 'all'
+        can take down our canvas. Same for forcing a graph._reload(),
+        which would interleave with the running tick.
+        """
+        import gc, resource
+        rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        for _ in range(3):
+            gc.collect()
+        rss_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # ru_maxrss is in KiB on Linux
+        print(f"FREE-RAM: maxRSS {rss_before/1024:.1f} MB → "
+              f"{rss_after/1024:.1f} MB (gc.collect ×3)",
+              file=sys.stderr, flush=True)
 
     # ── configurazione ────────────────────────────────────────────────────────
 
@@ -2972,6 +3000,13 @@ class GMP343Monitor(QMainWindow):
         # grafico fermo a uno stato precedente). Loggiamo su stderr che
         # finisce in /tmp/co2monitor.log per diagnosi.
         t0 = time.monotonic()
+        # File-based free-RAM trigger (vedi bin/co2-free-ram.sh)
+        try:
+            if os.path.exists(self._free_ram_trigger):
+                os.unlink(self._free_ram_trigger)
+                self._free_ram_now()
+        except Exception as exc:
+            self._log_tick_error("free_ram_trigger", exc)
         try:
             self._update_monitor()
         except Exception as exc:
