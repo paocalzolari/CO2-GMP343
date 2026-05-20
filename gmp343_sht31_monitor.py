@@ -2979,21 +2979,22 @@ class GMP343Monitor(QMainWindow):
         def _make_value_row(prefix: str, value_size: int, color: str, unit: str):
             """Returns (row_layout, value_label) → 'PREFIX:  VALUE unit'.
 
-            Le label hanno sizePolicy Ignored sull'orizzontale + min width 0
-            perché altrimenti il loro sizeHint nativo (proporzionale al font
-            24pt) farebbe da pavimento minimo della finestra impedendo il
-            resize a dimensioni piccole con il mouse.
+            Le label hanno minimum width = 0 per non bloccare il resize
+            verticale della finestra a dimensioni piccole; NON usiamo
+            QSizePolicy.Ignored perché in combinazione con row.addStretch()
+            faceva collassare la label di valore a 0 px (testo aggiornato
+            ma invisibile — regressione 2026-05-20). Il pavimento del
+            resize è gestito da self.setMinimumSize(400, 300) + dalla
+            QScrollArea che wrappa la tab Monitor.
             """
             row = QHBoxLayout()
             lbl_p = QLabel(prefix)
             lbl_p.setStyleSheet(f"font-weight:bold;font-size:{cap_sz}px")
-            lbl_p.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             lbl_p.setMinimumWidth(0)
             row.addWidget(lbl_p)
             lbl = QLabel(f"--- {unit}")
             lbl.setFont(QFont("Arial", value_size, QFont.Bold))
             lbl.setStyleSheet(f"color:{color}")
-            lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             lbl.setMinimumWidth(0)
             row.addWidget(lbl)
             row.addStretch()
@@ -3006,7 +3007,6 @@ class GMP343Monitor(QMainWindow):
             head.setStyleSheet(
                 f"color:{title_color};font-weight:bold;font-size:{cap_sz+2}px;"
                 f"border-bottom:2px solid {title_color};padding-bottom:2px")
-            head.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             head.setMinimumWidth(0)
             col.addWidget(head)
             return col
