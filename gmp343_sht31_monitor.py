@@ -2079,6 +2079,23 @@ class MonitorConfigDialog(QDialog, _IniMixin):
         fw.addRow("Y position (px):",  self.sp_win_y)
         fw.addRow("Width (px):",       self.sp_win_width)
         fw.addRow("Height (px):",      self.sp_win_height)
+
+        # Suggerimento live: legge la geometria della finestra del Monitor
+        # nel momento in cui si apre il dialog. Comodo per copiare nei 4
+        # spinbox sopra le dimensioni attuali (ad es. dopo aver ridimensionato
+        # la finestra a piacere col mouse).
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "geometry"):
+            g = parent.geometry()
+            cur = QLabel(
+                f"<i>Current window:</i> <b>{g.width()} × {g.height()}</b> "
+                f"px  @  X=<b>{g.x()}</b>, Y=<b>{g.y()}</b>"
+            )
+            cur.setStyleSheet("color:#246;font-size:9pt;"
+                              "background:#eef4fa;padding:4px;border-radius:3px")
+            cur.setTextFormat(Qt.RichText)
+            fw.addRow(cur)
+
         hint = QLabel("Applied at next Monitor startup. "
                       "(Closing the app does NOT overwrite these values.)")
         hint.setStyleSheet("color:#888;font-size:8pt"); hint.setWordWrap(True)
