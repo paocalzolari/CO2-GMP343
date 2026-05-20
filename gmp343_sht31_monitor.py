@@ -2048,6 +2048,7 @@ class MonitorConfigDialog(QDialog, _IniMixin):
         ini = self._read_ini(MONITOR_INI)
         fnt = ini["fonts"] if "fonts" in ini else {}
         grp = ini["graph"] if "graph" in ini else {}
+        win = ini["window"] if "window" in ini else {}
 
         # Scroll area: la tab cresce con la sezione per-finestra (4 box)
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
@@ -2058,6 +2059,31 @@ class MonitorConfigDialog(QDialog, _IniMixin):
             "Changes require a Monitor restart to take effect.")
         info.setStyleSheet("color:#666;font-size:9pt"); info.setWordWrap(True)
         root.addWidget(info)
+
+        # — Default window geometry (letto da [window] di monitor.ini)  ——————
+        g_win = QGroupBox("Default window geometry")
+        fw = QFormLayout(g_win)
+
+        def _ispin(initial, lo, hi):
+            sp = QSpinBox(); sp.setRange(lo, hi)
+            try: sp.setValue(int(float(initial)))
+            except (TypeError, ValueError): sp.setValue(lo)
+            return sp
+
+        # x, y supportano valori negativi (multi-monitor con monitor a sinistra)
+        self.sp_win_x      = _ispin(win.get("x",      100),  -4000, 10000)
+        self.sp_win_y      = _ispin(win.get("y",       50),  -4000, 10000)
+        self.sp_win_width  = _ispin(win.get("width",  1200),   400,  6000)
+        self.sp_win_height = _ispin(win.get("height",  800),   300,  4000)
+        fw.addRow("X position (px):",  self.sp_win_x)
+        fw.addRow("Y position (px):",  self.sp_win_y)
+        fw.addRow("Width (px):",       self.sp_win_width)
+        fw.addRow("Height (px):",      self.sp_win_height)
+        hint = QLabel("Applied at next Monitor startup. "
+                      "(Closing the app does NOT overwrite these values.)")
+        hint.setStyleSheet("color:#888;font-size:8pt"); hint.setWordWrap(True)
+        fw.addRow(hint)
+        root.addWidget(g_win)
 
         # — Fonts —
         g_font = QGroupBox("Font sizes (px)")
@@ -2266,8 +2292,14 @@ class MonitorConfigDialog(QDialog, _IniMixin):
                 ini[key]["addr"]    = ed_addr.text().strip() or "0x44"
             self._write_ini(os.path.join(self.config_dir, "sensors.ini"), ini)
 
-            # monitor.ini — Aspetto (font + grafico)
+            # monitor.ini — Aspetto (window geometry + font + grafico)
             mini = self._read_ini(MONITOR_INI)
+            if "window" not in mini:
+                mini["window"] = {}
+            mini["window"]["x"]      = str(self.sp_win_x.value())
+            mini["window"]["y"]      = str(self.sp_win_y.value())
+            mini["window"]["width"]  = str(self.sp_win_width.value())
+            mini["window"]["height"] = str(self.sp_win_height.value())
             if "fonts" not in mini:
                 mini["fonts"] = {}
             mini["fonts"]["co2_value_size"] = str(self.sp_co2_value_size.value())
