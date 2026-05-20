@@ -11,7 +11,7 @@ Formato file v3 (dal 2026-04-15, con T/RH):
   - Parser retrocompatibile col formato v2 (5 colonne, senza T/RH).
 """
 
-import sys, os, json, signal, subprocess, logging, time
+import sys, os, json, signal, subprocess, logging, time, tracemalloc
 from datetime import datetime, timedelta, timezone, date as date_type
 import configparser
 from pathlib import Path
@@ -110,6 +110,16 @@ else:
 SENSOR_IMG = os.path.join(_INSTALL_DIR, "gmp343_sensor.png")
 
 UPDATE_MS       = 5000   # refresh timer (ms)
+
+# ── Diagnostica memoria ──────────────────────────────────────────────────────
+# RSS sempre loggato (costo trascurabile) → /tmp/co2-monitor-rss.log
+# tracemalloc opt-in via env: MONITOR_TRACEMALLOC=1 python3 gmp343_sht31_monitor.py
+RSS_LOG_INTERVAL_MS     = 300_000     # 5 min
+TRACEMALLOC_INTERVAL_MS = 1_800_000   # 30 min
+RSS_LOG_FILE            = "/tmp/co2-monitor-rss.log"
+TRACEMALLOC_LOG_FILE    = "/tmp/co2-monitor-tracemalloc.log"
+TRACEMALLOC_ENABLED     = os.environ.get("MONITOR_TRACEMALLOC", "").lower() in (
+    "1", "true", "yes", "on")
 
 # Default per-window styling — shared between GraphWidget (rendering) and
 # MonitorConfigDialog Appearance tab (form). Keep in sync with the
@@ -2667,6 +2677,76 @@ class GMP343Monitor(QMainWindow):
         self.timer_fast = QTimer(self)
         self.timer_fast.timeout.connect(self._tick_fast)
         self.timer_fast.start(1000)
+
+        # Diagnostica RSS (sempre) + tracemalloc (opt-in via env)
+        self._setup_diagnostics()
+
+    # ── diagnostica memoria ──────────────────────────────────────────────────
+
+    def _setup_diagnostics(self):
+        """Logging periodico RSS + tracemalloc snapshot (opt-in).
+
+        RSS: una riga ogni 5 min su RSS_LOG_FILE. Costo: open/write ~µs.
+        tracemalloc: opt-in via env MONITOR_TRACEMALLOC=1. Quando attivo,
+        ogni 30 min logga i top-10 allocator differenziali rispetto al
+        baseline iniziale su TRACEMALLOC_LOG_FILE. Costo: overhead ~5-10%
+        sull'app — accettabile per diagnosi mirate (1-2 giorni).
+        """
+        self._diag_t0 = datetime.now()
+        self._rss_timer = QTimer(self)
+        self._rss_timer.timeout.connect(self._log_rss)
+        self._rss_timer.start(RSS_LOG_INTERVAL_MS)
+        self._log_rss()   # baseline a t=0
+
+        if TRACEMALLOC_ENABLED:
+            tracemalloc.start(25)
+            self._tm_baseline = tracemalloc.take_snapshot()
+            self._tm_timer = QTimer(self)
+            self._tm_timer.timeout.connect(self._log_tracemalloc)
+            self._tm_timer.start(TRACEMALLOC_INTERVAL_MS)
+            print(f"MONITOR: tracemalloc enabled → {TRACEMALLOC_LOG_FILE}",
+                  file=sys.stderr, flush=True)
+
+    def _read_self_rss_mb(self) -> float:
+        """Legge VmRSS da /proc/self/status (MB). -1 se errore."""
+        try:
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        return int(line.split()[1]) / 1024.0
+        except Exception:
+            pass
+        return -1.0
+
+    def _log_rss(self):
+        rss_mb = self._read_self_rss_mb()
+        try:
+            with open(RSS_LOG_FILE, "a") as f:
+                f.write(f"{datetime.now().isoformat(timespec='seconds')}  "
+                        f"pid={os.getpid()}  rss={rss_mb:7.1f} MB  "
+                        f"tick={self._tick_count}\n")
+        except OSError:
+            pass
+
+    def _log_tracemalloc(self):
+        if not TRACEMALLOC_ENABLED:
+            return
+        try:
+            snap = tracemalloc.take_snapshot()
+            diff = snap.compare_to(self._tm_baseline, "lineno")
+            rss_mb = self._read_self_rss_mb()
+            with open(TRACEMALLOC_LOG_FILE, "a") as f:
+                f.write(f"\n===== {datetime.now().isoformat(timespec='seconds')}"
+                        f"   rss={rss_mb:.1f} MB"
+                        f"   uptime={(datetime.now()-self._diag_t0)}"
+                        " =====\n")
+                for stat in diff[:10]:
+                    where = stat.traceback.format()[-1].strip()
+                    f.write(f"  +{stat.size_diff/1024:9.1f} kB  "
+                            f"+{stat.count_diff:6d} alloc   {where}\n")
+        except Exception as e:
+            print(f"tracemalloc log error: {e}",
+                  file=sys.stderr, flush=True)
 
     def _free_ram_now(self):
         """Best-effort RAM cleanup. Conservative on purpose: only gc.collect.

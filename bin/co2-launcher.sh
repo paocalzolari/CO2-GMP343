@@ -116,6 +116,38 @@ monitor_close() {
     fi
 }
 
+monitor_restart() {
+    # Kill + rilancio puliti via lo script wrapper (eredita ENV X corretto).
+    "$HOME/programs/CO2/bin/co2-monitor-restart.sh" --force \
+        > /tmp/co2-monitor-restart.log 2>&1
+    notify "Monitor restarted — see /tmp/co2-monitor-restart.log"
+}
+
+monitor_debug_open() {
+    # Rilancio della GUI con tracemalloc attivo per indagine RAM.
+    if pgrep -f "python3.*gmp343_sht31_monitor.py" >/dev/null; then
+        notify "Monitor già attivo — usa 'Close GUI' poi 'Debug open'"
+        return
+    fi
+    cd "$HOME/programs/CO2" || return
+    MONITOR_TRACEMALLOC=1 setsid python3 -u gmp343_sht31_monitor.py \
+        < /dev/null > /tmp/co2monitor.log 2>&1 &
+    disown
+    notify "Monitor (debug) started — tracemalloc → /tmp/co2-monitor-tracemalloc.log"
+}
+
+rss_log_view() {
+    # Apre un terminale con tail -f sul log RSS della GUI.
+    for term in lxterminal x-terminal-emulator xterm gnome-terminal konsole; do
+        if command -v "$term" >/dev/null 2>&1; then
+            "$term" -e bash -c \
+                "echo '── /tmp/co2-monitor-rss.log (Ctrl-C per chiudere) ──'; tail -F /tmp/co2-monitor-rss.log" &
+            return
+        fi
+    done
+    notify "No terminal emulator found"
+}
+
 free_ram() {
     # Best-effort RAM cleanup: SIGUSR1 to Monitor + drop_caches.
     # Output captured for inspection in /tmp/co2-free-ram.log.
@@ -146,10 +178,13 @@ dispatch() {
             backend_start)   backend_start   ;;
             backend_stop)    backend_stop    ;;
             backend_restart) backend_restart ;;
-            monitor_open)    monitor_open    ;;
-            monitor_close)   monitor_close   ;;
-            status_term)     status_term     ;;
-            free_ram)        free_ram        ;;
+            monitor_open)       monitor_open       ;;
+            monitor_close)      monitor_close      ;;
+            monitor_restart)    monitor_restart    ;;
+            monitor_debug_open) monitor_debug_open ;;
+            rss_log_view)       rss_log_view       ;;
+            status_term)        status_term        ;;
+            free_ram)           free_ram           ;;
         esac
     done
 }
@@ -177,11 +212,14 @@ while true; do
         FALSE ""        "Backend"  "■  Stop"         "backend_stop"    \
         FALSE ""        "Backend"  "↻  Restart"      "backend_restart" \
         FALSE ""        ""         ""                "$SEP"            \
-        FALSE "$S_MON"  "Monitor"  "🖥  Open GUI"     "monitor_open"    \
-        FALSE ""        "Monitor"  "✖  Close GUI"    "monitor_close"   \
-        FALSE ""        ""         ""                "$SEP"            \
-        FALSE "—"       "Status"   "📜  Terminal status + journal -f"  "status_term" \
-        FALSE "—"       "System"   "🧹  Free RAM (gc + drop_caches)"   "free_ram" \
+        FALSE "$S_MON"  "Monitor"  "🖥  Open GUI"                       "monitor_open"        \
+        FALSE ""        "Monitor"  "✖  Close GUI"                      "monitor_close"       \
+        FALSE ""        "Monitor"  "↻  Restart GUI (libera RAM)"       "monitor_restart"     \
+        FALSE ""        "Monitor"  "🐛  Open GUI (debug, tracemalloc)" "monitor_debug_open"  \
+        FALSE ""        ""         ""                                  "$SEP"                \
+        FALSE "—"       "Status"   "📜  Terminal status + journal -f"  "status_term"         \
+        FALSE "—"       "Status"   "📊  View RSS log (tail -f)"        "rss_log_view"        \
+        FALSE "—"       "System"   "🧹  Free RAM (gc + drop_caches)"   "free_ram"            \
         2>/dev/null)
     RC=$?
 
