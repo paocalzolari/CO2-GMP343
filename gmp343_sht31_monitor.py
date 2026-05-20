@@ -2855,6 +2855,10 @@ class GMP343Monitor(QMainWindow):
         x  = self.guicfg.getint("window", "x",      fallback=100)
         y  = self.guicfg.getint("window", "y",      fallback=50)
         self.setWindowTitle("GMP343 Monitor  v2")
+        # Pavimento basso per il resize manuale: lascia ridurre la finestra
+        # fino a 400×300 anche con font value grandi (24 pt). I widget
+        # interni hanno sizePolicy Ignored sull'orizzontale per non bloccare.
+        self.setMinimumSize(400, 300)
         self.setGeometry(x, y, w, h)
 
         # Menubar — Settings
@@ -2942,14 +2946,24 @@ class GMP343Monitor(QMainWindow):
         cap_sz = self.guicfg.getint("fonts","caption_size",fallback=14)
 
         def _make_value_row(prefix: str, value_size: int, color: str, unit: str):
-            """Returns (row_layout, value_label) → 'PREFIX:  VALUE unit'."""
+            """Returns (row_layout, value_label) → 'PREFIX:  VALUE unit'.
+
+            Le label hanno sizePolicy Ignored sull'orizzontale + min width 0
+            perché altrimenti il loro sizeHint nativo (proporzionale al font
+            24pt) farebbe da pavimento minimo della finestra impedendo il
+            resize a dimensioni piccole con il mouse.
+            """
             row = QHBoxLayout()
             lbl_p = QLabel(prefix)
             lbl_p.setStyleSheet(f"font-weight:bold;font-size:{cap_sz}px")
+            lbl_p.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            lbl_p.setMinimumWidth(0)
             row.addWidget(lbl_p)
             lbl = QLabel(f"--- {unit}")
             lbl.setFont(QFont("Arial", value_size, QFont.Bold))
             lbl.setStyleSheet(f"color:{color}")
+            lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            lbl.setMinimumWidth(0)
             row.addWidget(lbl)
             row.addStretch()
             return row, lbl
@@ -2961,6 +2975,8 @@ class GMP343Monitor(QMainWindow):
             head.setStyleSheet(
                 f"color:{title_color};font-weight:bold;font-size:{cap_sz+2}px;"
                 f"border-bottom:2px solid {title_color};padding-bottom:2px")
+            head.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            head.setMinimumWidth(0)
             col.addWidget(head)
             return col
 
