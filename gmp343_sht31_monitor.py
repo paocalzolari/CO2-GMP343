@@ -2902,11 +2902,25 @@ class GMP343Monitor(QMainWindow):
 
         tabs = QTabWidget()
         self.setCentralWidget(tabs)
-        tabs.addTab(self._build_monitor_tab(), "📊  Monitor")
-        tabs.addTab(self._build_graph_tab(),   "📈  Chart")
+
+        def _scrollable(widget):
+            """Avvolge widget in un QScrollArea per permettere a tutto il
+            contenuto di restare leggibile anche a finestra piccola."""
+            sa = QScrollArea()
+            sa.setWidgetResizable(True)
+            sa.setFrameShape(QFrame.NoFrame)
+            sa.setWidget(widget)
+            return sa
+
+        # Monitor: scroll perché Last Sample/Stats stanno sotto il blocco CO₂.
+        tabs.addTab(_scrollable(self._build_monitor_tab()), "📊  Monitor")
+        # Chart: NO scroll — la canvas matplotlib è già responsive.
+        tabs.addTab(self._build_graph_tab(), "📈  Chart")
         if _HAS_VALVE_SCHEDULER:
             self.tab_valve = TabValve()
-            tabs.addTab(self.tab_valve, "🔧  VICI Valve")
+            # VICI Valve: scroll per leggere Step sequence anche su finestra
+            # piccola (la tabella ha sizeHint largo).
+            tabs.addTab(_scrollable(self.tab_valve), "🔧  VICI Valve")
         else:
             self.tab_valve = None
         tabs.setStyleSheet("QTabBar::tab { padding: 6px 18px; font-size: 11pt; }")
