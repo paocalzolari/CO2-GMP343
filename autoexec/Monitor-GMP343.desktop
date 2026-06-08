@@ -2,8 +2,8 @@
 Version=1.0
 Type=Application
 Name=Monitor CO2 - GMP343 Vaisala
-Comment=GUI visualizzazione CO2 (gui_integrated_v13.py)
-Exec=bash -c "cd /home/misura/programs/CO2 && python3 gui_integrated_v13.py > /tmp/co2monitor.log 2>&1"
+Comment=GUI visualizzazione CO2 (gmp343_sht31_monitor.py)
+Exec=bash -c "cd /home/misura/programs/CO2 && python3 gmp343_sht31_monitor.py > /tmp/co2monitor.log 2>&1"
 Icon=/home/misura/programs/CO2/gmp343_sensor.png
 Terminal=false
 StartupNotify=false

@@ -42,15 +42,15 @@ recenti come [o3-monitor-headless](../o3-monitor-headless/CLAUDE.md) o
 Lo strato di acquisizione e quello di visualizzazione sono però **due
 processi distinti**:
 
-1. **Backend logger** (`gmp343_logger-9.py`) — script Python da riga di
+1. **Backend logger** (`gmp343_sht31_logger.py`) — script Python da riga di
    comando, no GUI. Apre `/dev/gmp343`, legge in continuo, calcola medie
    1 minuto, scrive due file giornalieri. Gira come **systemd service**
    `co2-logger.service` con watchdog `Restart=always`.
-2. **Monitor GUI** (`gui_integrated_v13.py`) — PyQt5 + matplotlib, due
+2. **Monitor GUI** (`gmp343_sht31_monitor.py`) — PyQt5 + matplotlib, due
    tab (monitor real-time + grafico giornaliero). **Non scrive sul
    sensore**, legge solo i file `_min.raw` prodotti dal backend. Avvio
    automatico al login X via `~/.config/autostart/Monitor-GMP343.desktop`.
-3. **Logger di calibrazione** (`calib-GMP343-logger.py`) — variante del
+3. **Logger di calibrazione** (`gmp343_sht31_calib.py`) — variante del
    backend con GUI minimale per togglare il flag `measure ↔ calib` durante
    le sessioni di calibrazione. Lanciato manualmente. **Non può girare
    insieme al backend systemd** (entrambi tengono `/dev/gmp343`).
@@ -63,9 +63,9 @@ processi distinti**:
 ## File principali
 
 ```text
-gmp343_logger-9.py              Backend logger headless (CORRENTE)
-calib-GMP343-logger.py          Logger con GUI per sessioni calibrazione (CORRENTE)
-gui_integrated_v13.py           Monitor real-time + grafico (CORRENTE)
+gmp343_sht31_logger.py              Backend logger headless (CORRENTE)
+gmp343_sht31_calib.py          Logger con GUI per sessioni calibrazione (CORRENTE)
+gmp343_sht31_monitor.py           Monitor real-time + grafico (CORRENTE)
 diagnosi.py                     Script diagnostico (verifica config, file dati, parsing)
 gmp343_sensor.png               Immagine sensore (icona + decorazione GUI)
 build.sh                        Build PyInstaller → eseguibili in dist/
@@ -99,9 +99,9 @@ Per evitare confusione, ecco la tabella aggiornata (vedere anche
 
 | Ruolo | File CORRENTE | Versioni obsolete (archivio) |
 |---|---|---|
-| Backend logger | `gmp343_logger-9.py` | `gmp343_logger-7.py`, `gmp343_logger-8.py` |
-| Monitor GUI | `gui_integrated_v13.py` | `gui_integrated_v11.py`, `gui_integrated_v12.py` |
-| Logger calibrazione | `calib-GMP343-logger.py` | `calib-GMP343-logger-old.py`, `calib-GMP343-logger-old1.py` |
+| Backend logger | `gmp343_sht31_logger.py` | `gmp343_logger-7.py`, `gmp343_logger-8.py`, `gmp343_logger-9.py` |
+| Monitor GUI | `gmp343_sht31_monitor.py` | `gui_integrated_v11.py`, `gui_integrated_v12.py`, `gui_integrated_v13.py` |
+| Logger calibrazione | `gmp343_sht31_calib.py` | `calib-GMP343-logger-old.py`, `calib-GMP343-logger-old1.py` |
 
 > **Avvertimento**: per modifiche strutturali partire SEMPRE dalla
 > versione corrente. Le versioni vecchie sono mantenute solo per archivio
@@ -159,20 +159,20 @@ carbocap343_<site>_<YYYYMMDD>_p00.raw       Campioni grezzi (uno per riga serial
 carbocap343_<site>_<YYYYMMDD>_p00_min.raw   Medie 1 minuto (con SD e n campioni)
 ```
 
-Header file `_min` (formato v2 in uso dal 2026):
+Header file `_min` (formato v3 in uso dal 2026-04-15, con T/RH da SHT31-D):
 
 ```text
-#date time CO2[PPM] CO2_std[PPM] ndata_60s_mean flag
+#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag
 ```
 
 Con integrazione **valve-scheduler** attiva (opzionale, vedere sezione
 sotto) l'header `_min` ha **2 colonne aggiuntive**:
 
 ```text
-#date time CO2[PPM] CO2_std[PPM] ndata_60s_mean flag valve_pos valve_label
+#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag valve_pos valve_label
 ```
 
-Caratteristiche formato v2:
+Caratteristiche formato v3:
 
 - Underscore nei nomi file (non più trattini)
 - Timestamp `YYYY-MM-DD HH:MM:SS` (UTC)
@@ -211,7 +211,7 @@ journalctl -u co2-logger -f
 sudo systemctl restart co2-logger
 
 # avvio manuale GUI (se chiusa)
-cd ~/programs/CO2 && python3 gui_integrated_v13.py
+cd ~/programs/CO2 && python3 gmp343_sht31_monitor.py
 ```
 
 ### Procedura calibrazione
@@ -228,7 +228,7 @@ lancia la GUI di calibrazione, e al termine riavvia il service.
 
 ```bash
 sudo systemctl stop co2-logger
-cd ~/programs/CO2 && python3 calib-GMP343-logger.py
+cd ~/programs/CO2 && python3 gmp343_sht31_calib.py
 # ... toggla flag measure/calib durante la sessione, poi chiudi la GUI
 sudo systemctl start co2-logger
 ```
@@ -274,14 +274,35 @@ Edit [`config/integration.ini`](config/integration.ini):
 
 ```ini
 [valve_scheduler]
-enabled       = true
-status_file   = ~/programs/valve-scheduler/service/valve_status.json
-stale_after_s = 10
+enabled          = true
+status_file      = ~/programs/valve-scheduler/service/valve_status.json
+stale_after_s    = 10
+calib_auto       = true
+measure_position = 1
+calib_labels     = zero,span,span-low,span-high
 ```
 
 Poi riavvia il backend: `sudo systemctl restart co2-logger` (il flag è
 letto una volta all'avvio; i file giornalieri esistenti mantengono il
 loro header, quelli nuovi avranno le 8 colonne).
+
+### Regola flag automatico (`calib_auto=true`)
+
+Il backend determina `measure`/`calib` così:
+
+1. **Posizionale** (primaria): se `valve_pos != measure_position` → `calib`.
+   La posizione di misura ambientale è una sola (default `1`); tutte le
+   altre sono per bombole di calibrazione (zero, span, ecc.).
+2. **Per label** (legacy, in OR): se `valve_label ∈ calib_labels` → `calib`.
+   Permette di forzare `calib` anche su `pos = measure_position`.
+3. **Fallback**: se valve-scheduler non risponde / file stale / engine
+   `idle|stopped` → mantiene l'**ultimo flag valido**. Stato interno al
+   modulo `gmp343_valve_state`, all'avvio inizializzato a `measure`.
+
+Il logger di calibrazione manuale (`gmp343_sht31_calib.py`) ha un **popup
+di conferma** sul pulsante toggle `measure ↔ calib`: ricorda all'utente
+che in modo automatico il flag è gestito dalla valvola e che il toggle
+manuale può creare incoerenze (flag scritto != posizione registrata).
 
 ### Sentinelle
 
@@ -291,7 +312,7 @@ loro header, quelli nuovi avranno le 8 colonne).
 
 ### Retrocompatibilità parser GUI + visualizzazione
 
-La GUI [gui_integrated_v13.py](gui_integrated_v13.py) legge correttamente
+La GUI [gmp343_sht31_monitor.py](gmp343_sht31_monitor.py) legge correttamente
 file con header sia a 6 che a 8 colonne. Le 2 colonne extra (`valve_pos`,
 `valve_labels`) sono accettate dal parser `read_file` (7-tupla) e
 aggregate dal period loader `load_period` su più giorni, con sentinella
@@ -305,6 +326,14 @@ run contiguo di posizione valvola, colorata tramite cmap `tab20` (fino a
 un'etichetta `<pos> <label>` sopra la striscia. Attivazione dalla
 checkbox **"Posizione valvola"** (default ON; no-op se i file non hanno
 le colonne valvola).
+
+Inoltre, quando i file hanno le colonne valvola, gli **scatter dei punti
+CO₂** sono colorati per posizione con la stessa palette `tab20`, con
+legenda dinamica `pos N (label)` per ogni posizione presente nei dati
+visibili. Marker: cerchio per la posizione di misura, diamante per le
+posizioni di calibrazione (basato sul flag prevalente in quella
+posizione). Per i file legacy senza colonne valvola si mantiene la
+visualizzazione a due colori (blu = `measure`, arancione = `calib`).
 
 ### Diagnosi rapida
 

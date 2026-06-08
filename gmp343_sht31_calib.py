@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-calib-GMP343-logger.py
-Logger GMP343 con GUI per sessioni di calibrazione.
+gmp343_sht31_calib.py
+Logger GMP343 (CO2, seriale) + SHT31-D (T/RH, I2C) con GUI per sessioni di calibrazione.
 
-Formato file v2 (dal 2026):
+Formato file v3 (dal 2026-04-15, con T/RH):
   - Nome: carbocap343_<site>_<YYYYMMDD>_p00_min.raw (underscore, non trattini)
   - Data/ora: YYYY-MM-DD HH:MM:SS (con trattini e due punti)
-  - Header _min: #date time CO2[PPM] CO2_std[PPM] ndata_60s_mean flag
+  - Header raw:  #date time CO2[PPM] T[C] RH[%] flag
+  - Header _min: #date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag
   - Std in PPM assoluto (non percentuale)
   - Flag: measure o calib (modificabile da GUI)
+  - Dato mancante (SHT31 errore/assente, minuto vuoto) → -999.99
 """
 
 import sys
@@ -21,10 +23,16 @@ import statistics
 import configparser
 from datetime import datetime
 
+try:
+    import smbus2
+    _HAS_SMBUS = True
+except ImportError:
+    _HAS_SMBUS = False
+
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QGroupBox
+    QPushButton, QGroupBox, QMessageBox
 )
 from PyQt5.QtCore  import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui   import QFont
@@ -33,6 +41,7 @@ from PyQt5.QtGui   import QFont
 try:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from gmp343_valve_state import format_for_raw as valve_format_for_raw
+    from gmp343_valve_state import get_flag as valve_get_flag
     _HAS_VALVE_MODULE = True
 except ImportError:
     _HAS_VALVE_MODULE = False
@@ -52,6 +61,60 @@ FLAG_CALIB   = "calib"
 
 _RECONNECT_DELAY_INIT = 5    # secondi, delay iniziale riconnessione
 _RECONNECT_DELAY_MAX  = 60   # secondi, cap backoff esponenziale
+
+# Sentinel unico per dato mancante (CO2, T, RH, std)
+MISSING = -999.99
+
+# ── SHT31-D (T/RH via I2C) ────────────────────────────────────────────────────
+SHT31_BUS      = 1
+SHT31_ADDR     = 0x44
+SHT31_CMD_MSB  = 0x24        # single-shot high repeatability
+SHT31_CMD_LSB  = 0x00
+SHT31_WAIT_S   = 0.02
+
+
+def open_sht31_bus():
+    """Apre SMBus(1). Ritorna oggetto o None se I2C non disponibile."""
+    if not _HAS_SMBUS:
+        print("WARN: smbus2 non installato → SHT31 disabilitato")
+        return None
+    try:
+        bus = smbus2.SMBus(SHT31_BUS)
+        bus.write_i2c_block_data(SHT31_ADDR, SHT31_CMD_MSB, [SHT31_CMD_LSB])
+        time.sleep(SHT31_WAIT_S)
+        bus.read_i2c_block_data(SHT31_ADDR, 0x00, 6)
+        return bus
+    except Exception as e:
+        print(f"WARN: SHT31-D non raggiungibile ({e}) → T/RH = {MISSING}")
+        return None
+
+
+def read_sht31(bus):
+    """Ritorna (T, RH) in °C e %, oppure (MISSING, MISSING) su errore."""
+    if bus is None:
+        return MISSING, MISSING
+    try:
+        bus.write_i2c_block_data(SHT31_ADDR, SHT31_CMD_MSB, [SHT31_CMD_LSB])
+        time.sleep(SHT31_WAIT_S)
+        r = bus.read_i2c_block_data(SHT31_ADDR, 0x00, 6)
+        t_raw  = (r[0] << 8) | r[1]
+        rh_raw = (r[3] << 8) | r[4]
+        t  = -45.0 + 175.0 * (t_raw  / 65535.0)
+        rh = 100.0 * (rh_raw / 65535.0)
+        return t, rh
+    except Exception as e:
+        print(f"[acq] read_sht31: {e}")
+        return MISSING, MISSING
+
+
+def _mean_std_missing(values):
+    """Media e stdev ignorando MISSING. Se nessun valido: (MISSING, MISSING)."""
+    clean = [v for v in values if v != MISSING]
+    if not clean:
+        return MISSING, MISSING
+    avg = sum(clean) / len(clean)
+    std = statistics.stdev(clean) if len(clean) > 1 else 0.0
+    return avg, std
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -91,21 +154,25 @@ def get_filename(cfg) -> str:
 def load_valve_integration():
     """Carica la config integrazione valve-scheduler (opt-in, retrocompat).
 
-    Returns (enabled: bool, status_file: str, stale_after_s: float).
+    Returns (enabled, status_file, stale_after_s, calib_auto, calib_labels).
     Se integration.ini non esiste o il modulo valve_state non è importabile,
     enabled=False (formato .raw invariato).
     """
     if not _HAS_VALVE_MODULE or not os.path.exists(INTEGRATION_INI):
-        return (False, "", 10.0)
+        return (False, "", 10.0, False, [])
     cp = configparser.ConfigParser()
     cp.read(INTEGRATION_INI)
     if not cp.has_section("valve_scheduler"):
-        return (False, "", 10.0)
+        return (False, "", 10.0, False, [])
     enabled = cp.getboolean("valve_scheduler", "enabled", fallback=False)
     status_file = cp.get("valve_scheduler", "status_file",
                          fallback="~/programs/valve-scheduler/service/valve_status.json")
     stale = cp.getfloat("valve_scheduler", "stale_after_s", fallback=10.0)
-    return (enabled, os.path.expanduser(status_file), stale)
+    calib_auto = cp.getboolean("valve_scheduler", "calib_auto", fallback=False)
+    calib_labels_raw = cp.get("valve_scheduler", "calib_labels", fallback="")
+    calib_labels = [s.strip() for s in calib_labels_raw.split(",") if s.strip()]
+    return (enabled, os.path.expanduser(status_file), stale,
+            calib_auto, calib_labels)
 
 
 def _valve_suffix(enabled, status_file, stale_s):
@@ -124,15 +191,23 @@ def write_headers_if_needed(raw_file: str, min_file: str, valve_enabled: bool = 
     # Usa open('x') per creazione atomica — evita TOCTOU e troncamento (DI-004)
     try:
         with open(raw_file, "x", encoding="utf-8") as f:
-            f.write("#date time CO2[PPM] flag\n")
+            f.write("#date time CO2[PPM] T[C] RH[%] flag\n")
     except FileExistsError:
         pass
     try:
         with open(min_file, "x", encoding="utf-8") as f:
             if valve_enabled:
-                f.write("#date time CO2[PPM] CO2_std[PPM] ndata_60s_mean flag valve_pos valve_label\n")
+                f.write(
+                    "#date time CO2[PPM] CO2_std[PPM] "
+                    "T[C] T_std[C] RH[%] RH_std[%] "
+                    "ndata_60s_mean flag valve_pos valve_label\n"
+                )
             else:
-                f.write("#date time CO2[PPM] CO2_std[PPM] ndata_60s_mean flag\n")
+                f.write(
+                    "#date time CO2[PPM] CO2_std[PPM] "
+                    "T[C] T_std[C] RH[%] RH_std[%] "
+                    "ndata_60s_mean flag\n"
+                )
     except FileExistsError:
         pass
 
@@ -167,10 +242,15 @@ class AcqThread(threading.Thread):
         # Integrazione valve-scheduler (opt-in): letta una volta all'avvio
         (self._valve_enabled,
          self._valve_status_file,
-         self._valve_stale_s) = load_valve_integration()
+         self._valve_stale_s,
+         self._calib_auto,
+         self._calib_labels) = load_valve_integration()
         if self._valve_enabled:
             print(f"[integration] valve-scheduler ATTIVA — "
                   f"status_file={self._valve_status_file}")
+            if self._calib_auto:
+                print(f"[integration] calib_auto ATTIVO — "
+                      f"calib_labels={self._calib_labels}")
 
     def set_flag(self, flag: str):
         with self._flag_lock:
@@ -221,7 +301,11 @@ class AcqThread(threading.Thread):
         if ser is None or self._stop.is_set():
             return
 
+        sht31_bus = open_sht31_bus()
+
         co2_buf  = []
+        t_buf    = []
+        rh_buf   = []
         flag_buf = []
         cur_min  = datetime.utcnow().replace(second=0, microsecond=0)
 
@@ -269,13 +353,22 @@ class AcqThread(threading.Thread):
                             avg      = sum(co2_buf) / len(co2_buf)
                             std      = statistics.stdev(co2_buf) if len(co2_buf) > 1 else 0.0
                             n        = len(co2_buf)
+                            t_avg,  t_std  = _mean_std_missing(t_buf)
+                            rh_avg, rh_std = _mean_std_missing(rh_buf)
                             vsuf = _valve_suffix(self._valve_enabled,
                                                  self._valve_status_file,
                                                  self._valve_stale_s)
                             with open(min_file, "a", encoding="utf-8") as mf:
-                                mf.write(f"{ts_avg} {avg:.2f} {std:.2f} {n} {min_flag}{vsuf}\n")
+                                mf.write(
+                                    f"{ts_avg} {avg:.2f} {std:.2f} "
+                                    f"{t_avg:.2f} {t_std:.2f} "
+                                    f"{rh_avg:.2f} {rh_std:.2f} "
+                                    f"{n} {min_flag}{vsuf}\n"
+                                )
                                 mf.flush()  # DI-003
                             co2_buf  = []
+                            t_buf    = []
+                            rh_buf   = []
                             flag_buf = []
                             cur_min  = now.replace(second=0, microsecond=0)
                         raw_file, min_file = new_raw, new_min
@@ -294,12 +387,19 @@ class AcqThread(threading.Thread):
                                                  self._valve_status_file,
                                                  self._valve_stale_s)
                             with open(min_file, "a", encoding="utf-8") as mf:
-                                mf.write(f"{ts_avg} 999.99 0.00 0 {min_flag}{vsuf}\n")
+                                mf.write(
+                                    f"{ts_avg} {MISSING:.2f} {MISSING:.2f} "
+                                    f"{MISSING:.2f} {MISSING:.2f} "
+                                    f"{MISSING:.2f} {MISSING:.2f} "
+                                    f"0 {min_flag}{vsuf}\n"
+                                )
                                 mf.flush()  # DI-003
                         except OSError as e:
                             print(f"[acq] write sentinel: {e}")
                         cur_min  = now.replace(second=0, microsecond=0)
                         co2_buf  = []
+                        t_buf    = []
+                        rh_buf   = []
                         flag_buf = []
                     continue
 
@@ -309,11 +409,12 @@ class AcqThread(threading.Thread):
                     continue
 
                 current_flag = self._get_flag()  # lettura atomica (ARCH-001)
+                t, rh = read_sht31(sht31_bus)
 
                 # ── Scrittura raw — try/except isolato (DI-002) ───────────────
                 try:
                     with open(raw_file, "a", encoding="utf-8") as rf:
-                        rf.write(f"{ts_str} {value:.2f} {current_flag}\n")
+                        rf.write(f"{ts_str} {value:.2f} {t:.2f} {rh:.2f} {current_flag}\n")
                         rf.flush()  # DI-003
                 except OSError as e:
                     print(f"[acq] write raw: {e}")
@@ -321,6 +422,8 @@ class AcqThread(threading.Thread):
                 now_min = now.replace(second=0, microsecond=0)
                 if now_min == cur_min:
                     co2_buf.append(value)
+                    t_buf.append(t)
+                    rh_buf.append(rh)
                     flag_buf.append(current_flag)
                 else:
                     # ── Scrittura media minuto — try/except isolato (DI-002) ──
@@ -333,17 +436,26 @@ class AcqThread(threading.Thread):
                             std = statistics.stdev(co2_buf) if len(co2_buf) > 1 else 0.0
                             n   = len(co2_buf)
                         else:
-                            avg, std, n = 999.99, 0.0, 0
+                            avg, std, n = MISSING, MISSING, 0
+                        t_avg,  t_std  = _mean_std_missing(t_buf)
+                        rh_avg, rh_std = _mean_std_missing(rh_buf)
                         vsuf = _valve_suffix(self._valve_enabled,
                                              self._valve_status_file,
                                              self._valve_stale_s)
                         with open(min_file, "a", encoding="utf-8") as mf:
-                            mf.write(f"{ts_avg} {avg:.2f} {std:.2f} {n} {min_flag}{vsuf}\n")
+                            mf.write(
+                                f"{ts_avg} {avg:.2f} {std:.2f} "
+                                f"{t_avg:.2f} {t_std:.2f} "
+                                f"{rh_avg:.2f} {rh_std:.2f} "
+                                f"{n} {min_flag}{vsuf}\n"
+                            )
                             mf.flush()  # DI-003
                     except OSError as e:
                         print(f"[acq] write min: {e}")
                     cur_min  = now_min
                     co2_buf  = [value]
+                    t_buf    = [t]
+                    rh_buf   = [rh]
                     flag_buf = [current_flag]
 
                 # ── Segnale GUI — try/except isolato (DI-002) ─────────────────
@@ -491,10 +603,37 @@ class CalibLogger(QMainWindow):
         self.lbl_datetime.setText(now)
 
     def _toggle_mode(self):
-        if self.mode == FLAG_MEASURE:
-            self.mode = FLAG_CALIB
+        new_mode = FLAG_CALIB if self.mode == FLAG_MEASURE else FLAG_MEASURE
+        if new_mode == FLAG_CALIB:
+            title = "Conferma passaggio a CALIB"
+            text = (
+                "Stai per marcare i dati come <b>CALIB</b> (calibrazione).\n\n"
+                "Da ora in poi, ogni record scritto sui file giornalieri "
+                "sarà etichettato con flag <code>calib</code>.\n\n"
+                "Confermi solo se sai cosa stai facendo: in modalità "
+                "automatica il flag è già gestito dalla posizione della "
+                "valvola (vedi config/integration.ini → measure_position)."
+                "\n\nProcedere?"
+            )
         else:
-            self.mode = FLAG_MEASURE
+            title = "Conferma passaggio a MEASURE"
+            text = (
+                "Stai per marcare i dati come <b>MEASURE</b> (misura ambientale).\n\n"
+                "Da ora in poi, ogni record scritto sui file giornalieri "
+                "sarà etichettato con flag <code>measure</code>.\n\n"
+                "Assicurati di non essere ancora collegato a una bombola "
+                "di calibrazione: il dato verrebbe registrato come "
+                "ambiente quando in realtà è in calibrazione."
+                "\n\nProcedere?"
+            )
+        reply = QMessageBox.question(
+            self, title, text,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.mode = new_mode
         self.thread.set_flag(self.mode)
         self._apply_mode_style()
 

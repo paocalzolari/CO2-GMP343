@@ -11,3 +11,6 @@ co2-calib
 *.egg-info/
 .eggs/
 config/.backup/
+
+# Runtime PID files
+*.pid

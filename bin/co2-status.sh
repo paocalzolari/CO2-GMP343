@@ -27,7 +27,7 @@ ls -lh ~/data/carbocap343_*_min.raw 2>/dev/null | tail -5 || echo "  nessun file
 echo
 
 echo "## Processi attivi"
-pgrep -af "gmp343_logger|calib-GMP343|gui_integrated" || echo "  nessuno"
+pgrep -af "gmp343_sht31_(logger|calib|monitor)" || echo "  nessuno"
 echo
 
 echo "==============================================="

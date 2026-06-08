@@ -1,7 +1,7 @@
 # CO2 / GMP343 — Stato programmi correnti
 
 Documento di riferimento sui programmi attivi nella cartella `programs/CO2/`.
-Aggiornato il: **2026-04-10**
+Aggiornato il: **2026-04-23**
 
 > ⚠️ Mantenere questo file allineato. Per rigenerarlo automaticamente usare la
 > skill `co2-status` (`~/.claude/skills/co2-status/`).
@@ -12,27 +12,31 @@ Aggiornato il: **2026-04-10**
 
 | Ruolo | File corrente | Wrapper bash | Lancio automatico |
 |---|---|---|---|
-| **Backend logger** (headless, solo seriale → file) | `gmp343_logger-9.py` | `co2-logger` | **`co2-logger.service`** (systemd, watchdog) |
-| **Logger di calibrazione** (con GUI, flag measure/calib) | `calib-GMP343-logger.py` | `co2-calib` | — *(manuale, durante calibrazioni)* |
-| **Visualizzazione** (monitor real-time + grafico) | `gui_integrated_v13.py` | `co2-monitor` | `Monitor-GMP343.desktop` |
+| **Backend logger** (headless, solo seriale → file) | `gmp343_sht31_logger.py` | `co2-logger` | **`co2-logger.service`** (systemd, watchdog) |
+| **Logger di calibrazione** (con GUI, flag measure/calib) | `gmp343_sht31_calib.py` | `co2-calib` | — *(manuale, durante calibrazioni)* |
+| **Visualizzazione** (monitor real-time + grafico) | `gmp343_sht31_monitor.py` | `co2-monitor` | `Monitor-GMP343.desktop` |
 
 ### Cosa fanno
 
-- **`gmp343_logger-9.py`** — backend di acquisizione headless. Apre `/dev/gmp343`,
-  legge il sensore, calcola medie 1 minuto e scrive due file giornalieri:
+- **`gmp343_sht31_logger.py`** — backend di acquisizione headless. Apre
+  `/dev/gmp343` (CO2 via seriale) e `/dev/i2c-1` (SHT31-D per T/RH), legge
+  entrambi in modo sincrono a ogni campione CO2, calcola medie 1 minuto e
+  scrive due file giornalieri:
   - `carbocap343_<site>_<YYYYMMDD>_p00.raw` (campioni grezzi)
   - `carbocap343_<site>_<YYYYMMDD>_p00_min.raw` (medie 1 min)
   Configurazione letta da `~/programs/CO2/config/{serial,site,name}.ini`.
   Flag fisso: `measure`. Nessuna interfaccia. **È il processo che garantisce
   la continuità dell'acquisizione** — gira sotto systemd con restart automatico.
+  Se l'SHT31 non è raggiungibile (bus I2C assente, errore di lettura),
+  T e RH vengono registrati come `-999.99` (MISSING) ma CO2 continua.
 
-- **`calib-GMP343-logger.py`** — stesso backend di acquisizione ma con GUI
+- **`gmp343_sht31_calib.py`** — stesso backend di acquisizione ma con GUI
   PyQt5 minimale per gestire le sessioni di calibrazione. Permette di cambiare
   in vivo il flag tra `measure` e `calib`, che viene scritto sul file `_min`
   per ogni record. **Va usato solo manualmente durante una calibrazione**,
   dopo aver fermato il backend systemd (vedi sezione "Procedura calibrazione").
 
-- **`gui_integrated_v13.py`** — GUI di sola visualizzazione (PyQt5 +
+- **`gmp343_sht31_monitor.py`** — GUI di sola visualizzazione (PyQt5 +
   matplotlib). Due tab:
   - *Tab 1*: monitor real-time del valore CO₂ corrente con flag dal file `_min`
   - *Tab 2*: grafico CO₂ giornaliero con punti `calib` evidenziati in arancione
@@ -41,13 +45,34 @@ Aggiornato il: **2026-04-10**
 
 ---
 
-## Formato file v2 (in uso dal 2026)
+## Formato file v3 (in uso dal 2026-04-15)
 
 - Nome file: `carbocap343_<site>_<YYYYMMDD>_p00_min.raw` (con underscore, non trattini)
 - Data/ora: `YYYY-MM-DD HH:MM:SS`
-- Header `_min`: `#date time CO2[PPM] CO2_std[PPM] ndata_60s_mean flag`
-- Std in **PPM assoluto** (non percentuale)
-- Flag: `measure` o `calib` (modificabile da GUI in `calib-GMP343-logger.py`)
+- Header `raw`: `#date time CO2[PPM] T[C] RH[%] flag`
+- Header `_min`: `#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag [valve_pos valve_label]`
+- Std in **PPM assoluto** (non percentuale). T_std in °C, RH_std in %.
+- Flag: `measure` o `calib`
+  - Con `calib_auto=true` in `config/integration.ini`: determinato automaticamente.
+    Regola **posizionale** (primaria): `valve_pos != measure_position` (default 1)
+    → `calib`. Affiancata in OR: se la `valve_label` è in `calib_labels` →
+    `calib` (legacy, utile per marcare come `calib` anche posizioni con label
+    speciali pur essendo nella posizione di misura). Se valve-scheduler non
+    risponde, mantiene l'**ultimo flag valido** (non torna a `measure`).
+  - Senza `calib_auto`: flag `measure` fisso (backend) o manuale (GUI calib,
+    con popup di conferma sul toggle).
+- Sentinel per dato mancante: `-999.99` (CO2 non acquisito, SHT31 non
+  raggiungibile, minuto vuoto). La GUI filtra queste sentinelle dalle
+  statistiche e dal plot.
+
+### Migrazione da formato v2
+
+I file scritti prima del 2026-04-15 hanno il vecchio formato v2 (5 colonne
+nel `_min`, senza T/RH). Il parser del monitor (`read_file` in
+`gmp343_sht31_monitor.py`) è retrocompatibile: rileva il numero di colonne
+e assegna `-999.99` a T/RH per i file v2. I file v2 di oggi (15/04)
+acquisiti prima della transizione sono stati rinominati con suffisso
+`.pre-sht31` per non confondere il parser.
 
 ---
 
@@ -55,7 +80,7 @@ Aggiornato il: **2026-04-10**
 
 ### Backend logger — systemd system service
 
-Il backend `gmp343_logger-9.py` gira sotto **`co2-logger.service`**, un
+Il backend `gmp343_sht31_logger.py` gira sotto **`co2-logger.service`**, un
 systemd system service installato in `/etc/systemd/system/`. Caratteristiche:
 
 - **Parte al boot** (`WantedBy=multi-user.target`), indipendente dalla sessione X
@@ -82,36 +107,117 @@ sudo systemctl start co2-logger         # ripartenza
 
 ### Visualizzazione GUI — autostart desktop
 
-`gui_integrated_v13.py` parte al login X tramite
+`gmp343_sht31_monitor.py` parte al login X tramite
 `~/.config/autostart/Monitor-GMP343.desktop` (sorgente versionato in
 `autoexec/Monitor-GMP343.desktop`). Non ha watchdog: se crasha, va riavviata
 manualmente. Non è critico perché legge solo file e non scrive dati.
 
 ### Cron utente
 
-Cron utente esegue ogni 5 minuti `~/bin/rsync-co2.sh` per sincronizzare
-`~/data/` verso `cimone@ozone.bo.isac.cnr.it:/home/cimone/data/gmp343`.
+Due job, definiti in [`autoexec/crontab.txt`](autoexec/crontab.txt):
+
+1. **Sync dati** (ogni 5 min): `rsync-tailscale.sh` sincronizza `~/data/`
+   verso `cimone@ozone.bo.isac.cnr.it:/home/cimone/data/gmp343` con
+   auto-recovery Tailscale (se DNS/rsync fallisce riavvia `tailscaled`
+   e ritenta una volta).
+2. **Watchdog Tailscale** (ogni 10 min): `tailscale-health.sh --fix`
+   verifica la risoluzione DNS di GitHub, ozone, naslame1 e riavvia
+   `tailscaled` se necessario. Il restart viene **posposto** se c'è un
+   `git push/pull/fetch/rsync/scp` in corso (evita di troncare TCP).
+
+Entrambi gli script vivono in [`~/programs/services/tools/`](../services/tools/)
+(repo `paocalzolari/services`, clonata sul Raspberry). La logica
+Tailscale è centralizzata lì: un unico punto di aggiornamento per tutti
+i PC di acquisizione del network.
+
+Richiesta sudoers (una volta sola, vedi header degli script):
+
+```bash
+echo 'misura ALL=(root) NOPASSWD: /bin/systemctl restart tailscaled' | \
+    sudo tee /etc/sudoers.d/misura-tailscale
+sudo chmod 440 /etc/sudoers.d/misura-tailscale
+```
 
 ### Icone sul Desktop
 
-Tre lanciatori grafici in `~/Desktop/` (sorgenti versionati nella radice
+Lanciatori grafici in `~/Desktop/` (sorgenti versionati nella radice
 `programs/CO2/`):
 
 | Icona | Cosa fa | Script invocato |
 |---|---|---|
-| **CO2 Monitor** | Apre la GUI di visualizzazione | `gui_integrated_v13.py` |
-| **CO2 Calibration** | Procedura calibrazione completa: stop service → GUI calib → restart service | `bin/co2-calib-mode.sh` |
+| **CO2 Launcher** | Dialog yad con stato live + Start/Stop/Restart backend, Open/Close Monitor, Status terminal | `bin/co2-launcher.sh` |
+| **CO2 Monitor** | Apre la GUI di visualizzazione | `gmp343_sht31_monitor.py` |
 | **CO2 Status** | Apre un terminale con stato + log live del service | `bin/co2-status.sh` |
 
-`CO2 Calibration` e `CO2 Status` aprono un terminale (`Terminal=true`) in
-modo che l'utente veda cosa succede e possa digitare la password sudo
-quando necessario. `CO2 Monitor` non apre terminale (è solo una GUI Qt).
+> `CO2 Calibration` (manuale) è stato rimosso dal Desktop perché il flusso
+> principale è ora **automatico** via `valve-scheduler` (regola posizionale
+> `valve_pos != 1 → calib`). Lo script `bin/co2-calib-mode.sh` resta
+> invocabile da CLI per calibrazioni manuali estemporanee.
+
+`CO2 Status` apre un terminale (`Terminal=true`) per mostrare il `journalctl
+-f`. `CO2 Monitor` e `CO2 Launcher` non aprono terminale.
+
+#### Autostart al login X
+
+Il **CO2 Launcher** viene lanciato anche automaticamente all'apertura della
+sessione X tramite `~/.config/autostart/CO2-Launcher.desktop` (stesso file
+`.desktop` in `programs/CO2/CO2-Launcher.desktop` con
+`X-GNOME-Autostart-enabled=true`). Sopra il dock c'è quindi sempre la
+finestra del launcher pronta per Apply/Refresh.
+
+Anche **Monitor-GMP343** continua a partire automaticamente al login
+(`autoexec/Monitor-GMP343.desktop` → `~/.config/autostart/`). Se preferisci
+lanciarlo solo dal yad launcher, sposta il `.desktop` di Monitor in
+`Hidden=true` o rimuovilo da `~/.config/autostart/`.
 
 ---
 
-## Procedura calibrazione
+## Calibrazione automatica via valve-scheduler (modo principale)
 
-Il backend systemd e `calib-GMP343-logger.py` **non possono girare insieme**:
+Con `calib_auto=true` in `config/integration.ini`, il **backend headless**
+(`gmp343_sht31_logger.py`) determina il flag `measure`/`calib` automaticamente
+dalla posizione della valvola VICI, senza bisogno di intervento manuale:
+
+- **Regola posizionale (primaria)**: se `valve_pos != measure_position`
+  (default `1`) → flag **`calib`**. Il presupposto è che la posizione di
+  misura ambientale sia una sola; tutte le altre posizioni servono per
+  bombole di calibrazione (zero, span, ecc.) e producono dato `calib`.
+- **Regola per label (legacy, in OR)**: se la `valve_label` è in
+  `calib_labels` (es. `zero,span,span-low,span-high`) → flag **`calib`**
+  anche se la posizione fosse quella di misura. Utile se in futuro si
+  vuole marcare come `calib` un punto particolare con label dedicata.
+- **Valvola non raggiungibile / file stale / engine idle** → mantiene
+  l'**ultimo flag valido** (non torna a `measure` di default). Stato
+  interno al modulo `gmp343_valve_state`, all'avvio inizializzato a
+  `measure`.
+
+### Come attivare
+
+Edit `config/integration.ini`:
+
+```ini
+[valve_scheduler]
+enabled          = true
+status_file      = ~/programs/valve-scheduler/service/valve_status.json
+stale_after_s    = 10
+calib_auto       = true
+measure_position = 1
+calib_labels     = zero,span,span-low,span-high
+```
+
+Poi: `sudo systemctl restart co2-logger`
+
+Il backend headless gestisce tutto in automatico seguendo lo schedule della
+valvola. Non serve fermare il service né usare la GUI di calibrazione.
+
+---
+
+## Procedura calibrazione manuale (modo legacy)
+
+Se il valve-scheduler non è disponibile o per calibrazioni manuali estemporanee,
+resta disponibile la procedura manuale con `gmp343_sht31_calib.py`.
+
+Il backend systemd e `gmp343_sht31_calib.py` **non possono girare insieme**:
 entrambi vogliono `/dev/gmp343` e scrivono sugli stessi file giornalieri.
 
 **Modo consigliato (icona desktop):** doppio click su **CO2 Calibration** sul
@@ -123,11 +229,17 @@ riavvia automaticamente il service. Ti chiede solo la password sudo (due volte).
 
 ```bash
 sudo systemctl stop co2-logger                          # 1. ferma il backend
-cd /home/misura/programs/CO2 && python3 calib-GMP343-logger.py    # 2. apri la GUI calib
+cd /home/misura/programs/CO2 && python3 gmp343_sht31_calib.py    # 2. apri la GUI calib
 # ... esegui la calibrazione, usa il pulsante per togglare flag measure/calib ...
 # ... chiudi la GUI quando hai finito ...
 sudo systemctl start co2-logger                         # 3. riparti il backend
 ```
+
+Il pulsante di toggle `measure ↔ calib` mostra un **popup di conferma** che
+ricorda all'utente cosa sta per fare e che in modalità automatica il flag
+è già gestito dalla posizione della valvola. È un freno volontario: in
+modo automatico il toggle manuale è quasi sempre superfluo e può creare
+incoerenze tra flag scritto e posizione valvola registrata.
 
 Durante la calibrazione i record vengono comunque scritti sui file giornalieri
 del giorno corrente, con il flag `calib` per i campioni in calibrazione e
@@ -140,12 +252,15 @@ sugli stessi file con flag `measure`.
 
 | File | Sostituito da |
 |---|---|
-| `gmp343_logger-7.py` | `gmp343_logger-9.py` |
-| `gmp343_logger-8.py` | `gmp343_logger-9.py` |
-| `gui_integrated_v11.py` | `gui_integrated_v13.py` |
-| `gui_integrated_v12.py` | `gui_integrated_v13.py` |
-| `calib-GMP343-logger-old.py` | `calib-GMP343-logger.py` |
-| `calib-GMP343-logger-old1.py` | `calib-GMP343-logger.py` |
+| `gmp343_logger-7.py` | `gmp343_sht31_logger.py` |
+| `gmp343_logger-8.py` | `gmp343_sht31_logger.py` |
+| `gmp343_logger-9.py` | `gmp343_sht31_logger.py` *(rinominato il 2026-04-15)* |
+| `gui_integrated_v11.py` | `gmp343_sht31_monitor.py` |
+| `gui_integrated_v12.py` | `gmp343_sht31_monitor.py` |
+| `gui_integrated_v13.py` | `gmp343_sht31_monitor.py` *(rinominato il 2026-04-15)* |
+| `calib-GMP343-logger-old.py` | `gmp343_sht31_calib.py` |
+| `calib-GMP343-logger-old1.py` | `gmp343_sht31_calib.py` |
+| `calib-GMP343-logger.py` | `gmp343_sht31_calib.py` *(rinominato il 2026-04-15)* |
 
 Non eliminare senza prima averne fatto un tag git.
 

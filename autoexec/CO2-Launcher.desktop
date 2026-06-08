@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=CO2 Launcher
+GenericName=GMP343 yad launcher
+Comment=yad GUI with live status; start/stop backend, open/close Monitor
+Exec=/home/misura/programs/CO2/bin/co2-launcher.sh
+Icon=/home/misura/programs/CO2/gmp343_sensor.png
+Terminal=false
+StartupNotify=false
+Categories=Science;
+X-GNOME-Autostart-enabled=true
+Hidden=false

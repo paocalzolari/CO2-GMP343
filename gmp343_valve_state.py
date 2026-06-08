@@ -6,11 +6,17 @@ gmp343_valve_state.py
 Lettore dello stato della valvola multiposizione VICI pubblicato dal
 programma valve-scheduler (~/programs/valve-scheduler/).
 
-Integrazione opt-in con gmp343_logger-9.py e calib-GMP343-logger.py:
+Integrazione opt-in con gmp343_sht31_logger.py:
 quando l'integrazione è abilitata (config/integration.ini → enabled=true),
 ogni riga del file `_min.raw` contiene 2 colonne aggiuntive dopo il flag:
 `valve_pos` (intero 1..N o `-1` se sconosciuto) e `valve_label` (stringa
 senza spazi, `-` se vuota/sconosciuta).
+
+Regola flag (get_flag):
+  - flag = "calib" se valve_pos != measure_position (default 1)
+  - oppure se valve_label è in calib_labels (legacy, OR con la regola sopra)
+  - altrimenti "measure"
+  - se valve-scheduler non risponde → ultimo flag valido (stato interno)
 
 Progettato per Raspberry Pi 5 (bassa latenza, zero deps esterne):
   - solo stdlib (json, os, datetime)
@@ -22,7 +28,7 @@ Progettato per Raspberry Pi 5 (bassa latenza, zero deps esterne):
 Formato atteso del JSON prodotto da valve-scheduler:
 {
   "timestamp": "2026-04-23T10:30:45+00:00",
-  "state": "running",           // running|paused|stopped|idle
+  "state": "running",           // running|paused|stopped|idle|monitoring
   "step_index": 3,
   "step_total": 10,
   "step_label": "span-low",
@@ -32,10 +38,18 @@ Formato atteso del JSON prodotto da valve-scheduler:
   "loop_enabled": true,
   "cycle_count": 2
 }
+
+Lo stato `monitoring` è emesso dall'IdlePoller della GUI quando la valvola
+è connessa ma nessuno schedule è in esecuzione: ogni ~2s legge `CP` e
+pubblica la posizione corrente. Permette al logger di rilevare anche
+movimenti manuali della valvola (via comando `Go to position` o pannello
+fisico). Per il consumer è equivalente a `running`: importa solo il campo
+`position` + freschezza del `timestamp`.
 """
 from __future__ import annotations
 import json
 import os
+import tempfile
 from datetime import datetime, timezone
 from typing import Optional, Tuple
 
@@ -45,6 +59,53 @@ SENTINEL_LABEL = "-"
 
 # Cache interna: evita re-parse se mtime invariato.
 _cache: dict = {"path": None, "mtime": 0.0, "pos": None, "label": ""}
+
+# ───────────────────────────── stato calibrazione persistente
+# Salvato su disco così sopravvive a restart del logger E al passaggio
+# di giorno UTC. La regola di flag è ricalcolata in real-time da
+# get_flag(); questo file serve solo come fallback quando la fonte
+# primaria (valve_status.json) non risponde — ad esempio nei primi
+# secondi dopo il restart del logger, prima che il valve-scheduler
+# pubblichi un nuovo status, oppure quando il valve-daemon è giù.
+_CALIB_STATE_FILE = os.path.expanduser(
+    "~/programs/CO2/shared/ipc_co2/calib_state.json")
+
+
+def _load_persisted_flag() -> str:
+    """Read the last persisted calibration flag from disk.
+
+    Returns 'measure' or 'calib'. Defaults to 'measure' on any error
+    (file missing, JSON corrupted, unexpected value).
+    """
+    try:
+        with open(_CALIB_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        flag = data.get("flag", "measure")
+        if flag in ("measure", "calib"):
+            return flag
+    except (OSError, ValueError, UnicodeDecodeError):
+        pass
+    return "measure"
+
+
+def _save_persisted_flag(flag: str) -> None:
+    """Atomically write the current calibration flag to disk.
+
+    No-op on filesystem errors (best-effort). Atomic via tmp+rename so
+    readers never see a half-written file.
+    """
+    try:
+        os.makedirs(os.path.dirname(_CALIB_STATE_FILE), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            dir=os.path.dirname(_CALIB_STATE_FILE), suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump({
+                "flag": flag,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }, f)
+        os.replace(tmp, _CALIB_STATE_FILE)
+    except OSError:
+        pass
 
 
 def _is_stale(ts_str: str, stale_after_s: float) -> bool:
@@ -112,7 +173,7 @@ def read_valve_status(path: str,
         pos_int = -1
 
     if pos_int < 1:
-        # posizione sconosciuta o engine in idle
+        # posizione sconosciuta (sentinella -1 dal poller / engine idle)
         return (None, "")
 
     # aggiorna cache
@@ -141,6 +202,71 @@ def format_for_raw(path: str,
     # mai contenerli, ma meglio difendersi)
     safe = safe or SENTINEL_LABEL
     return pos_str, safe
+
+
+# Ultimo flag valido restituito da get_flag(): usato come fallback quando
+# il valve-scheduler non risponde. Inizializzato dallo STATE FILE su
+# disco così l'identità calibrazione/misura sopravvive a:
+#   - restart del logger
+#   - rotazione giornaliera del file (passaggio del giorno UTC)
+# Se il file non esiste / è corrotto, default "measure".
+_last_valid_flag: str = _load_persisted_flag()
+
+# Garantisce che il file di stato esista sempre dopo l'import del modulo
+# (anche al primo avvio, prima della prima transizione). Idempotente.
+_save_persisted_flag(_last_valid_flag)
+
+
+def get_flag(path: str,
+             stale_after_s: float = 10.0,
+             calib_labels: list[str] | None = None,
+             measure_position: int = 1,
+             ) -> str:
+    """Determina il flag measure/calib in base a posizione + label valvola.
+
+    Regola (OR logico):
+      - flag = "calib" se valve_pos != measure_position
+      - oppure flag = "calib" se valve_label è in calib_labels
+      - altrimenti flag = "measure"
+
+    Fallback: se il file è mancante/stale/corrotto la funzione restituisce
+    l'ULTIMO flag valido restituito da una chiamata precedente (stato
+    interno al modulo). All'avvio del processo, prima di ogni dato valido,
+    il fallback è "measure".
+
+    Args:
+        path: percorso al file valve_status.json.
+        stale_after_s: soglia staleness (secondi).
+        calib_labels: lista di label (case-insensitive) che forzano "calib"
+            anche se la posizione è quella di misura. Lasciare None/vuota
+            per affidarsi solo alla regola posizionale.
+        measure_position: posizione della valvola che corrisponde alla
+            misura ambientale (default 1). Tutte le altre posizioni
+            classificano il dato come "calib".
+    """
+    global _last_valid_flag
+    pos, label = read_valve_status(path, stale_after_s)
+    if pos is None:
+        # valve-scheduler non risponde / stato stale / engine idle
+        return _last_valid_flag
+
+    flag = "measure"
+    if pos != measure_position:
+        flag = "calib"
+    elif calib_labels and label:
+        label_lower = label.lower()
+        for cl in calib_labels:
+            if cl.lower() == label_lower:
+                flag = "calib"
+                break
+
+    # Persisti su disco SOLO sulle transizioni measure↔calib per evitare
+    # writes inutili (filesystem thrashing). Il valore in memoria è
+    # sempre aggiornato a ogni chiamata.
+    if flag != _last_valid_flag:
+        _last_valid_flag = flag
+        _save_persisted_flag(flag)
+    return flag
 
 
 # ----------------------------------------------------------------- CLI helper

@@ -2,8 +2,8 @@
 Version=1.0
 Type=Application
 Name=Acquisizione Vaisala GMP343
-Comment=Logger calibrazione GMP343 con GUI (calib-GMP343-logger.py)
-Exec=bash -c "cd /home/misura/programs/CO2 && python3 calib-GMP343-logger.py > /tmp/co2logger.log 2>&1"
+Comment=Logger calibrazione GMP343 con GUI (gmp343_sht31_calib.py)
+Exec=bash -c "cd /home/misura/programs/CO2 && python3 gmp343_sht31_calib.py > /tmp/co2logger.log 2>&1"
 Icon=/home/misura/programs/CO2/gmp343_sensor.png
 Terminal=false
 StartupNotify=false
