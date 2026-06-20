@@ -1,23 +1,32 @@
-"""Test delle funzioni pure del monitor GUI (gui_integrated_v13.py).
+"""Test delle funzioni pure del monitor GUI (gui_integrated_v13.py — ARCHIVIATO).
 
-Le funzioni puro-Python sono: get_data_dir, build_filename, read_file,
-smart_ylim, night_spans (solo se astral non è installato → fallback).
-Tutto il resto è PyQt5 (widgets, signal/slot) e non coperto qui."""
+NOTA 2026-06-20: i test puntavano alla versione archiviata
+`gui_integrated_v13.py` che non esiste nel repo. Il file corrente è
+`gmp343_sht31_monitor.py` (vedi CLAUDE.md → "Versioni multiple"), che
+ha API diverse. Test marcati come SKIP in blocco — vanno riscritti per
+le nuove API quando si rivisita il monitor GUI."""
 import configparser
 from datetime import date as date_type, datetime
 
 import numpy as np
 import pytest
 
+pytestmark = pytest.mark.skip(
+    reason="gui_integrated_v13.py archiviato; test da riscrivere per "
+           "gmp343_sht31_monitor.py (vedi CLAUDE.md)")
 
-# Import del modulo
+
+# Import del modulo (wrappato: file archiviato, vedi pytestmark skip)
 import sys
 from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-import gui_integrated_v13 as gui
+try:
+    import gui_integrated_v13 as gui
+except ImportError:
+    gui = None  # I test sono skippati comunque dal pytestmark
 
 
 # ── get_data_dir ─────────────────────────────────────────────────────────
