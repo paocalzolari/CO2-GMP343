@@ -9,8 +9,19 @@ data_path letto da name.ini (default: ~/data)
 Formato file v3 (dal 2026-04-15, con T/RH):
   - Nome: carbocap343_<site>_<YYYYMMDD>_p00_min.raw (underscore, non trattini)
   - Data/ora: YYYY-MM-DD HH:MM:SS (con trattini e due punti)
-  - Header raw:  #date time CO2[PPM] T[C] RH[%] flag
+  - Header raw:  #date time CO2[PPM] T[C] RH[%] flag [valve_pos valve_label] CO2RAW[PPM] CO2RAWUC[PPM]
   - Header _min: #date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag [valve_pos valve_label]
+  - Std in PPM assoluto (non percentuale)
+
+Formato file v5 (dal 2026-06-23, 3 valori CO2 dalla GMP343):
+  - La sonda è configurata (comando FORM, salvato in EEPROM) per emettere
+    3 grandezze: CO2 (filtrata+compensata), CO2RAW (non filtrata, compensata),
+    CO2RAWUC (non filtrata, SENZA compensazioni) — vedi manuale M210514EN-C p.36.
+  - Le colonne CO2RAW/CO2RAWUC sono aggiunte IN CODA alla riga `.raw`
+    (dopo le colonne valvola) per non rompere i parser posizionali esistenti.
+  - CO2 resta in colonna 3: i file `_min`/10/30/60 e il monitor sono invariati
+    (aggregano la CO2 corretta). Gli aggregati dei valori grezzi si possono
+    ricalcolare dal `.raw` e verranno aggiunti in un secondo momento.
   - Std in PPM assoluto (non percentuale)
   - Flag: measure o calib
     - Se calib_auto=false in integration.ini (default): flag fisso "measure"
@@ -47,12 +58,24 @@ try:
 except ImportError:
     _HAS_VALVE_MODULE = False
 
+# ── Compensazione P/RH (opt-in, poll-mode) ────────────────────────────────────
+# Import tollerante: i moduli bmp388 / gmp343_compensation servono SOLO se
+# [compensation] enabled=true in sensors.ini. Se mancano o la feature è
+# disattiva, il logger gira in RUN-mode come sempre.
+try:
+    import bmp388
+    import gmp343_compensation as gmp343_comp
+    _HAS_COMP_MODULES = True
+except ImportError:
+    _HAS_COMP_MODULES = False
+
 # ── Percorsi ──────────────────────────────────────────────────────────────────
 CONFIG_DIR      = os.path.expanduser("~/programs/CO2/config")
 NAME_INI        = os.path.join(CONFIG_DIR, "name.ini")
 SERIAL_INI      = os.path.join(CONFIG_DIR, "serial.ini")
 SITE_INI        = os.path.join(CONFIG_DIR, "site.ini")
 INTEGRATION_INI = os.path.join(CONFIG_DIR, "integration.ini")  # opzionale
+SENSORS_INI     = os.path.join(CONFIG_DIR, "sensors.ini")      # SHT3X/BMP388/compensazione
 
 CMD_START = b"R\r\n"
 
@@ -133,6 +156,53 @@ def read_sht31(bus):
     except Exception as e:
         print(f"WARN: read_sht31 fallita: {e}")
         return MISSING, MISSING
+
+
+def load_sensors_config():
+    """Legge config/sensors.ini e ritorna un dict con la config sensori e
+    compensazione. Tollerante: se il file o le sezioni mancano, usa i default
+    (SHT3X 0x44 abilitato, BMP388 disabilitato, compensazione DISABILITATA).
+
+    Effetto collaterale: aggiorna le globali SHT31_BUS/SHT31_ADDR così che
+    open_sht31_bus()/read_sht31() usino l'indirizzo da config (0x44 o 0x45).
+
+    Ritorna:
+      {
+        "bmp388": {"enabled": bool, "bus": int, "addr": int},
+        "comp":   {"enabled": bool, "addr": int,
+                   "feed_pressure": bool, "feed_humidity": bool,
+                   "poll_interval_s": float, "default_p_hpa": float},
+      }
+    """
+    global SHT31_BUS, SHT31_ADDR
+    cp = configparser.ConfigParser()
+    cp.read(SENSORS_INI)
+
+    def _addr(sec, key, default):
+        raw = cp.get(sec, key, fallback=None)
+        if raw is None:
+            return default
+        return int(raw, 16) if raw.strip().lower().startswith("0x") else int(raw)
+
+    # SHT3X (sezione sht31_a) → aggiorna le globali
+    if cp.has_section("sht31_a") and cp.getboolean("sht31_a", "enabled", fallback=True):
+        SHT31_BUS  = cp.getint("sht31_a", "bus",  fallback=SHT31_BUS)
+        SHT31_ADDR = _addr("sht31_a", "addr", SHT31_ADDR)
+
+    bmp = {
+        "enabled": cp.getboolean("bmp388", "enabled", fallback=False),
+        "bus":     cp.getint("bmp388", "bus", fallback=1),
+        "addr":    _addr("bmp388", "addr", 0x77),
+    }
+    comp = {
+        "enabled":         cp.getboolean("compensation", "enabled", fallback=False),
+        "addr":            cp.getint("compensation", "gmp343_addr", fallback=0),
+        "feed_pressure":   cp.getboolean("compensation", "feed_pressure", fallback=True),
+        "feed_humidity":   cp.getboolean("compensation", "feed_humidity", fallback=True),
+        "poll_interval_s": cp.getfloat("compensation", "poll_interval_s", fallback=2.0),
+        "default_p_hpa":   cp.getfloat("compensation", "default_p_hpa", fallback=1013.0),
+    }
+    return {"bmp388": bmp, "comp": comp}
 
 
 def load_valve_integration():
@@ -219,12 +289,12 @@ def write_headers_if_needed(raw_file, avg_file, file_10, file_30, file_60,
               CO2 CO2_std CO2_median T T_std T_median RH RH_std RH_median.
     """
     if valve_enabled:
-        raw_header  = "#date time CO2[PPM] T[C] RH[%] flag valve_pos valve_label"
+        raw_header  = "#date time CO2[PPM] T[C] RH[%] flag valve_pos valve_label CO2RAW[PPM] CO2RAWUC[PPM]"
         avg_header  = "#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag valve_pos valve_label"
         agg_header  = "#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata flag valve_pos valve_label"
         agg60_header= "#date time CO2[PPM] CO2_std[PPM] CO2_median[PPM] T[C] T_std[C] T_median[C] RH[%] RH_std[%] RH_median[%] ndata flag valve_pos valve_label"
     else:
-        raw_header  = "#date time CO2[PPM] T[C] RH[%] flag"
+        raw_header  = "#date time CO2[PPM] T[C] RH[%] flag CO2RAW[PPM] CO2RAWUC[PPM]"
         avg_header  = "#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag"
         agg_header  = "#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata flag"
         agg60_header= "#date time CO2[PPM] CO2_std[PPM] CO2_median[PPM] T[C] T_std[C] T_median[C] RH[%] RH_std[%] RH_median[%] ndata flag"
@@ -427,6 +497,37 @@ def parse_co2_from_line(line):
     return None
 
 
+def parse_three_co2(line):
+    """Estrae i 3 valori CO2 emessi dalla GMP343 col FORM
+    `CO2 " " CO2RAW " " CO2RAWUC` (riga tipo "  472.1   471.9   459.5").
+
+    Ritorna (co2, co2raw, co2rawuc):
+      - co2      = CO2 filtrata + compensata (P/T/RH/O2) → valore "corretto"
+      - co2raw   = CO2 non filtrata, compensazioni ancora applicate
+      - co2rawuc = CO2 non filtrata e SENZA compensazioni → valore "grezzo"
+
+    Robusto alla transizione di formato: se la riga contiene un solo numero
+    (vecchio FORM o sonda non riconfigurata) ritorna (co2, MISSING, MISSING)
+    così il logger continua a funzionare; se il parsing fallisce del tutto
+    ritorna (None, None, None).
+    """
+    try:
+        nums = []
+        for p in line.strip().split():
+            tok = p.replace('.', '', 1).replace('-', '', 1)
+            if tok.isdigit():
+                nums.append(float(p))
+        if not nums:
+            return None, None, None
+        co2      = nums[0]
+        co2raw   = nums[1] if len(nums) >= 2 else MISSING
+        co2rawuc = nums[2] if len(nums) >= 3 else MISSING
+        return co2, co2raw, co2rawuc
+    except Exception as e:
+        print(f"Error parsing 3-CO2 line '{line}': {e}")
+        return None, None, None
+
+
 def mean_std_missing(values):
     """
     Media e stdev ignorando i valori MISSING.
@@ -490,6 +591,21 @@ def main():
     else:
         print("[integration] valve-scheduler disattiva (formato file storico)")
 
+    # Config sensori + compensazione (legge sensors.ini, aggiorna SHT31_ADDR/BUS)
+    sensors_cfg = load_sensors_config()
+    comp_cfg = sensors_cfg["comp"]
+    bmp_cfg  = sensors_cfg["bmp388"]
+    comp_enabled = bool(comp_cfg["enabled"]) and _HAS_COMP_MODULES
+    if comp_cfg["enabled"] and not _HAS_COMP_MODULES:
+        print("WARN: [compensation] enabled ma moduli bmp388/gmp343_compensation "
+              "non importabili → resto in RUN-mode")
+    if comp_enabled:
+        print(f"[compensation] ATTIVA (poll-mode) — gmp343_addr={comp_cfg['addr']}, "
+              f"feed P={comp_cfg['feed_pressure']} RH={comp_cfg['feed_humidity']}, "
+              f"BMP388 bus {bmp_cfg['bus']} addr 0x{bmp_cfg['addr']:02x}")
+    else:
+        print("[compensation] disattiva (STANDBY) — RUN-mode, nessun feed P/RH")
+
     device = config.get('serial', 'port', fallback='/dev/ttyUSB0')
     baudrate = config.getint('serial', 'baudrate', fallback=19200)
     bytesize = config.getint('serial', 'bytesize', fallback=8)
@@ -510,12 +626,28 @@ def main():
             timeout=timeout
         )
         time.sleep(2)
-        ser.write(CMD_START)
     except serial.SerialException as e:
         print(f"Error opening serial port {device}: {e}")
         return
 
     sht31_bus = open_sht31_bus()
+
+    # ── Setup modalità sonda ──────────────────────────────────────────────────
+    # comp_enabled → POLL-mode (per poter inviare XP/XRH di compensazione).
+    # Altrimenti → RUN-mode come da comportamento storico.
+    bmp_dev = None
+    if comp_enabled:
+        bmp_dev = bmp388.open_bmp388(bus=bmp_cfg["bus"], addr=bmp_cfg["addr"])
+        if not gmp343_comp.stop_run(ser):
+            print("WARN: impossibile fermare RUN-mode → fallback RUN-mode (no feed)")
+            comp_enabled = False
+            ser.write(CMD_START)
+        else:
+            gmp343_comp.enter_poll(ser)
+            print(f"[compensation] sonda in POLL-mode (addr {comp_cfg['addr']})")
+    else:
+        ser.write(CMD_START)
+
     _write_status_json(True)  # seriale aperta → strumento connesso
 
     co2_values = []
@@ -614,7 +746,24 @@ def main():
 
     while True:
         try:
-            line = ser.readline().decode(errors='ignore').strip()
+            # ── Acquisizione di un campione ───────────────────────────────────
+            # comp_enabled → POLL-mode: leggi P (BMP388) e T/RH (SHT3X), inviali
+            # alla sonda come compensazione (XP/XRH) e richiedi la misura (SEND).
+            # _poll_tr porta T/RH a valle così non li si rilegge due volte.
+            _poll_tr = None
+            if comp_enabled:
+                p_hpa, _ = bmp388.read_bmp388(bmp_dev)
+                pt, prh = read_sht31(sht31_bus)
+                _poll_tr = (pt, prh)
+                line = gmp343_comp.feed_and_send(
+                    ser, comp_cfg["addr"],
+                    p_hpa=(None if p_hpa is None else p_hpa),
+                    rh_pct=(None if prh == MISSING else prh),
+                    do_pressure=comp_cfg["feed_pressure"],
+                    do_humidity=comp_cfg["feed_humidity"])
+                time.sleep(comp_cfg["poll_interval_s"])
+            else:
+                line = ser.readline().decode(errors='ignore').strip()
             now = datetime.utcnow()
 
             new_files = get_filenames(config)
@@ -626,7 +775,7 @@ def main():
 
             if line:
                 ts_str, current_timestamp = timestamp_now()
-                co2 = parse_co2_from_line(line)
+                co2, co2raw, co2rawuc = parse_three_co2(line)
 
                 if co2 is not None:
                     # Dedup-by-value: il sensore aggiorna ~ogni 2 s.
@@ -640,15 +789,25 @@ def main():
                         # (anche senza letture indipendenti) — vedi sotto.
                         pass
                     else:
-                        t, rh = read_sht31(sht31_bus)
+                        # In poll-mode T/RH sono già stati letti a inizio ciclo
+                        # (e inviati alla sonda); in run-mode si leggono qui.
+                        t, rh = _poll_tr if _poll_tr is not None else read_sht31(sht31_bus)
                         last_co2_value = co2
                         flag = _auto_flag(calib_auto, valve_enabled,
                                           valve_status_file, valve_stale_s,
                                           calib_labels, measure_position)
 
                         valve_suf_raw = _valve_suffix(valve_enabled, valve_status_file, valve_stale_s)
+                        # Le 2 colonne CO2RAW/CO2RAWUC vanno IN CODA alla riga,
+                        # dopo le eventuali colonne valvola, così i parser
+                        # posizionali esistenti (monitor: CO2@2 T@3 RH@4 flag@5)
+                        # restano validi e ignorano le colonne nuove.
                         with open(raw_file, 'a') as f_raw:
-                            f_raw.write(f"{ts_str} {co2:.2f} {t:.2f} {rh:.2f} {flag}{valve_suf_raw}\n")
+                            f_raw.write(
+                                f"{ts_str} {co2:.2f} {t:.2f} {rh:.2f} "
+                                f"{flag}{valve_suf_raw} "
+                                f"{co2raw:.2f} {co2rawuc:.2f}\n"
+                            )
 
                     if current_timestamp.replace(second=0, microsecond=0) == current_minute:
                         # Stesso minuto: aggiorna i buffer (solo se non duplicato)
@@ -756,7 +915,14 @@ def main():
             time.sleep(5)
             try:
                 ser.open()
-                ser.write(CMD_START)
+                if comp_enabled:
+                    # Ripristina POLL-mode dopo la riconnessione
+                    if gmp343_comp.stop_run(ser):
+                        gmp343_comp.enter_poll(ser)
+                    else:
+                        ser.write(CMD_START)
+                else:
+                    ser.write(CMD_START)
                 _write_status_json(True, _last_co2, _last_t, _last_rh)
             except serial.SerialException as reopen_e:
                 print(f"Unable to reopen serial port: {reopen_e}. Exiting.")
