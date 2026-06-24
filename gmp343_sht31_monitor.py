@@ -2587,6 +2587,17 @@ class TabValve(QWidget):
         else:
             self._lbl_label_live.setText("")
         self._set_btns_enabled(valve_open and not sched_running)
+        # Aggiorna countdown + stato + bottoni Start/Stop del TabSchedule.
+        # L'IPC get_status è minimale (niente state/seconds_remaining/step):
+        # lo stato schedule completo è solo in valve_status.json, da cui
+        # TabSchedule.on_status() ricava countdown, step e abilitazione bottoni.
+        # Senza questo, nel monitor il countdown resta fermo e "Start" sempre
+        # abilitato anche con schedule in esecuzione.
+        try:
+            with _VALVE_STATUS_JSON.open("r", encoding="utf-8") as _vf:
+                self._tab_sched.on_status(json.load(_vf))
+        except Exception:
+            pass
 
     def _set_btns_enabled(self, enabled: bool) -> None:
         self._btn_home.setEnabled(enabled)
