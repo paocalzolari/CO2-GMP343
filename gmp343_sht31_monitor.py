@@ -241,7 +241,18 @@ def read_last_raw_sample(cfg: configparser.ConfigParser, d: date_type):
         # v2: date time CO2 flag (no T/RH)
         t, rh = None, None
         flag = parts[3] if len(parts) >= 4 else None
-    return (ts, co2, t, rh, flag)
+    # P (BMP388): ultima colonna del formato v5 (…CO2RAW CO2RAWUC P). Sulle
+    # righe vecchie (no P) l'ultimo token è un flag/CO2RAWUC: il float-guard
+    # e il check MISSING evitano falsi positivi sulla riga live (sempre v5).
+    p = None
+    if len(parts) >= 9:
+        try:
+            pv = float(parts[-1])
+            if pv != MISSING:
+                p = pv
+        except (ValueError, IndexError):
+            p = None
+    return (ts, co2, t, rh, flag, p)
 
 
 def _startup_log():
@@ -1530,7 +1541,7 @@ class GraphWidget(QWidget):
         self._refresh_comp_label()
         today = datetime.utcnow().date()
         # Live: ultima riga del .raw (~1 Hz)
-        _, live_co2, _, _, _ = read_last_raw_sample(self.cfg, today)
+        _, live_co2, _, _, _, _ = read_last_raw_sample(self.cfg, today)
         if live_co2 is None or live_co2 == MISSING:
             self.lbl_chart_live.setText("--- ppm")
         else:
@@ -3064,6 +3075,8 @@ class GMP343Monitor(QMainWindow):
         col_live.addLayout(row)
         row, self.lbl_rh_live  = _make_value_row("RH:",  14,    "#007060", "%")
         col_live.addLayout(row)
+        row, self.lbl_p_live   = _make_value_row("P:",   14,    "#5030a0", "hPa")
+        col_live.addLayout(row)
         col_live.addStretch()
 
         # — RIGHT COLUMN: 1-min average + σ + n (stats of the average) —
@@ -3088,6 +3101,8 @@ class GMP343Monitor(QMainWindow):
         row, self.lbl_t   = _make_value_row("T:",   14, "#c05000", "°C")
         col_avg.addLayout(row)
         row, self.lbl_rh  = _make_value_row("RH:",  14, "#007060", "%")
+        col_avg.addLayout(row)
+        row, self.lbl_p   = _make_value_row("P:",   14, "#5030a0", "hPa")
         col_avg.addLayout(row)
         col_avg.addStretch()
 
@@ -3307,7 +3322,7 @@ class GMP343Monitor(QMainWindow):
         result = load_period(self.cfg, today, 1)
 
         # Tempo reale: ultimo campione dal file .raw (indipendente da _min)
-        live_ts, live_co2, live_t, live_rh, _live_flag = read_last_raw_sample(
+        live_ts, live_co2, live_t, live_rh, _live_flag, live_p = read_last_raw_sample(
             self.cfg, today)
         dec = self.guicfg.getint("display","co2_decimals",fallback=2)
         if live_co2 is None or live_co2 == MISSING:
@@ -3324,11 +3339,16 @@ class GMP343Monitor(QMainWindow):
             self.lbl_rh_live.setText("--- %")
         else:
             self.lbl_rh_live.setText(f"{live_rh:.2f} %")
+        if live_p is None or live_p == MISSING:
+            self.lbl_p_live.setText("--- hPa")
+        else:
+            self.lbl_p_live.setText(f"{live_p:.2f} hPa")
 
         if result is None:
             self.lbl_co2.setText("--- ppm"); self.lbl_status.setText("")
             self.lbl_std.setText("---"); self.lbl_n.setText("---")
             self.lbl_t.setText("--- °C"); self.lbl_rh.setText("--- %")
+            self.lbl_p.setText("--- hPa")
             self.lbl_ts.setText("No data")
             self.lbl_flag.setText("---"); self.lbl_flag.setStyleSheet("color:#888;font-size:9px")
             self.lbl_flag_top.setText("---")
@@ -3412,6 +3432,17 @@ class GMP343Monitor(QMainWindow):
 
         self.lbl_t.setText(_fmt(last_t, last_t_std, "°C"))
         self.lbl_rh.setText(_fmt(last_rh, last_rh_std, "%"))
+        # P 1-min average: penultima/ultima colonna del _min (… P P_std)
+        p_avg, p_sd = MISSING, MISSING
+        try:
+            with open(path) as _f:
+                _last = [ln for ln in _f.read().splitlines()
+                         if ln and not ln.startswith("#")][-1].split()
+            if len(_last) >= 2:
+                p_avg = float(_last[-2]); p_sd = float(_last[-1])
+        except Exception:
+            pass
+        self.lbl_p.setText(_fmt(p_avg, p_sd, "hPa"))
         self.lbl_ts.setText(last_ts)
         self.lbl_file.setText(path)
 
