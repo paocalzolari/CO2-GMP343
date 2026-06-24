@@ -58,16 +58,36 @@ gui_status() {
 }
 
 last_co2() {
-    # Extract last_co2_ppm from status.json with a tiny python one-liner;
-    # silent on parse failure.
+    # CO2 corretta (compensata) + grezza (CO2RAWUC) da status.json, con dicitura.
     python3 -c "
-import json,sys
+import json
 try:
     d=json.load(open('$STATUS_JSON'))
-    v=d.get('last_co2_ppm')
-    print(f'{v:.2f} ppm' if isinstance(v,(int,float)) else '—')
+    c=d.get('last_co2_ppm'); g=d.get('last_co2rawuc_ppm')
+    cs=f'{c:.2f}' if isinstance(c,(int,float)) else '—'
+    gs=f'{g:.2f}' if isinstance(g,(int,float)) else '—'
+    print(f'corrected {cs} ppm · raw {gs} ppm')
 except Exception:
     print('—')
+" 2>/dev/null
+}
+
+comp_info() {
+    # Stato compensazione P/RH inviata alla sonda (da status.json).
+    python3 -c "
+import json
+try:
+    d=json.load(open('$STATUS_JSON'))
+    if not d.get('comp_active'):
+        print('Compensation: OFF (RUN-mode)')
+    else:
+        rh=d.get('comp_rh_fed'); p=d.get('comp_p_hpa'); src=d.get('comp_p_source')
+        rh_s=f'RH {rh:.1f}%→probe' if isinstance(rh,(int,float)) else 'RH —'
+        src_s={'fixed':'fixed','bmp388':'BMP388'}.get(src,'')
+        p_s=f'P {p:.1f} hPa ({src_s})' if isinstance(p,(int,float)) else 'P —'
+        print(f'Compensation: {rh_s} · {p_s}')
+except Exception:
+    print('Compensation: n/a')
 " 2>/dev/null
 }
 
@@ -197,13 +217,14 @@ while true; do
     S_MON=$(gui_status "gmp343_sht31_monitor.py")
     LAST=$(last_co2)
     AGE=$(last_age)
+    COMP=$(comp_info)
 
     SELECTION=$(yad --list --checklist \
         --title="CO2 / GMP343 Launcher — ISAC CNR" \
         --width=620 --height=420 \
         --window-icon="$ICON" \
         --image="$ICON" --image-on-top \
-        --text="<b>Backend:</b> $S_BE   ·   <b>Monitor:</b> $S_MON\n<b>Last CO₂:</b> $LAST   ·   <b>Updated:</b> $AGE   ·   <i>(refresh on Apply/Refresh)</i>" \
+        --text="<b>Backend:</b> $S_BE   ·   <b>Monitor:</b> $S_MON\n<b>CO₂:</b> $LAST   ·   <b>Updated:</b> $AGE   ·   <i>(refresh on Apply/Refresh)</i>\n<b>$COMP</b>" \
         --column="" --column="Status" --column="Component" --column="Action" --column="cmd" \
         --hide-column=5 --print-column=5 --separator="|" \
         --grid-lines=HOR --expand-column=4 \

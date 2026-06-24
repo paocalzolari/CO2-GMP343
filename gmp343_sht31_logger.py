@@ -85,18 +85,34 @@ STATUS_JSON = os.path.join(
     "shared", "ipc_co2", "status.json")
 
 
-def _write_status_json(instrument_connected, last_co2=None, last_t=None, last_rh=None):
+# Stato compensazione P/RH pubblicato in status.json (per launcher + monitor GUI).
+# Aggiornato da main() all'avvio; i valori live (rh inviata) ad ogni minuto.
+_COMP_STATUS = {
+    "comp_active": False,      # poll-mode con feed attivo
+    "comp_rh_fed": None,       # %RH inviata alla sonda (None se non inviata)
+    "comp_p_hpa": None,        # hPa usati per la compensazione (fissi o BMP388)
+    "comp_p_source": None,     # "fixed" | "bmp388" | None
+}
+
+
+def _write_status_json(instrument_connected, last_co2=None, last_t=None,
+                       last_rh=None, last_co2rawuc=None):
     """Scrive status.json atomicamente (tmp + rename) per acq-tools.
 
     Aggiorna l'mtime — acq-tools considera stale dopo 120s.
+    Include lo stato di compensazione P/RH (_COMP_STATUS) per launcher/monitor.
+    last_co2_ppm = CO2 CORRETTA (compensata); last_co2rawuc_ppm = CO2 GREZZA
+    (senza compensazioni) → le GUI mostrano entrambe con dicitura.
     """
     status = {
         "instrument_connected": instrument_connected,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "last_co2_ppm": last_co2,
+        "last_co2rawuc_ppm": last_co2rawuc,
         "last_t_c": last_t,
         "last_rh_pct": last_rh,
     }
+    status.update(_COMP_STATUS)
     try:
         os.makedirs(os.path.dirname(STATUS_JSON), exist_ok=True)
         fd, tmp = tempfile.mkstemp(
@@ -201,6 +217,9 @@ def load_sensors_config():
         "feed_humidity":   cp.getboolean("compensation", "feed_humidity", fallback=True),
         "poll_interval_s": cp.getfloat("compensation", "poll_interval_s", fallback=2.0),
         "default_p_hpa":   cp.getfloat("compensation", "default_p_hpa", fallback=1013.0),
+        # Pressione fissa (hPa) usata quando NON si alimenta P live (no BMP388).
+        # Serve comunque alla sonda per la compensazione RH (vedi manuale). 0 = non impostare.
+        "fixed_pressure_hpa": cp.getfloat("compensation", "fixed_pressure_hpa", fallback=0.0),
     }
     return {"bmp388": bmp, "comp": comp}
 
@@ -288,16 +307,22 @@ def write_headers_if_needed(raw_file, avg_file, file_10, file_30, file_60,
     60   min: come MIN ma con MEDIANE aggiunte (calcolate da raw):
               CO2 CO2_std CO2_median T T_std T_median RH RH_std RH_median.
     """
+    # Colonne CO2RAW/CO2RAWUC aggiunte IN CODA (dopo valvola) anche negli
+    # aggregati, così i parser posizionali esistenti restano validi.
+    raw_co2  = "CO2RAW[PPM] CO2RAWUC[PPM]"
+    avg_co2  = "CO2RAW[PPM] CO2RAW_std[PPM] CO2RAWUC[PPM] CO2RAWUC_std[PPM]"
+    med_co2  = ("CO2RAW[PPM] CO2RAW_std[PPM] CO2RAW_median[PPM] "
+                "CO2RAWUC[PPM] CO2RAWUC_std[PPM] CO2RAWUC_median[PPM]")
     if valve_enabled:
-        raw_header  = "#date time CO2[PPM] T[C] RH[%] flag valve_pos valve_label CO2RAW[PPM] CO2RAWUC[PPM]"
-        avg_header  = "#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag valve_pos valve_label"
-        agg_header  = "#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata flag valve_pos valve_label"
-        agg60_header= "#date time CO2[PPM] CO2_std[PPM] CO2_median[PPM] T[C] T_std[C] T_median[C] RH[%] RH_std[%] RH_median[%] ndata flag valve_pos valve_label"
+        raw_header  = f"#date time CO2[PPM] T[C] RH[%] flag valve_pos valve_label {raw_co2}"
+        avg_header  = f"#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag valve_pos valve_label {avg_co2}"
+        agg_header  = f"#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata flag valve_pos valve_label {avg_co2}"
+        agg60_header= f"#date time CO2[PPM] CO2_std[PPM] CO2_median[PPM] T[C] T_std[C] T_median[C] RH[%] RH_std[%] RH_median[%] ndata flag valve_pos valve_label {med_co2}"
     else:
-        raw_header  = "#date time CO2[PPM] T[C] RH[%] flag CO2RAW[PPM] CO2RAWUC[PPM]"
-        avg_header  = "#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag"
-        agg_header  = "#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata flag"
-        agg60_header= "#date time CO2[PPM] CO2_std[PPM] CO2_median[PPM] T[C] T_std[C] T_median[C] RH[%] RH_std[%] RH_median[%] ndata flag"
+        raw_header  = f"#date time CO2[PPM] T[C] RH[%] flag {raw_co2}"
+        avg_header  = f"#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag {avg_co2}"
+        agg_header  = f"#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata flag {avg_co2}"
+        agg60_header= f"#date time CO2[PPM] CO2_std[PPM] CO2_median[PPM] T[C] T_std[C] T_median[C] RH[%] RH_std[%] RH_median[%] ndata flag {med_co2}"
 
     pairs = [
         (raw_file, raw_header),
@@ -375,8 +400,16 @@ def _flush_slot(path, slot_ts, buf, valve_enabled):
         M_r, S_r, _ = _pooled_mean_std(
             [r["rh"]     for r in measure_buf],
             [r["rh_std"] for r in measure_buf], co2_n)
+        # CO2RAW / CO2RAWUC pooled (in coda)
+        M_cr, S_cr, _ = _pooled_mean_std(
+            [r.get("co2raw", MISSING)     for r in measure_buf],
+            [r.get("co2raw_std", MISSING) for r in measure_buf], co2_n)
+        M_cu, S_cu, _ = _pooled_mean_std(
+            [r.get("co2rawuc", MISSING)     for r in measure_buf],
+            [r.get("co2rawuc_std", MISSING) for r in measure_buf], co2_n)
     else:
         M_c = S_c = M_t = S_t = M_r = S_r = MISSING
+        M_cr = S_cr = M_cu = S_cu = MISSING
         N = 0
     flag = "calib" if any(r["flag"] == "calib" for r in buf) else "measure"
     if valve_enabled:
@@ -394,13 +427,15 @@ def _flush_slot(path, slot_ts, buf, valve_enabled):
             f"{ts} {M_c:.2f} {S_c:.2f} "
             f"{M_t:.2f} {S_t:.2f} "
             f"{M_r:.2f} {S_r:.2f} "
-            f"{N} {flag}{valve_suf}\n"
+            f"{N} {flag}{valve_suf} "
+            f"{M_cr:.2f} {S_cr:.2f} {M_cu:.2f} {S_cu:.2f}\n"
         )
 
 
 def _flush_60min_with_median(path, slot_ts, buf_minutes,
                              raw_co2, raw_t, raw_rh, raw_flag,
-                             valve_enabled):
+                             valve_enabled,
+                             raw_co2raw=None, raw_co2rawuc=None):
     """Write a 60-min row computing mean/std/median directly from raw samples.
 
     `raw_co2/_t/_rh` are flat lists of per-sample readings collected
@@ -418,14 +453,21 @@ def _flush_60min_with_median(path, slot_ts, buf_minutes,
     if not raw_co2 and not buf_minutes:
         return
 
+    raw_co2raw   = raw_co2raw   or []
+    raw_co2rawuc = raw_co2rawuc or []
     # Filter raw samples to MEASURE only
     if raw_flag and len(raw_flag) == len(raw_co2):
         m_co2 = [c for c, fl in zip(raw_co2, raw_flag) if fl != "calib"]
         m_t   = [t for t, fl in zip(raw_t,   raw_flag) if fl != "calib"]
         m_rh  = [r for r, fl in zip(raw_rh,  raw_flag) if fl != "calib"]
+        m_cr  = [c for c, fl in zip(raw_co2raw,   raw_flag) if fl != "calib"] \
+                if len(raw_co2raw) == len(raw_flag) else raw_co2raw
+        m_cu  = [c for c, fl in zip(raw_co2rawuc, raw_flag) if fl != "calib"] \
+                if len(raw_co2rawuc) == len(raw_flag) else raw_co2rawuc
     else:
         # No flag list (legacy path): assume all measure
         m_co2, m_t, m_rh = raw_co2, raw_t, raw_rh
+        m_cr, m_cu = raw_co2raw, raw_co2rawuc
 
     def _stats(values):
         clean = [v for v in values if v != MISSING]
@@ -439,6 +481,8 @@ def _flush_60min_with_median(path, slot_ts, buf_minutes,
     M_c, S_c, Med_c = _stats(m_co2)
     M_t, S_t, Med_t = _stats(m_t)
     M_r, S_r, Med_r = _stats(m_rh)
+    M_cr, S_cr, Med_cr = _stats(m_cr)
+    M_cu, S_cu, Med_cu = _stats(m_cu)
     N = sum(1 for v in m_co2 if v != MISSING)
     # Sticky-calib: any minute or any sample = calib
     has_calib_minute = any(r["flag"] == "calib" for r in buf_minutes)
@@ -458,13 +502,20 @@ def _flush_60min_with_median(path, slot_ts, buf_minutes,
             f"{ts} {M_c:.2f} {S_c:.2f} {Med_c:.2f} "
             f"{M_t:.2f} {S_t:.2f} {Med_t:.2f} "
             f"{M_r:.2f} {S_r:.2f} {Med_r:.2f} "
-            f"{N} {flag}{valve_suf}\n"
+            f"{N} {flag}{valve_suf} "
+            f"{M_cr:.2f} {S_cr:.2f} {Med_cr:.2f} "
+            f"{M_cu:.2f} {S_cu:.2f} {Med_cu:.2f}\n"
         )
 
 
 def _make_minute_record(co2, co2_std, n_co2, t, t_std, rh, rh_std,
-                        flag, valve_enabled, valve_status_file, valve_stale_s):
-    """Pack the just-closed minute aggregate into a dict for slot buffers."""
+                        flag, valve_enabled, valve_status_file, valve_stale_s,
+                        co2raw=MISSING, co2raw_std=MISSING,
+                        co2rawuc=MISSING, co2rawuc_std=MISSING):
+    """Pack the just-closed minute aggregate into a dict for slot buffers.
+
+    co2raw/co2rawuc (medie+std del minuto) servono a propagare i 3 valori CO2
+    anche negli aggregati 10/30-min (pooled in _flush_slot)."""
     if valve_enabled:
         try:
             vpos_str, vlabel_str = valve_format_for_raw(
@@ -477,6 +528,8 @@ def _make_minute_record(co2, co2_std, n_co2, t, t_std, rh, rh_std,
         "co2": co2, "co2_std": co2_std, "n": n_co2,
         "t":   t,   "t_std":   t_std,
         "rh":  rh,  "rh_std":  rh_std,
+        "co2raw": co2raw, "co2raw_std": co2raw_std,
+        "co2rawuc": co2rawuc, "co2rawuc_std": co2rawuc_std,
         "flag": flag,
         "valve_pos": vpos_str, "valve_label": vlabel_str,
     }
@@ -638,14 +691,33 @@ def main():
     bmp_dev = None
     if comp_enabled:
         bmp_dev = bmp388.open_bmp388(bus=bmp_cfg["bus"], addr=bmp_cfg["addr"])
-        if not gmp343_comp.stop_run(ser):
+        if not gmp343_comp.stop_run(ser, addr=comp_cfg["addr"]):
             print("WARN: impossibile fermare RUN-mode → fallback RUN-mode (no feed)")
             comp_enabled = False
             ser.write(CMD_START)
         else:
+            # Pressione fissa (es. 1014 hPa) quando non c'è il BMP388: la sonda
+            # la usa per la compensazione RH (richiesta dal manuale) e P.
+            # Volatile (no SAVE) → ri-applicata ad ogni avvio, niente usura EEPROM.
+            if comp_cfg["fixed_pressure_hpa"] > 0:
+                gmp343_comp.set_pressure(ser, comp_cfg["fixed_pressure_hpa"], save=False)
+                print(f"[compensation] pressione FISSA impostata a "
+                      f"{comp_cfg['fixed_pressure_hpa']:.1f} hPa")
             gmp343_comp.enter_poll(ser)
             print(f"[compensation] sonda in POLL-mode (addr {comp_cfg['addr']})")
+            # Pubblica lo stato compensazione per launcher/monitor
+            _COMP_STATUS["comp_active"] = True
+            if comp_cfg["fixed_pressure_hpa"] > 0:
+                _COMP_STATUS["comp_p_hpa"] = round(comp_cfg["fixed_pressure_hpa"], 1)
+                _COMP_STATUS["comp_p_source"] = "fixed"
+            elif bmp_dev is not None:
+                _COMP_STATUS["comp_p_source"] = "bmp388"
     else:
+        # Recupero da eventuale POLL-mode residuo (sonda lasciata in POLL da
+        # un'esecuzione comp precedente terminata senza teardown): in POLL la
+        # sonda ignora R, quindi prima OPEN per riportarla a STOP, poi R.
+        if _HAS_COMP_MODULES:
+            ser.write(b"OPEN 0\r"); time.sleep(0.3); ser.reset_input_buffer()
         ser.write(CMD_START)
 
     _write_status_json(True)  # seriale aperta → strumento connesso
@@ -653,7 +725,10 @@ def main():
     co2_values = []
     t_values   = []
     rh_values  = []
-    _last_co2 = None  # ultimo valore per status.json
+    co2raw_values   = []   # CO2RAW per-minuto (aggregati in coda)
+    co2rawuc_values = []   # CO2RAWUC per-minuto
+    _last_co2 = None  # ultimo valore per status.json (CO2 corretta)
+    _last_co2rawuc = None  # CO2 grezza (non compensata)
     _last_t   = None
     _last_rh  = None
     # Dedup-by-value: il GMP343 emette a 1 Hz ma aggiorna internamente ogni
@@ -683,6 +758,8 @@ def main():
     buf_60_raw_t    = []
     buf_60_raw_rh   = []
     buf_60_raw_flag = []
+    buf_60_raw_co2raw   = []   # CO2RAW per-sample (mediana 60-min)
+    buf_60_raw_co2rawuc = []   # CO2RAWUC per-sample
 
     print(f"Logging started. Raw: {raw_file}, Min: {avg_file}")
     print(f"Aggregates: 10/{file_10}  30/{file_30}  60/{file_60}")
@@ -712,6 +789,7 @@ def main():
         """
         nonlocal buf_10, slot_10, buf_30, slot_30, buf_60, slot_60
         nonlocal buf_60_raw_co2, buf_60_raw_t, buf_60_raw_rh, buf_60_raw_flag
+        nonlocal buf_60_raw_co2raw, buf_60_raw_co2rawuc
         # 10-min
         this_slot10 = _slot_start(current_minute, 10)
         if this_slot10 != slot_10:
@@ -735,12 +813,16 @@ def main():
             _flush_60min_with_median(
                 slot_files[4], slot_60, buf_60,
                 buf_60_raw_co2, buf_60_raw_t, buf_60_raw_rh,
-                buf_60_raw_flag, valve_enabled)
+                buf_60_raw_flag, valve_enabled,
+                raw_co2raw=buf_60_raw_co2raw,
+                raw_co2rawuc=buf_60_raw_co2rawuc)
             buf_60 = []
             buf_60_raw_co2  = []
             buf_60_raw_t    = []
             buf_60_raw_rh   = []
             buf_60_raw_flag = []
+            buf_60_raw_co2raw   = []
+            buf_60_raw_co2rawuc = []
             slot_60 = this_slot60
         buf_60.append(min_record)
 
@@ -761,6 +843,12 @@ def main():
                     rh_pct=(None if prh == MISSING else prh),
                     do_pressure=comp_cfg["feed_pressure"],
                     do_humidity=comp_cfg["feed_humidity"])
+                # Stato per launcher/monitor: RH effettivamente inviata + P live
+                if comp_cfg["feed_humidity"]:
+                    _COMP_STATUS["comp_rh_fed"] = (
+                        None if prh == MISSING else round(prh, 1))
+                if comp_cfg["feed_pressure"] and p_hpa is not None:
+                    _COMP_STATUS["comp_p_hpa"] = round(p_hpa, 1)
                 time.sleep(comp_cfg["poll_interval_s"])
             else:
                 line = ser.readline().decode(errors='ignore').strip()
@@ -815,6 +903,8 @@ def main():
                             co2_values.append(co2)
                             t_values.append(t)
                             rh_values.append(rh)
+                            co2raw_values.append(co2raw)
+                            co2rawuc_values.append(co2rawuc)
                             # Raw buffer per la mediana 60-min (un sample
                             # per chiamata, post-dedup). `flag` per-sample
                             # serve a escludere i sample di calibrazione
@@ -823,6 +913,8 @@ def main():
                             buf_60_raw_t.append(t)
                             buf_60_raw_rh.append(rh)
                             buf_60_raw_flag.append(flag)
+                            buf_60_raw_co2raw.append(co2raw)
+                            buf_60_raw_co2rawuc.append(co2rawuc)
                     else:
                         # Cambio minuto: chiudi il minuto corrente e scrivi
                         # il record _min.raw, poi gli aggregati 10/30/60.
@@ -841,6 +933,8 @@ def main():
                                 co2_avg, co2_std, n_co2 = MISSING, MISSING, 0
                             t_avg,  t_std  = mean_std_missing(t_values)
                             rh_avg, rh_std = mean_std_missing(rh_values)
+                            cr_avg, cr_std = mean_std_missing(co2raw_values)
+                            cu_avg, cu_std = mean_std_missing(co2rawuc_values)
                             flag = _auto_flag(calib_auto, valve_enabled,
                                               valve_status_file, valve_stale_s,
                                               calib_labels, measure_position)
@@ -849,18 +943,23 @@ def main():
                                 f"{ts_avg} {co2_avg:.2f} {co2_std:.2f} "
                                 f"{t_avg:.2f} {t_std:.2f} "
                                 f"{rh_avg:.2f} {rh_std:.2f} "
-                                f"{n_co2} {flag}{valve_suf}\n"
+                                f"{n_co2} {flag}{valve_suf} "
+                                f"{cr_avg:.2f} {cr_std:.2f} {cu_avg:.2f} {cu_std:.2f}\n"
                             )
                         # Aggrega nei bucket 10/30/60 min
                         _on_minute_closed(_make_minute_record(
                             co2_avg, co2_std, n_co2,
                             t_avg, t_std, rh_avg, rh_std,
-                            flag, valve_enabled, valve_status_file, valve_stale_s))
+                            flag, valve_enabled, valve_status_file, valve_stale_s,
+                            co2raw=cr_avg, co2raw_std=cr_std,
+                            co2rawuc=cu_avg, co2rawuc_std=cu_std))
 
                         _last_co2 = co2_avg if co2_avg != MISSING else None
+                        _last_co2rawuc = cu_avg if cu_avg != MISSING else None
                         _last_t   = t_avg   if t_avg   != MISSING else None
                         _last_rh  = rh_avg  if rh_avg  != MISSING else None
-                        _write_status_json(True, _last_co2, _last_t, _last_rh)
+                        _write_status_json(True, _last_co2, _last_t, _last_rh,
+                                           last_co2rawuc=_last_co2rawuc)
                         current_minute = current_timestamp.replace(second=0, microsecond=0)
                         # Avvia il nuovo minuto: includi il campione corrente
                         # solo se non è un duplicato.
@@ -868,10 +967,14 @@ def main():
                             co2_values = []
                             t_values   = []
                             rh_values  = []
+                            co2raw_values   = []
+                            co2rawuc_values = []
                         else:
                             co2_values = [co2]
                             t_values   = [t]
                             rh_values  = [rh]
+                            co2raw_values   = [co2raw]
+                            co2rawuc_values = [co2rawuc]
                             # Il sample corrente appartiene già al nuovo
                             # minuto: includilo anche nel raw buffer 60-min
                             # (se il flush 60 è stato appena eseguito,
@@ -882,6 +985,8 @@ def main():
                             buf_60_raw_t.append(t)
                             buf_60_raw_rh.append(rh)
                             buf_60_raw_flag.append(flag)
+                            buf_60_raw_co2raw.append(co2raw)
+                            buf_60_raw_co2rawuc.append(co2rawuc)
             else:
                 if now.replace(second=0, microsecond=0) != current_minute:
                     files_for_min = _files_for_day(current_minute)
@@ -895,7 +1000,8 @@ def main():
                             f"{ts_avg} {MISSING:.2f} {MISSING:.2f} "
                             f"{MISSING:.2f} {MISSING:.2f} "
                             f"{MISSING:.2f} {MISSING:.2f} "
-                            f"0 {flag}{valve_suf}\n"
+                            f"0 {flag}{valve_suf} "
+                            f"{MISSING:.2f} {MISSING:.2f} {MISSING:.2f} {MISSING:.2f}\n"
                         )
                     # Anche un minuto vuoto va nei buffer: la pooling salta
                     # i MISSING ma il minuto conta come "trascorso" per gli
@@ -908,6 +1014,8 @@ def main():
                     co2_values = []
                     t_values   = []
                     rh_values  = []
+                    co2raw_values   = []
+                    co2rawuc_values = []
         except serial.SerialException as e:
             print(f"Serial communication error: {e}. Retrying in 5 seconds...")
             _write_status_json(False)
@@ -917,13 +1025,14 @@ def main():
                 ser.open()
                 if comp_enabled:
                     # Ripristina POLL-mode dopo la riconnessione
-                    if gmp343_comp.stop_run(ser):
+                    if gmp343_comp.stop_run(ser, addr=comp_cfg["addr"]):
                         gmp343_comp.enter_poll(ser)
                     else:
                         ser.write(CMD_START)
                 else:
                     ser.write(CMD_START)
-                _write_status_json(True, _last_co2, _last_t, _last_rh)
+                _write_status_json(True, _last_co2, _last_t, _last_rh,
+                                   last_co2rawuc=_last_co2rawuc)
             except serial.SerialException as reopen_e:
                 print(f"Unable to reopen serial port: {reopen_e}. Exiting.")
                 _write_status_json(False)

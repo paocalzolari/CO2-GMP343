@@ -305,6 +305,11 @@ def read_file(path: str, metric: str = "mean"):
         return (times, values, stds, counts, flags,
                 ts_t, ts_tstd, ts_rh, ts_rhstd,
                 valve_pos, valve_labels)
+    # Il formato v4 (con MEDIANE) esiste SOLO nel file 60-min. Dal 2026-06-24
+    # i file 1/10/30-min hanno 4 colonne CO2RAW/CO2RAWUC IN CODA che alzano
+    # il conteggio colonne: senza questo gate verrebbero scambiati per v4.
+    # Quindi il ramo median si attiva solo per "_60min." (gli altri restano v3).
+    is_60min_file = "_60min." in os.path.basename(path)
     try:
         with open(path, "r", encoding="utf-8") as fh:
             for raw in fh:
@@ -320,7 +325,7 @@ def read_file(path: str, metric: str = "mean"):
                     # CO2_med T T_std T_med RH RH_std RH_med n flag), v3 ha 7
                     # (CO2_std T T_std RH RH_std n flag), v2 fino a 3.
                     remaining = len(p) - 3
-                    if remaining >= 10:
+                    if is_60min_file and remaining >= 10:
                         # v4: CO2_std CO2_med T T_std T_med RH RH_std RH_med n flag
                         co2_std    = float(p[3])
                         co2_median = float(p[4])
@@ -659,6 +664,14 @@ class GraphWidget(QWidget):
         self.lbl_chart_std.setToolTip("Std dev of the last 1-min average")
         bar.addWidget(self.lbl_chart_std)
 
+        # Compensazione P/RH inviata alla sonda (da status.json, vedi _refresh_comp_label)
+        self.lbl_comp = QLabel("")
+        self.lbl_comp.setStyleSheet("color:#0a7d36;font-weight:bold")
+        self.lbl_comp.setToolTip(
+            "Values sent to the GMP343 for its internal compensation "
+            "(RH from the SHT3X, P fixed or from the BMP388). Temperature is internal to the probe.")
+        bar.addWidget(self.lbl_comp)
+
         bar.addStretch()
         root.addLayout(bar)
 
@@ -853,7 +866,7 @@ class GraphWidget(QWidget):
                       fc="white", ec="#2060c0", lw=1.5, alpha=0.9)
         )
 
-        self.ax.set_ylabel("CO₂  1-min avg (ppm)", fontsize=10)
+        self.ax.set_ylabel("CO₂ corrected (compensated)  1-min avg (ppm)", fontsize=10)
         self.ax.grid(True, linestyle="--", linewidth=0.3, alpha=0.6)
         # xlabel va sul pannello inferiore (ax_t è il bottom visibile)
         self.ax_t.set_xlabel("Ora (UTC)", fontsize=10)
@@ -1320,7 +1333,7 @@ class GraphWidget(QWidget):
             date_str = start.strftime("%Y-%m-%d")
         else:
             date_str = f"{start}  →  {start + timedelta(days=n_days-1)}"
-        self.ax.set_title(f"{site}   CO₂   {date_str}  [{label}]",
+        self.ax.set_title(f"{site}   CO₂ corrected   {date_str}  [{label}]",
                           fontsize=11, fontweight="bold", loc="left")
 
         self.canvas.draw_idle()
@@ -1484,8 +1497,37 @@ class GraphWidget(QWidget):
             self._reload()
         self._refresh_toolbar_readouts()
 
+    def _refresh_comp_label(self):
+        """Aggiorna la dicitura compensazione P/RH inviata alla sonda
+        (legge i campi comp_* da shared/ipc_co2/status.json scritti dal logger)."""
+        if not hasattr(self, "lbl_comp"):
+            return
+        try:
+            sj = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "shared", "ipc_co2", "status.json")
+            with open(sj) as f:
+                d = json.load(f)
+            # CO2 corretta (compensata) vs grezza (CO2RAWUC), con dicitura
+            c = d.get("last_co2_ppm"); g = d.get("last_co2rawuc_ppm")
+            cs = f"{c:.1f}" if isinstance(c, (int, float)) else "—"
+            gs = f"{g:.1f}" if isinstance(g, (int, float)) else "—"
+            co2_s = f"CO₂ corrected {cs} · raw {gs} ppm"
+            if not d.get("comp_active"):
+                self.lbl_comp.setText(f"{co2_s}   ·   Comp: OFF")
+                self.lbl_comp.setStyleSheet("color:#999;font-weight:bold")
+                return
+            rh = d.get("comp_rh_fed"); p = d.get("comp_p_hpa"); src = d.get("comp_p_source")
+            rh_s = f"RH {rh:.1f}%→probe" if isinstance(rh, (int, float)) else "RH —"
+            src_s = {"fixed": "fixed", "bmp388": "BMP388"}.get(src, "")
+            p_s = f"P {p:.1f} hPa ({src_s})" if isinstance(p, (int, float)) else "P —"
+            self.lbl_comp.setText(f"{co2_s}   ·   Comp → {rh_s} · {p_s}")
+            self.lbl_comp.setStyleSheet("color:#0a7d36;font-weight:bold")
+        except Exception:
+            self.lbl_comp.setText("")
+
     def _refresh_toolbar_readouts(self):
         """Aggiorna i tre label "Live / 1-min avg / σ" nella toolbar grafico."""
+        self._refresh_comp_label()
         today = datetime.utcnow().date()
         # Live: ultima riga del .raw (~1 Hz)
         _, live_co2, _, _, _ = read_last_raw_sample(self.cfg, today)
@@ -2748,7 +2790,10 @@ class GMP343Monitor(QMainWindow):
         self._log_rss()   # baseline a t=0
 
         if TRACEMALLOC_ENABLED:
-            tracemalloc.start(25)
+            # Profondità bassa: il log usa solo l'ultima riga del traceback
+            # (compare_to "lineno"), e depth alta rallenta MOLTO la GUI
+            # (cambio tab lentissimo, specie via RustDesk). 4 frame bastano.
+            tracemalloc.start(4)
             self._tm_baseline = tracemalloc.take_snapshot()
             self._tm_timer = QTimer(self)
             self._tm_timer.timeout.connect(self._log_tracemalloc)
@@ -2972,7 +3017,7 @@ class GMP343Monitor(QMainWindow):
         # rule. Left = Live (last sample from .raw, ~1 Hz), Right = 1-min
         # average (last row of _min.raw). σ and n live in the right column
         # because they're statistics OF the 1-min average, not of the live.
-        grp_co2 = QGroupBox("Current Data")
+        grp_co2 = QGroupBox("Current Data — CO₂ corrected (compensated)")
         sz = self.guicfg.getint("fonts","co2_value_size",fallback=24)
         cap_sz = self.guicfg.getint("fonts","caption_size",fallback=14)
 
@@ -3063,7 +3108,7 @@ class GMP343Monitor(QMainWindow):
         grp_co2.setLayout(vco2); vbox.addWidget(grp_co2)
 
         # Daily statistics
-        grp_st = QGroupBox("Daily Statistics")
+        grp_st = QGroupBox("Daily Statistics — CO₂ corrected (compensated)")
         g = QGridLayout(); g.setSpacing(3)
         g.addWidget(QLabel("Min:"),0,0)
         self.lbl_min = QLabel("---"); self.lbl_min.setStyleSheet("color:#090;font-weight:bold;font-size:10px"); g.addWidget(self.lbl_min,0,1)

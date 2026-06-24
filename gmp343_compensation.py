@@ -67,12 +67,23 @@ def _send(ser, cmd, wait=0.6):
     return _drain(ser, wait)
 
 
-def stop_run(ser, tries=6):
+def stop_run(ser, tries=6, addr=0):
     """Ferma il RUN-mode in modo robusto (S ripetuto + verifica via FORM).
 
     Ritorna True se confermato STOP-mode. Necessario perché un singolo `S`
     a volte non aggancia il boundary di riga dello streaming.
+
+    IMPORTANTE: prima invia OPEN <addr>. Se la sonda è stata lasciata in
+    POLL-mode (es. processo comp precedente ucciso senza teardown), in POLL
+    essa IGNORA sia `S` che `R`: solo OPEN/SEND/X* funzionano. OPEN la riporta
+    a STOP da POLL (ed è innocuo in STOP/RUN). Senza questo, stop_run e il
+    fallback RUN non recuperano mai → nessun dato.
     """
+    ser.reset_input_buffer()
+    ser.write(f"OPEN {addr}\r".encode())
+    time.sleep(0.3)
+    ser.write(b"\r")
+    _drain(ser, 0.8)
     for _ in range(tries):
         ser.reset_input_buffer()
         ser.write(b"S\r")
@@ -129,13 +140,30 @@ def feed_and_send(ser, addr, p_hpa=None, rh_pct=None,
     return _send(ser, f"SEND {addr}", wait).strip()
 
 
+def set_pressure(ser, p_hpa, save=False):
+    """In STOP-mode, imposta la pressione di lavoro (comando 'P', range 700-1300).
+
+    Usata per la **pressione fissa** quando non c'è un sensore di pressione:
+    la GMP343 la usa sia per la compensazione P (se PC ON) sia per quella di
+    umidità (RHC la richiede comunque). save=True persiste in EEPROM (sconsigliato
+    se chiamata ad ogni avvio: usura). save=False = volatile, va ri-applicata
+    ad ogni avvio (ciò che fa il logger).
+    """
+    if p_hpa is None or not (P_MIN <= p_hpa <= P_MAX):
+        return ""
+    out = _send(ser, f"P {p_hpa:.1f}", 1.0)
+    if save:
+        out += _send(ser, "SAVE", 2.0)
+    return out
+
+
 def restore_pressure(ser, p_hpa=DEFAULT_P_HPA):
     """In STOP-mode, riporta la pressione di lavoro al default (senza SAVE).
 
     Da chiamare in teardown dopo exit_poll(), così la compensazione non resta
     agganciata all'ultimo valore inviato in poll-mode.
     """
-    return _send(ser, f"P {p_hpa:.1f}", 1.0)
+    return set_pressure(ser, p_hpa, save=False)
 
 
 if __name__ == "__main__":
