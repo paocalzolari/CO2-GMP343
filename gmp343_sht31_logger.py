@@ -707,11 +707,12 @@ def main():
             print(f"[compensation] sonda in POLL-mode (addr {comp_cfg['addr']})")
             # Pubblica lo stato compensazione per launcher/monitor
             _COMP_STATUS["comp_active"] = True
-            if comp_cfg["fixed_pressure_hpa"] > 0:
+            if comp_cfg["feed_pressure"] and bmp_dev is not None:
+                # P live dal BMP388 (aggiornata ad ogni ciclo nel loop)
+                _COMP_STATUS["comp_p_source"] = "bmp388"
+            elif comp_cfg["fixed_pressure_hpa"] > 0:
                 _COMP_STATUS["comp_p_hpa"] = round(comp_cfg["fixed_pressure_hpa"], 1)
                 _COMP_STATUS["comp_p_source"] = "fixed"
-            elif bmp_dev is not None:
-                _COMP_STATUS["comp_p_source"] = "bmp388"
     else:
         # Recupero da eventuale POLL-mode residuo (sonda lasciata in POLL da
         # un'esecuzione comp precedente terminata senza teardown): in POLL la
