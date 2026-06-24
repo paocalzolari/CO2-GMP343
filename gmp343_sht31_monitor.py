@@ -310,11 +310,12 @@ def read_file(path: str, metric: str = "mean"):
     """
     times, values, stds, counts, flags = [], [], [], [], []
     ts_t, ts_tstd, ts_rh, ts_rhstd = [], [], [], []
+    ts_p = []
     valve_pos, valve_labels = [], []
     has_valve_cols = False
     if not path or not os.path.exists(path):
         return (times, values, stds, counts, flags,
-                ts_t, ts_tstd, ts_rh, ts_rhstd,
+                ts_t, ts_tstd, ts_rh, ts_rhstd, ts_p,
                 valve_pos, valve_labels)
     # Il formato v4 (con MEDIANE) esiste SOLO nel file 60-min. Dal 2026-06-24
     # i file 1/10/30-min hanno 4 colonne CO2RAW/CO2RAWUC IN CODA che alzano
@@ -382,6 +383,13 @@ def read_file(path: str, metric: str = "mean"):
                     else:
                         vpos = -1
                         vlab = "-"
+                    # P (BMP388): formato v6 in coda. _min/10/30 finiscono con
+                    # "… P P_std" → P=p[-2]; 60-min con "… P P_std P_median" →
+                    # P=p[-3]. Guard: MISSING se non parsabile (righe pre-v6).
+                    try:
+                        p_val = float(p[-3] if is_60min_file else p[-2])
+                    except (ValueError, IndexError):
+                        p_val = MISSING
                     times.append(dt)
                     values.append(co2)
                     stds.append(co2_std)
@@ -391,6 +399,7 @@ def read_file(path: str, metric: str = "mean"):
                     ts_tstd.append(t_std)
                     ts_rh.append(rh_val)
                     ts_rhstd.append(rh_std)
+                    ts_p.append(p_val)
                     valve_pos.append(vpos)
                     valve_labels.append(vlab)
                 except ValueError:
@@ -400,7 +409,7 @@ def read_file(path: str, metric: str = "mean"):
     if not has_valve_cols:
         valve_pos, valve_labels = [], []
     return (times, values, stds, counts, flags,
-            ts_t, ts_tstd, ts_rh, ts_rhstd,
+            ts_t, ts_tstd, ts_rh, ts_rhstd, ts_p,
             valve_pos, valve_labels)
 
 
@@ -419,11 +428,12 @@ def load_period(cfg: configparser.ConfigParser,
     """
     all_t, all_v, all_s, all_c, all_f = [], [], [], [], []
     all_tt, all_tstd, all_rh, all_rhstd = [], [], [], []
+    all_tp = []
     all_vp, all_vl = [], []
     n_with_valve = 0
     for i in range(n_days):
         d = start + timedelta(days=i)
-        t, v, s, c, f, tt, tstd, rh, rhstd, vp, vl = read_file(
+        t, v, s, c, f, tt, tstd, rh, rhstd, tp, vp, vl = read_file(
             build_filename(cfg, d, suffix), metric=metric)
         all_t.extend(t)
         all_v.extend(v)
@@ -434,6 +444,7 @@ def load_period(cfg: configparser.ConfigParser,
         all_tstd.extend(tstd)
         all_rh.extend(rh)
         all_rhstd.extend(rhstd)
+        all_tp.extend(tp)
         if vp:
             all_vp.extend(vp)
             all_vl.extend(vl)
@@ -453,6 +464,7 @@ def load_period(cfg: configparser.ConfigParser,
     tstd    = np.array(all_tstd,  dtype=float)[idx]
     rh_arr  = np.array(all_rh,    dtype=float)[idx]
     rhstd   = np.array(all_rhstd, dtype=float)[idx]
+    p_arr   = np.array(all_tp,    dtype=float)[idx] if all_tp else np.array([], dtype=float)
     if n_with_valve > 0:
         valve_pos    = np.array(all_vp, dtype=int)[idx]
         valve_labels = np.array(all_vl)[idx]
@@ -460,7 +472,7 @@ def load_period(cfg: configparser.ConfigParser,
         valve_pos    = np.array([], dtype=int)
         valve_labels = np.array([], dtype=str)
     return (times, values, stds, counts, flags,
-            t_arr, tstd, rh_arr, rhstd,
+            t_arr, tstd, rh_arr, rhstd, p_arr,
             valve_pos, valve_labels)
 
 
@@ -788,15 +800,30 @@ class GraphWidget(QWidget):
         # ricreati a ogni reload e ripuliti qui sotto.
         self._overlay_lines = []
 
-        # 2 subplots con asse X condiviso: CO2 (grande sopra), T+RH (piccolo sotto)
-        gs = self.fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.08)
+        # 3 subplots con asse X condiviso: CO2 (grande sopra), P (medio),
+        # T+RH (piccolo sotto). Asse tempo sincronizzato (sharex) su tutti.
+        gs = self.fig.add_gridspec(3, 1, height_ratios=[3, 1, 1], hspace=0.08)
         self.ax    = self.fig.add_subplot(gs[0])
-        self.ax_t  = self.fig.add_subplot(gs[1], sharex=self.ax)
+        self.ax_p  = self.fig.add_subplot(gs[1], sharex=self.ax)   # P (BMP388)
+        self.ax_t  = self.fig.add_subplot(gs[2], sharex=self.ax)
         # Asse Y secondario (a destra) per RH sul pannello di T
         self.ax_rh = self.ax_t.twinx()
 
-        # Nasconde i tick label X sul pannello CO2 (ax_t è l'asse X attivo)
+        # Tick label X solo sul pannello in basso (ax_t): CO2 e P li nascondono
         self.ax.tick_params(labelbottom=False)
+        self.ax_p.tick_params(labelbottom=False)
+
+        # ── P (pannello pressione, tra CO2 e T/RH) ────────────────────────
+        self.line_p, = self.ax_p.plot(
+            [], [], "-", linewidth=self._trh_line_width,
+            color="#5030a0", zorder=2, label="P"
+        )
+        self.sc_p = self.ax_p.scatter(
+            [], [], s=self._trh_point_size, color="#5030a0", zorder=3, label="P"
+        )
+        self.ax_p.set_ylabel("P (hPa)", fontsize=9, color="#5030a0")
+        self.ax_p.tick_params(axis="y", labelcolor="#5030a0", labelsize=8)
+        self.ax_p.grid(True, linestyle="--", linewidth=0.3, alpha=0.6)
 
         # ── CO2 (pannello principale) ─────────────────────────────────────
         self.line, = self.ax.plot(
@@ -1030,10 +1057,12 @@ class GraphWidget(QWidget):
             self.line.set_data([], [])
             self.line_t.set_data([], [])
             self.line_rh.set_data([], [])
+            self.line_p.set_data([], [])
             self.sc_measure.set_offsets(np.empty((0, 2)))
             self.sc_calib.set_offsets(np.empty((0, 2)))
             self.sc_t.set_offsets(np.empty((0, 2)))
             self.sc_rh.set_offsets(np.empty((0, 2)))
+            self.sc_p.set_offsets(np.empty((0, 2)))
             self.flag_label.set_text("MEASURE")
             self.flag_label.set_color("#2060c0")
             self.flag_label.get_bbox_patch().set_edgecolor("#2060c0")
@@ -1044,25 +1073,34 @@ class GraphWidget(QWidget):
             return
 
         (times, values, stds, counts, flags,
-         t_arr, t_std_arr, rh_arr, rh_std_arr,
+         t_arr, t_std_arr, rh_arr, rh_std_arr, p_arr,
          valve_pos, valve_labels) = result
         xt = mdates.date2num(times)
         # Sostituisci MISSING con NaN per i plot (break nella linea, no Y axis esteso)
         values_plot = np.where(values == MISSING, np.nan, values)
         t_plot      = np.where(t_arr  == MISSING, np.nan, t_arr)
         rh_plot     = np.where(rh_arr == MISSING, np.nan, rh_arr)
+        # P può essere array vuoto (file pre-v6 o senza P): allinea a NaN.
+        if p_arr.size == values.size:
+            p_plot = np.where(p_arr == MISSING, np.nan, p_arr)
+        else:
+            p_arr  = np.full(values.size, MISSING)
+            p_plot = np.full(values.size, np.nan)
         # Salva per accesso dal tooltip
         self._t_plot  = t_plot
         self._rh_plot = rh_plot
+        self._p_plot  = p_plot
 
         # ── Linee continue ────────────────────────────────────────────────
         self.line.set_data(xt, values_plot)
         self.line_t.set_data(xt, t_plot)
         self.line_rh.set_data(xt, rh_plot)
+        self.line_p.set_data(xt, p_plot)
 
-        # ── Scatter punti T e RH (filtra MISSING) ─────────────────────────
+        # ── Scatter punti T, RH e P (filtra MISSING) ──────────────────────
         mask_t  = t_arr  != MISSING
         mask_rh = rh_arr != MISSING
+        mask_p  = p_arr  != MISSING
         if mask_t.any():
             self.sc_t.set_offsets(np.column_stack([xt[mask_t], t_arr[mask_t]]))
         else:
@@ -1071,6 +1109,10 @@ class GraphWidget(QWidget):
             self.sc_rh.set_offsets(np.column_stack([xt[mask_rh], rh_arr[mask_rh]]))
         else:
             self.sc_rh.set_offsets(np.empty((0, 2)))
+        if mask_p.any():
+            self.sc_p.set_offsets(np.column_stack([xt[mask_p], p_arr[mask_p]]))
+        else:
+            self.sc_p.set_offsets(np.empty((0, 2)))
 
         # ── Applica styling per-window al PRIMARY (DOPO set_data/set_offsets).
         # Necessario in questo ordine perché set_facecolor/set_edgecolor su
@@ -1290,7 +1332,7 @@ class GraphWidget(QWidget):
                                 suffix=suf_w, metric=met_w)
             if res_w is None:
                 continue
-            (t_w, v_w, _, _, _, tt_w, _, rh_w, _, _, _) = res_w
+            (t_w, v_w, _, _, _, tt_w, _, rh_w, _, _, _, _) = res_w
             xt_w = mdates.date2num(t_w)
             v_plot  = np.where(v_w  == MISSING, np.nan, v_w)
             tt_plot = np.where(tt_w == MISSING, np.nan, tt_w)
@@ -1336,6 +1378,7 @@ class GraphWidget(QWidget):
         # T e RH: sempre autoscale con min_range ridotto, ignorano lo zoom CO2
         self.ax_t.set_ylim(*smart_ylim(t_arr,   min_range=2.0,  fallback=(15.0, 30.0)))
         self.ax_rh.set_ylim(*smart_ylim(rh_arr, min_range=10.0, fallback=(0.0, 100.0)))
+        self.ax_p.set_ylim(*smart_ylim(p_arr,   min_range=2.0,  fallback=(980.0, 1040.0)))
 
         # ── Titolo e label flag sulla stessa riga ─────────────────────────
         site  = self.cfg.get("location", "name", fallback="")
@@ -3373,7 +3416,7 @@ class GMP343Monitor(QMainWindow):
             return
 
         (times, values, stds, counts, flags,
-         t_arr, t_std_arr, rh_arr, rh_std_arr,
+         t_arr, t_std_arr, rh_arr, rh_std_arr, p_arr,
          valve_pos, valve_labels) = result
         last_co2  = float(values[-1])
         last_std  = float(stds[-1])
