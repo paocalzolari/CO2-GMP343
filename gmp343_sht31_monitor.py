@@ -1279,7 +1279,18 @@ class GraphWidget(QWidget):
         if want_valve:
             # Rileva i run contigui di stessa posizione (trascura -1 = sconosciuta)
             from matplotlib import cm as _cm
+            import re as _re
             cmap = _cm.get_cmap("tab20")
+            # Passo nominale della finestra primaria in giorni (es. "1m"→1 min,
+            # "60m-med"→60 min). Serve a (a) estendere la striscia di mezzo passo
+            # e (b) SPEZZARE un run quando c'è un buco temporale nei dati: senza
+            # questo controllo, se la valvola è nella stessa posizione prima e
+            # dopo un'interruzione di acquisizione, l'axvspan unirebbe due
+            # istanti distanti ore in un'unica fascia (bug "stati uniti").
+            _m_step = _re.match(r"(\d+)", primary_w)
+            step_min = int(_m_step.group(1)) if _m_step else 1
+            step_day = step_min / (60.0 * 24.0)
+            gap_thresh = step_day * 1.5   # tolleranza: oltre 1.5× il passo = buco
             i = 0
             while i < len(valve_pos):
                 cur_pos = int(valve_pos[i])
@@ -1287,12 +1298,13 @@ class GraphWidget(QWidget):
                     i += 1
                     continue
                 j = i + 1
-                while j < len(valve_pos) and int(valve_pos[j]) == cur_pos:
+                while (j < len(valve_pos) and int(valve_pos[j]) == cur_pos
+                       and (xt[j] - xt[j-1]) <= gap_thresh):
                     j += 1
                 x0 = xt[i]
                 x1 = xt[j-1] if j-1 < len(xt) else xt[-1]
-                # estendi x1 di mezzo minuto (medie 1-min) per coprire l'intervallo
-                x1_ext = x1 + (1.0 / (60 * 24)) * 0.5
+                # estendi x1 di mezzo passo per coprire l'intervallo del campione
+                x1_ext = x1 + step_day * 0.5
                 color = cmap((cur_pos - 1) % 20)
                 patch = self.ax.axvspan(
                     x0, x1_ext, ymin=0.0, ymax=0.04,
