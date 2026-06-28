@@ -1274,35 +1274,50 @@ class GraphWidget(QWidget):
         # Attiva solo se abbiamo dati valvola (integrazione valve-scheduler)
         # E la checkbox è spuntata. Ogni run contiguo di stessa posizione
         # diventa un axvspan colorato (cmap tab20 → 20 posizioni distinguibili).
-        want_valve = (hasattr(self, "chk_valve") and self.chk_valve.isChecked()
-                      and valve_pos.size == len(times))
-        if want_valve:
+        # La striscia rappresenta lo STATO FISICO della valvola, che NON
+        # dipende dalle medie: la sorgiamo SEMPRE dai dati 1-min (suffix
+        # "min"), indipendentemente dalla finestra di averaging selezionata.
+        # Così i periodi di calibrazione restano visibili anche quando 1m non
+        # è tra le finestre attive (negli aggregati i minuti calib sono esclusi
+        # dalle medie e i PUNTI dati spariscono, ma la striscia deve restare).
+        vp_s = np.array([], dtype=int)
+        if hasattr(self, "chk_valve") and self.chk_valve.isChecked():
+            _vres = load_period(self.cfg, start, n_days,
+                                suffix="min", metric="mean")
+            if (_vres is not None and _vres[10].size == len(_vres[0])
+                    and _vres[10].size > 0):
+                # Sorgente preferita: valvola a 1-min (confini precisi)
+                _vt = _vres[0]; vp_s = _vres[10]; vl_s = _vres[11]
+                xt_s = mdates.date2num(_vt)
+                step_day = 1.0 / (60.0 * 24.0)        # passo 1-min fisso
+            elif valve_pos.size == len(times) and valve_pos.size > 0:
+                # Fallback: dati della finestra primaria (se i .raw 1-min
+                # mancano per il periodo). Passo = quello della finestra.
+                import re as _re
+                vp_s = valve_pos; vl_s = valve_labels; xt_s = xt
+                _m_step = _re.match(r"(\d+)", primary_w)
+                step_day = (int(_m_step.group(1)) if _m_step else 1) / (60.0 * 24.0)
+        if vp_s.size > 0:
             # Rileva i run contigui di stessa posizione (trascura -1 = sconosciuta)
             from matplotlib import cm as _cm
-            import re as _re
             cmap = _cm.get_cmap("tab20")
-            # Passo nominale della finestra primaria in giorni (es. "1m"→1 min,
-            # "60m-med"→60 min). Serve a (a) estendere la striscia di mezzo passo
-            # e (b) SPEZZARE un run quando c'è un buco temporale nei dati: senza
-            # questo controllo, se la valvola è nella stessa posizione prima e
-            # dopo un'interruzione di acquisizione, l'axvspan unirebbe due
-            # istanti distanti ore in un'unica fascia (bug "stati uniti").
-            _m_step = _re.match(r"(\d+)", primary_w)
-            step_min = int(_m_step.group(1)) if _m_step else 1
-            step_day = step_min / (60.0 * 24.0)
+            # gap_thresh SPEZZA un run quando c'è un buco temporale: senza, se
+            # la valvola è nella stessa posizione prima e dopo un'interruzione
+            # di acquisizione, l'axvspan unirebbe due istanti distanti ore in
+            # un'unica fascia (bug "stati uniti").
             gap_thresh = step_day * 1.5   # tolleranza: oltre 1.5× il passo = buco
             i = 0
-            while i < len(valve_pos):
-                cur_pos = int(valve_pos[i])
+            while i < len(vp_s):
+                cur_pos = int(vp_s[i])
                 if cur_pos < 1:
                     i += 1
                     continue
                 j = i + 1
-                while (j < len(valve_pos) and int(valve_pos[j]) == cur_pos
-                       and (xt[j] - xt[j-1]) <= gap_thresh):
+                while (j < len(vp_s) and int(vp_s[j]) == cur_pos
+                       and (xt_s[j] - xt_s[j-1]) <= gap_thresh):
                     j += 1
-                x0 = xt[i]
-                x1 = xt[j-1] if j-1 < len(xt) else xt[-1]
+                x0 = xt_s[i]
+                x1 = xt_s[j-1] if j-1 < len(xt_s) else xt_s[-1]
                 # estendi x1 di mezzo passo per coprire l'intervallo del campione
                 x1_ext = x1 + step_day * 0.5
                 color = cmap((cur_pos - 1) % 20)
