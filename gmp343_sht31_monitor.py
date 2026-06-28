@@ -1317,11 +1317,13 @@ class GraphWidget(QWidget):
                 except Exception:
                     width_frac = 1.0
                 if width_frac > 0.03:
-                    lab = str(valve_labels[i]) if valve_labels.size > i else ""
-                    if lab and lab != "-":
-                        text = f"{cur_pos} {lab}"
-                    else:
-                        text = str(cur_pos)
+                    # SOLO il numero di posizione: il riquadro colorato (bbox)
+                    # del testo è centrato sullo span e, con un testo lungo
+                    # (es. "10 pos2-CO2-calib-cylinder-LL73782"), sborderebbe di
+                    # ore oltre l'estensione reale della valvola, sovrapponendosi
+                    # ai periodi adiacenti e facendo SEMBRARE fuse due calib
+                    # distinte. Il nome completo resta nella legenda (pos N (...)).
+                    text = str(cur_pos)
                     txt = self.ax.text(
                         (x0 + x1_ext) / 2.0, 0.02, text,
                         transform=self.ax.get_xaxis_transform(),
