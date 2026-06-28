@@ -114,8 +114,15 @@ UPDATE_MS       = 5000   # refresh timer (ms)
 # ── Diagnostica memoria ──────────────────────────────────────────────────────
 # RSS sempre loggato (costo trascurabile) → /tmp/co2-monitor-rss.log
 # tracemalloc opt-in via env: MONITOR_TRACEMALLOC=1 python3 gmp343_sht31_monitor.py
-RSS_LOG_INTERVAL_MS     = 300_000     # 5 min
-TRACEMALLOC_INTERVAL_MS = 1_800_000   # 30 min
+RSS_LOG_INTERVAL_MS     = int(os.environ.get(
+    "MONITOR_RSS_INTERVAL_MS", "300000"))   # 5 min default (override per test)
+# Intervallo snapshot tracemalloc: default 30 min, override per diagnosi
+# rapide con MONITOR_TRACEMALLOC_INTERVAL_MS (es. 120000 = 2 min).
+TRACEMALLOC_INTERVAL_MS = int(os.environ.get(
+    "MONITOR_TRACEMALLOC_INTERVAL_MS", "1800000"))   # 30 min default
+# Profondità traceback: default 4 (basso = GUI reattiva); override per
+# avere lo stack completo con MONITOR_TRACEMALLOC_DEPTH.
+TRACEMALLOC_DEPTH       = int(os.environ.get("MONITOR_TRACEMALLOC_DEPTH", "4"))
 RSS_LOG_FILE            = "/tmp/co2-monitor-rss.log"
 TRACEMALLOC_LOG_FILE    = "/tmp/co2-monitor-tracemalloc.log"
 TRACEMALLOC_ENABLED     = os.environ.get("MONITOR_TRACEMALLOC", "").lower() in (
@@ -1028,18 +1035,34 @@ class GraphWidget(QWidget):
             self._pos_legend = None
 
         # ── Pulisci errorbar precedenti (CO₂, T, RH) ─────────────────────
+        # LEAK FIX (2026-06-28): errorbar() registra un ErrorbarContainer in
+        # ax.containers. Rimuovere SOLO i figli (line/caps/barlinecols) e fare
+        # self._errorbar=None NON toglie il container dalla lista: resta vivo e
+        # trattiene i barlinecols (LineCollection con Path/MaskedArray dei dati)
+        # → crescita RAM ~MB/tick (3 errorbar × ogni 5s, ax.containers +3/tick).
+        # In matplotlib 3.6 Container.remove() NON stacca da ax.containers, quindi
+        # NON ci si affida a eb.remove(): si rimuovono i figli E si filtra il
+        # container da ax.containers PER IDENTITÀ (== su tuple matcherebbe per
+        # contenuto). Questo azzera la crescita di ax.containers.
         def _remove_eb(eb):
             if eb is None:
                 return
             try:
-                if eb[0] is not None:
-                    eb[0].remove()
-                for cap in eb[1]:
-                    cap.remove()
-                for bar in eb[2]:
-                    bar.remove()
+                children = [eb[0]] if eb[0] is not None else []
+                children += list(eb[1]) + list(eb[2])   # caplines + barlinecols
+                for art in children:
+                    try:
+                        art.remove()
+                    except Exception:
+                        pass
             except Exception:
                 pass
+            # Stacca SEMPRE il container da ax.containers (per identità)
+            for axx in (self.ax, self.ax_t, self.ax_rh):
+                try:
+                    axx.containers[:] = [c for c in axx.containers if c is not eb]
+                except Exception:
+                    pass
 
         _remove_eb(self._errorbar);    self._errorbar = None
         _remove_eb(self._errorbar_t);  self._errorbar_t = None
@@ -2887,7 +2910,7 @@ class GMP343Monitor(QMainWindow):
             # Profondità bassa: il log usa solo l'ultima riga del traceback
             # (compare_to "lineno"), e depth alta rallenta MOLTO la GUI
             # (cambio tab lentissimo, specie via RustDesk). 4 frame bastano.
-            tracemalloc.start(4)
+            tracemalloc.start(TRACEMALLOC_DEPTH)
             self._tm_baseline = tracemalloc.take_snapshot()
             self._tm_timer = QTimer(self)
             self._tm_timer.timeout.connect(self._log_tracemalloc)
@@ -2908,11 +2931,22 @@ class GMP343Monitor(QMainWindow):
 
     def _log_rss(self):
         rss_mb = self._read_self_rss_mb()
+        # Conteggio artisti matplotlib: se crescono nel tempo → leak di artisti
+        # non rilasciati (diagnostica leak RAM, 2026-06-28).
+        art = ""
+        try:
+            g = self.graph
+            art = (f"  cont={len(g.ax.containers)+len(g.ax_t.containers)+len(g.ax_rh.containers)}"
+                   f" coll={len(g.ax.collections)+len(g.ax_t.collections)+len(g.ax_rh.collections)}"
+                   f" lines={len(g.ax.lines)+len(g.ax_t.lines)+len(g.ax_rh.lines)}"
+                   f" texts={len(g.ax.texts)} patches={len(g.ax.patches)}")
+        except Exception:
+            pass
         try:
             with open(RSS_LOG_FILE, "a") as f:
                 f.write(f"{datetime.now().isoformat(timespec='seconds')}  "
                         f"pid={os.getpid()}  rss={rss_mb:7.1f} MB  "
-                        f"tick={self._tick_count}\n")
+                        f"tick={self._tick_count}{art}\n")
         except OSError:
             pass
 
@@ -2932,6 +2966,15 @@ class GMP343Monitor(QMainWindow):
                     where = stat.traceback.format()[-1].strip()
                     f.write(f"  +{stat.size_diff/1024:9.1f} kB  "
                             f"+{stat.count_diff:6d} alloc   {where}\n")
+                # Stack completo dei top-3 grower: il sito che CHIAMA il leaker
+                # è quello che ci interessa (non l'ultima riga in libreria).
+                diff_tb = snap.compare_to(self._tm_baseline, "traceback")
+                f.write("  --- full traceback top-3 ---\n")
+                for stat in diff_tb[:3]:
+                    f.write(f"  +{stat.size_diff/1024:9.1f} kB  "
+                            f"+{stat.count_diff:6d} alloc:\n")
+                    for ln in stat.traceback.format():
+                        f.write(f"      {ln}\n")
         except Exception as e:
             print(f"tracemalloc log error: {e}",
                   file=sys.stderr, flush=True)
