@@ -811,6 +811,14 @@ def main():
     fvol_values     = []   # flusso VOLUMETRICO (Lpm) per-minuto (TSI, calcolato)
     _last_fmass = None     # ultimo flusso massa per status.json (live)
     _last_fvol  = None     # ultimo flusso volumetrico per status.json (live)
+    # Circuit-breaker TSI: se il flussimetro è muto, la lettura costa fino a
+    # ~2s/ciclo (2 tentativi × timeout) e RALLENTEREBBE il campionamento CO2
+    # (che è il MUST). Dopo TSI_FAIL_MAX letture fallite consecutive si sospende
+    # la lettura per TSI_COOLDOWN_S secondi e si ri-sonda una volta.
+    TSI_FAIL_MAX  = 5
+    TSI_COOLDOWN_S = 60.0
+    _tsi_fails = 0
+    _tsi_skip_until = 0.0
     _last_co2 = None  # ultimo valore per status.json (CO2 corretta)
     _last_co2rawuc = None  # CO2 grezza (non compensata)
     _last_t   = None
@@ -962,9 +970,20 @@ def main():
             #             (kPa = hPa/10). Senza P valida → volumetrico MISSING.
             flow_mass = MISSING
             flow_vol  = MISSING
-            if tsi_dev is not None:
+            # Circuit-breaker: leggi solo se non in cooldown (protegge la
+            # cadenza CO2 quando il TSI è muto/scollegato).
+            if tsi_dev is not None and time.monotonic() >= _tsi_skip_until:
                 fm, tg = tsi4140.read_flow_temp(tsi_dev)
-                if fm != MISSING:
+                if fm == MISSING:
+                    _tsi_fails += 1
+                    if _tsi_fails >= TSI_FAIL_MAX:
+                        _tsi_skip_until = time.monotonic() + TSI_COOLDOWN_S
+                        _tsi_fails = 0
+                        print(f"WARN: TSI muto ({TSI_FAIL_MAX} letture KO) → "
+                              f"sospendo il flusso per {TSI_COOLDOWN_S:.0f}s",
+                              flush=True)
+                else:
+                    _tsi_fails = 0
                     flow_mass = fm
                     # P per il volumetrico: BMP388 live se disponibile,
                     # altrimenti la pressione fissa di config (approssimata ma
