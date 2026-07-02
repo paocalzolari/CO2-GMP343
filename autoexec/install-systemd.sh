@@ -35,6 +35,10 @@ echo "==> Copio $UNIT_SRC -> $UNIT_DST"
 cp "$UNIT_SRC" "$UNIT_DST"
 chmod 644 "$UNIT_DST"
 
+echo "==> installo regole udev (serial stabili: gmp343/vici/tsi4140)"
+cp "$(dirname "$0")"/udev/*.rules /etc/udev/rules.d/ 2>/dev/null || true
+udevadm control --reload-rules && udevadm trigger --subsystem-match=tty || true
+
 echo "==> systemctl daemon-reload"
 systemctl daemon-reload
 

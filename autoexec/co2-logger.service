@@ -13,15 +13,18 @@ StartLimitIntervalSec=600
 StartLimitBurst=10
 
 [Service]
-Type=simple
+Type=notify
 User=misura
 Group=dialout
 WorkingDirectory=/home/misura/programs/CO2
 ExecStart=/usr/bin/python3 /home/misura/programs/CO2/gmp343_sht31_logger.py
 
-# Watchdog: riavvia sempre, anche su exit pulito (un logger non deve mai uscire)
+# Watchdog di LIVENESS: il logger invia READY=1/WATCHDOG=1 via sd_notify.
+# systemd riavvia su HANG (nessun ping entro WatchdogSec) E su exit.
 Restart=always
 RestartSec=10
+WatchdogSec=60
+NotifyAccess=main
 
 # Logging via journald — guarda i log con: journalctl -u co2-logger -f
 StandardOutput=journal

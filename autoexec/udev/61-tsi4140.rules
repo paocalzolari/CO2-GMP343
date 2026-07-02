@@ -1,0 +1,2 @@
+# TSI 4140 flowmeter — FT4232H Quad RS232, porta A (interface 00), serial FT5NP7I3
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6011", ATTRS{serial}=="FT5NP7I3", ENV{ID_USB_INTERFACE_NUM}=="00", SYMLINK+="tsi4140", GROUP="dialout", MODE="0660"
