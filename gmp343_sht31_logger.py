@@ -163,6 +163,13 @@ MISSING = -999.99
 # ── SHT31-D (T/RH via I2C) ────────────────────────────────────────────────────
 SHT31_BUS      = 1          # /dev/i2c-1 sul Raspberry Pi
 SHT31_ADDR     = 0x44       # default (ADDR pin low)
+# Correzione RH opzionale (DISATTIVA di default): RH_corr = gain*RH + offset,
+# clampata a [0,100]. Impostabile da [rh_correction] in sensors.ini. Applicata
+# UNA VOLTA in read_sht31 → vale sia per il valore loggato sia per il feed di
+# compensazione (XRH) alla sonda. Da tarare contro un riferimento, NON a occhio.
+RH_CORR_ENABLED = False
+RH_CORR_OFFSET  = 0.0
+RH_CORR_GAIN    = 1.0
 SHT31_CMD_MSB  = 0x24       # single-shot high repeatability, clock-stretch disabled
 SHT31_CMD_LSB  = 0x00
 SHT31_WAIT_S   = 0.02       # high-rep misura ~15 ms, 20 ms è conservativo
@@ -202,6 +209,10 @@ def read_sht31(bus):
         rh_raw = (r[3] << 8) | r[4]
         t  = -45.0 + 175.0 * (t_raw  / 65535.0)
         rh = 100.0 * (rh_raw / 65535.0)
+        # Correzione RH opzionale (offset/gain), clampata a [0,100].
+        if RH_CORR_ENABLED:
+            rh = RH_CORR_GAIN * rh + RH_CORR_OFFSET
+            rh = max(0.0, min(100.0, rh))
         return t, rh
     except Exception as e:
         print(f"WARN: read_sht31 fallita: {e}")
@@ -225,6 +236,7 @@ def load_sensors_config():
       }
     """
     global SHT31_BUS, SHT31_ADDR
+    global RH_CORR_ENABLED, RH_CORR_OFFSET, RH_CORR_GAIN
     cp = configparser.ConfigParser()
     cp.read(SENSORS_INI)
 
@@ -238,6 +250,15 @@ def load_sensors_config():
     if cp.has_section("sht31_a") and cp.getboolean("sht31_a", "enabled", fallback=True):
         SHT31_BUS  = cp.getint("sht31_a", "bus",  fallback=SHT31_BUS)
         SHT31_ADDR = _addr("sht31_a", "addr", SHT31_ADDR)
+
+    # Correzione RH opzionale (offset/gain) — DISATTIVA di default
+    RH_CORR_ENABLED = cp.getboolean("rh_correction", "enabled", fallback=False)
+    RH_CORR_OFFSET  = cp.getfloat("rh_correction", "offset", fallback=0.0)
+    RH_CORR_GAIN    = cp.getfloat("rh_correction", "gain", fallback=1.0)
+    if RH_CORR_ENABLED:
+        print(f"[rh_correction] ATTIVA: RH_corr = {RH_CORR_GAIN:.4f}*RH "
+              f"{'+' if RH_CORR_OFFSET >= 0 else '-'} {abs(RH_CORR_OFFSET):.2f} "
+              f"(applicata a log E feed compensazione)")
 
     bmp = {
         "enabled": cp.getboolean("bmp388", "enabled", fallback=False),
