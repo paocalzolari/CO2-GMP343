@@ -1009,7 +1009,7 @@ class GraphWidget(QWidget):
                       fc="white", ec="#2060c0", lw=1.5, alpha=0.9)
         )
 
-        self.ax.set_ylabel("CO₂ corrected (compensated)  1-min avg (ppm)", fontsize=10)
+        self.ax.set_ylabel("CO2 (comp.) 1min [PPM]", fontsize=10)
         self.ax.grid(True, linestyle="--", linewidth=0.3, alpha=0.6)
         # xlabel va sul pannello inferiore (ax_t è il bottom visibile)
         self.ax_t.set_xlabel("Ora (UTC)", fontsize=10)
