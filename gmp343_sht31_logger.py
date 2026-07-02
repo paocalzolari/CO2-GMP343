@@ -69,6 +69,14 @@ try:
 except ImportError:
     _HAS_COMP_MODULES = False
 
+# Import tollerante del driver TSI 4140 (flussimetro): serve solo se
+# [tsi4140] enabled=true in sensors.ini.
+try:
+    import tsi4140
+    _HAS_TSI = True
+except ImportError:
+    _HAS_TSI = False
+
 # ── Percorsi ──────────────────────────────────────────────────────────────────
 CONFIG_DIR      = os.path.expanduser("~/programs/CO2/config")
 NAME_INI        = os.path.join(CONFIG_DIR, "name.ini")
@@ -96,13 +104,16 @@ _COMP_STATUS = {
 
 
 def _write_status_json(instrument_connected, last_co2=None, last_t=None,
-                       last_rh=None, last_co2rawuc=None):
+                       last_rh=None, last_co2rawuc=None,
+                       last_flow_mass=None, last_flow_vol=None):
     """Scrive status.json atomicamente (tmp + rename) per acq-tools.
 
     Aggiorna l'mtime — acq-tools considera stale dopo 120s.
     Include lo stato di compensazione P/RH (_COMP_STATUS) per launcher/monitor.
     last_co2_ppm = CO2 CORRETTA (compensata); last_co2rawuc_ppm = CO2 GREZZA
     (senza compensazioni) → le GUI mostrano entrambe con dicitura.
+    last_flow_mass_slpm / last_flow_vol_lpm = flusso TSI 4140 (massa/volumetrico)
+    per la finestra Current Data del monitor (live).
     """
     status = {
         "instrument_connected": instrument_connected,
@@ -111,6 +122,8 @@ def _write_status_json(instrument_connected, last_co2=None, last_t=None,
         "last_co2rawuc_ppm": last_co2rawuc,
         "last_t_c": last_t,
         "last_rh_pct": last_rh,
+        "last_flow_mass_slpm": last_flow_mass,
+        "last_flow_vol_lpm": last_flow_vol,
     }
     status.update(_COMP_STATUS)
     try:
@@ -210,6 +223,10 @@ def load_sensors_config():
         "bus":     cp.getint("bmp388", "bus", fallback=1),
         "addr":    _addr("bmp388", "addr", 0x77),
     }
+    tsi = {
+        "enabled": cp.getboolean("tsi4140", "enabled", fallback=False),
+        "port":    cp.get("tsi4140", "port", fallback="/dev/tsi4140"),
+    }
     comp = {
         "enabled":         cp.getboolean("compensation", "enabled", fallback=False),
         "addr":            cp.getint("compensation", "gmp343_addr", fallback=0),
@@ -221,7 +238,7 @@ def load_sensors_config():
         # Serve comunque alla sonda per la compensazione RH (vedi manuale). 0 = non impostare.
         "fixed_pressure_hpa": cp.getfloat("compensation", "fixed_pressure_hpa", fallback=0.0),
     }
-    return {"bmp388": bmp, "comp": comp}
+    return {"bmp388": bmp, "comp": comp, "tsi": tsi}
 
 
 def load_valve_integration():
@@ -314,16 +331,23 @@ def write_headers_if_needed(raw_file, avg_file, file_10, file_30, file_60,
     med_co2  = ("CO2RAW[PPM] CO2RAW_std[PPM] CO2RAW_median[PPM] "
                 "CO2RAWUC[PPM] CO2RAWUC_std[PPM] CO2RAWUC_median[PPM] "
                 "P[hPa] P_std[hPa] P_median[hPa]")
+    # Colonne flussimetro TSI 4140 IN CODA (dopo le colonne CO2/P). Etichette
+    # esplicite massa (SLPM = Standard L/min) vs volumetrico (Lpm alle
+    # condizioni reali, calcolato con la P del BMP388).
+    raw_tsi  = "FLOWmass[slpm] FLOWvol[Lpm]"
+    avg_tsi  = "FLOWmass[slpm] FLOWmass_std[slpm] FLOWvol[Lpm] FLOWvol_std[Lpm]"
+    med_tsi  = ("FLOWmass[slpm] FLOWmass_std[slpm] FLOWmass_median[slpm] "
+                "FLOWvol[Lpm] FLOWvol_std[Lpm] FLOWvol_median[Lpm]")
     if valve_enabled:
-        raw_header  = f"#date time CO2[PPM] T[C] RH[%] flag valve_pos valve_label {raw_co2}"
-        avg_header  = f"#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag valve_pos valve_label {avg_co2}"
-        agg_header  = f"#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata flag valve_pos valve_label {avg_co2}"
-        agg60_header= f"#date time CO2[PPM] CO2_std[PPM] CO2_median[PPM] T[C] T_std[C] T_median[C] RH[%] RH_std[%] RH_median[%] ndata flag valve_pos valve_label {med_co2}"
+        raw_header  = f"#date time CO2[PPM] T[C] RH[%] flag valve_pos valve_label {raw_co2} {raw_tsi}"
+        avg_header  = f"#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag valve_pos valve_label {avg_co2} {avg_tsi}"
+        agg_header  = f"#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata flag valve_pos valve_label {avg_co2} {avg_tsi}"
+        agg60_header= f"#date time CO2[PPM] CO2_std[PPM] CO2_median[PPM] T[C] T_std[C] T_median[C] RH[%] RH_std[%] RH_median[%] ndata flag valve_pos valve_label {med_co2} {med_tsi}"
     else:
-        raw_header  = f"#date time CO2[PPM] T[C] RH[%] flag {raw_co2}"
-        avg_header  = f"#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag {avg_co2}"
-        agg_header  = f"#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata flag {avg_co2}"
-        agg60_header= f"#date time CO2[PPM] CO2_std[PPM] CO2_median[PPM] T[C] T_std[C] T_median[C] RH[%] RH_std[%] RH_median[%] ndata flag {med_co2}"
+        raw_header  = f"#date time CO2[PPM] T[C] RH[%] flag {raw_co2} {raw_tsi}"
+        avg_header  = f"#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata_60s_mean flag {avg_co2} {avg_tsi}"
+        agg_header  = f"#date time CO2[PPM] CO2_std[PPM] T[C] T_std[C] RH[%] RH_std[%] ndata flag {avg_co2} {avg_tsi}"
+        agg60_header= f"#date time CO2[PPM] CO2_std[PPM] CO2_median[PPM] T[C] T_std[C] T_median[C] RH[%] RH_std[%] RH_median[%] ndata flag {med_co2} {med_tsi}"
 
     pairs = [
         (raw_file, raw_header),
@@ -411,10 +435,18 @@ def _flush_slot(path, slot_ts, buf, valve_enabled):
         M_p, S_p, _ = _pooled_mean_std(
             [r.get("p", MISSING)     for r in measure_buf],
             [r.get("p_std", MISSING) for r in measure_buf], co2_n)
+        # Flusso TSI (massa / volumetrico) pooled (in coda)
+        M_fm, S_fm, _ = _pooled_mean_std(
+            [r.get("fmass", MISSING)     for r in measure_buf],
+            [r.get("fmass_std", MISSING) for r in measure_buf], co2_n)
+        M_fv, S_fv, _ = _pooled_mean_std(
+            [r.get("fvol", MISSING)     for r in measure_buf],
+            [r.get("fvol_std", MISSING) for r in measure_buf], co2_n)
     else:
         M_c = S_c = M_t = S_t = M_r = S_r = MISSING
         M_cr = S_cr = M_cu = S_cu = MISSING
         M_p = S_p = MISSING
+        M_fm = S_fm = M_fv = S_fv = MISSING
         N = 0
     flag = "calib" if any(r["flag"] == "calib" for r in buf) else "measure"
     if valve_enabled:
@@ -434,14 +466,16 @@ def _flush_slot(path, slot_ts, buf, valve_enabled):
             f"{M_r:.2f} {S_r:.2f} "
             f"{N} {flag}{valve_suf} "
             f"{M_cr:.2f} {S_cr:.2f} {M_cu:.2f} {S_cu:.2f} "
-            f"{M_p:.2f} {S_p:.2f}\n"
+            f"{M_p:.2f} {S_p:.2f} "
+            f"{M_fm:.3f} {S_fm:.3f} {M_fv:.3f} {S_fv:.3f}\n"
         )
 
 
 def _flush_60min_with_median(path, slot_ts, buf_minutes,
                              raw_co2, raw_t, raw_rh, raw_flag,
                              valve_enabled,
-                             raw_co2raw=None, raw_co2rawuc=None, raw_p=None):
+                             raw_co2raw=None, raw_co2rawuc=None, raw_p=None,
+                             raw_fmass=None, raw_fvol=None):
     """Write a 60-min row computing mean/std/median directly from raw samples.
 
     `raw_co2/_t/_rh` are flat lists of per-sample readings collected
@@ -462,6 +496,8 @@ def _flush_60min_with_median(path, slot_ts, buf_minutes,
     raw_co2raw   = raw_co2raw   or []
     raw_co2rawuc = raw_co2rawuc or []
     raw_p        = raw_p        or []
+    raw_fmass    = raw_fmass    or []
+    raw_fvol     = raw_fvol     or []
     # Filter raw samples to MEASURE only
     if raw_flag and len(raw_flag) == len(raw_co2):
         m_co2 = [c for c, fl in zip(raw_co2, raw_flag) if fl != "calib"]
@@ -473,10 +509,15 @@ def _flush_60min_with_median(path, slot_ts, buf_minutes,
                 if len(raw_co2rawuc) == len(raw_flag) else raw_co2rawuc
         m_p   = [c for c, fl in zip(raw_p, raw_flag) if fl != "calib"] \
                 if len(raw_p) == len(raw_flag) else raw_p
+        m_fm  = [c for c, fl in zip(raw_fmass, raw_flag) if fl != "calib"] \
+                if len(raw_fmass) == len(raw_flag) else raw_fmass
+        m_fv  = [c for c, fl in zip(raw_fvol, raw_flag) if fl != "calib"] \
+                if len(raw_fvol) == len(raw_flag) else raw_fvol
     else:
         # No flag list (legacy path): assume all measure
         m_co2, m_t, m_rh = raw_co2, raw_t, raw_rh
         m_cr, m_cu, m_p = raw_co2raw, raw_co2rawuc, raw_p
+        m_fm, m_fv = raw_fmass, raw_fvol
 
     def _stats(values):
         clean = [v for v in values if v != MISSING]
@@ -493,6 +534,8 @@ def _flush_60min_with_median(path, slot_ts, buf_minutes,
     M_cr, S_cr, Med_cr = _stats(m_cr)
     M_cu, S_cu, Med_cu = _stats(m_cu)
     M_p,  S_p,  Med_p  = _stats(m_p)
+    M_fm, S_fm, Med_fm = _stats(m_fm)
+    M_fv, S_fv, Med_fv = _stats(m_fv)
     N = sum(1 for v in m_co2 if v != MISSING)
     # Sticky-calib: any minute or any sample = calib
     has_calib_minute = any(r["flag"] == "calib" for r in buf_minutes)
@@ -515,7 +558,9 @@ def _flush_60min_with_median(path, slot_ts, buf_minutes,
             f"{N} {flag}{valve_suf} "
             f"{M_cr:.2f} {S_cr:.2f} {Med_cr:.2f} "
             f"{M_cu:.2f} {S_cu:.2f} {Med_cu:.2f} "
-            f"{M_p:.2f} {S_p:.2f} {Med_p:.2f}\n"
+            f"{M_p:.2f} {S_p:.2f} {Med_p:.2f} "
+            f"{M_fm:.3f} {S_fm:.3f} {Med_fm:.3f} "
+            f"{M_fv:.3f} {S_fv:.3f} {Med_fv:.3f}\n"
         )
 
 
@@ -523,11 +568,14 @@ def _make_minute_record(co2, co2_std, n_co2, t, t_std, rh, rh_std,
                         flag, valve_enabled, valve_status_file, valve_stale_s,
                         co2raw=MISSING, co2raw_std=MISSING,
                         co2rawuc=MISSING, co2rawuc_std=MISSING,
-                        p=MISSING, p_std=MISSING):
+                        p=MISSING, p_std=MISSING,
+                        fmass=MISSING, fmass_std=MISSING,
+                        fvol=MISSING, fvol_std=MISSING):
     """Pack the just-closed minute aggregate into a dict for slot buffers.
 
     co2raw/co2rawuc (medie+std del minuto) servono a propagare i 3 valori CO2
-    anche negli aggregati 10/30-min (pooled in _flush_slot)."""
+    anche negli aggregati 10/30-min (pooled in _flush_slot).
+    fmass/fvol = flusso TSI 4140 (massa SLPM / volumetrico Lpm), stesso pattern."""
     if valve_enabled:
         try:
             vpos_str, vlabel_str = valve_format_for_raw(
@@ -543,6 +591,8 @@ def _make_minute_record(co2, co2_std, n_co2, t, t_std, rh, rh_std,
         "co2raw": co2raw, "co2raw_std": co2raw_std,
         "co2rawuc": co2rawuc, "co2rawuc_std": co2rawuc_std,
         "p": p, "p_std": p_std,
+        "fmass": fmass, "fmass_std": fmass_std,
+        "fvol": fvol, "fvol_std": fvol_std,
         "flag": flag,
         "valve_pos": vpos_str, "valve_label": vlabel_str,
     }
@@ -661,6 +711,10 @@ def main():
     sensors_cfg = load_sensors_config()
     comp_cfg = sensors_cfg["comp"]
     bmp_cfg  = sensors_cfg["bmp388"]
+    tsi_cfg  = sensors_cfg["tsi"]
+    tsi_enabled = bool(tsi_cfg["enabled"]) and _HAS_TSI
+    if tsi_cfg["enabled"] and not _HAS_TSI:
+        print("WARN: [tsi4140] enabled ma modulo tsi4140 non importabile → flusso non loggato")
     comp_enabled = bool(comp_cfg["enabled"]) and _HAS_COMP_MODULES
     if comp_cfg["enabled"] and not _HAS_COMP_MODULES:
         print("WARN: [compensation] enabled ma moduli bmp388/gmp343_compensation "
@@ -697,6 +751,17 @@ def main():
         return
 
     sht31_bus = open_sht31_bus()
+
+    # ── Flussimetro TSI 4140 (opzionale) ──────────────────────────────────────
+    tsi_dev = None
+    if tsi_enabled:
+        try:
+            tsi_dev = tsi4140.open_tsi(tsi_cfg["port"])
+            print(f"[tsi4140] flussimetro aperto su {tsi_cfg['port']} "
+                  f"(ping={tsi4140.ping(tsi_dev)}) — flusso di MASSA (SLPM)")
+        except Exception as e:
+            print(f"WARN: apertura TSI 4140 fallita ({e}) → flusso non loggato")
+            tsi_dev = None
 
     # ── Setup modalità sonda ──────────────────────────────────────────────────
     # comp_enabled → POLL-mode (per poter inviare XP/XRH di compensazione).
@@ -742,6 +807,10 @@ def main():
     co2raw_values   = []   # CO2RAW per-minuto (aggregati in coda)
     co2rawuc_values = []   # CO2RAWUC per-minuto
     p_values        = []   # P (BMP388) per-minuto
+    fmass_values    = []   # flusso di MASSA (SLPM) per-minuto (TSI)
+    fvol_values     = []   # flusso VOLUMETRICO (Lpm) per-minuto (TSI, calcolato)
+    _last_fmass = None     # ultimo flusso massa per status.json (live)
+    _last_fvol  = None     # ultimo flusso volumetrico per status.json (live)
     _last_co2 = None  # ultimo valore per status.json (CO2 corretta)
     _last_co2rawuc = None  # CO2 grezza (non compensata)
     _last_t   = None
@@ -776,6 +845,8 @@ def main():
     buf_60_raw_co2raw   = []   # CO2RAW per-sample (mediana 60-min)
     buf_60_raw_co2rawuc = []   # CO2RAWUC per-sample
     buf_60_raw_p        = []   # P per-sample (mediana 60-min)
+    buf_60_raw_fmass    = []   # flusso massa per-sample (mediana 60-min)
+    buf_60_raw_fvol     = []   # flusso volumetrico per-sample (mediana 60-min)
 
     print(f"Logging started. Raw: {raw_file}, Min: {avg_file}")
     print(f"Aggregates: 10/{file_10}  30/{file_30}  60/{file_60}")
@@ -806,6 +877,7 @@ def main():
         nonlocal buf_10, slot_10, buf_30, slot_30, buf_60, slot_60
         nonlocal buf_60_raw_co2, buf_60_raw_t, buf_60_raw_rh, buf_60_raw_flag
         nonlocal buf_60_raw_co2raw, buf_60_raw_co2rawuc, buf_60_raw_p
+        nonlocal buf_60_raw_fmass, buf_60_raw_fvol
         # 10-min
         this_slot10 = _slot_start(current_minute, 10)
         if this_slot10 != slot_10:
@@ -832,7 +904,9 @@ def main():
                 buf_60_raw_flag, valve_enabled,
                 raw_co2raw=buf_60_raw_co2raw,
                 raw_co2rawuc=buf_60_raw_co2rawuc,
-                raw_p=buf_60_raw_p)
+                raw_p=buf_60_raw_p,
+                raw_fmass=buf_60_raw_fmass,
+                raw_fvol=buf_60_raw_fvol)
             buf_60 = []
             buf_60_raw_co2  = []
             buf_60_raw_t    = []
@@ -841,6 +915,8 @@ def main():
             buf_60_raw_co2raw   = []
             buf_60_raw_co2rawuc = []
             buf_60_raw_p        = []
+            buf_60_raw_fmass    = []
+            buf_60_raw_fvol     = []
             slot_60 = this_slot60
         buf_60.append(min_record)
 
@@ -880,6 +956,27 @@ def main():
                                         config, valve_enabled)
                 print(f"New day. Files rotated: {raw_file}, {avg_file}, ...")
 
+            # ── Lettura flussimetro TSI 4140 (indipendente dal ciclo CO2) ──
+            # flow_mass = flusso di MASSA (SLPM, misura nativa del meter);
+            # flow_vol  = VOLUMETRICO (Lpm) calcolato con la P reale del BMP388
+            #             (kPa = hPa/10). Senza P valida → volumetrico MISSING.
+            flow_mass = MISSING
+            flow_vol  = MISSING
+            if tsi_dev is not None:
+                fm, tg = tsi4140.read_flow_temp(tsi_dev)
+                if fm != MISSING:
+                    flow_mass = fm
+                    # P per il volumetrico: BMP388 live se disponibile,
+                    # altrimenti la pressione fissa di config (approssimata ma
+                    # tiene il volumetrico visibile anche col BMP388 staccato).
+                    p_for_vol = None
+                    if p_hpa is not None:
+                        p_for_vol = p_hpa
+                    elif comp_cfg["fixed_pressure_hpa"] > 0:
+                        p_for_vol = comp_cfg["fixed_pressure_hpa"]
+                    if p_for_vol is not None:
+                        flow_vol = tsi4140.to_volumetric(fm, tg, p_for_vol / 10.0)
+
             if line:
                 ts_str, current_timestamp = timestamp_now()
                 co2, co2raw, co2rawuc = parse_three_co2(line)
@@ -914,7 +1011,8 @@ def main():
                             f_raw.write(
                                 f"{ts_str} {co2:.2f} {t:.2f} {rh:.2f} "
                                 f"{flag}{valve_suf_raw} "
-                                f"{co2raw:.2f} {co2rawuc:.2f} {p_log:.2f}\n"
+                                f"{co2raw:.2f} {co2rawuc:.2f} {p_log:.2f} "
+                                f"{flow_mass:.3f} {flow_vol:.3f}\n"
                             )
 
                     if current_timestamp.replace(second=0, microsecond=0) == current_minute:
@@ -926,6 +1024,8 @@ def main():
                             co2raw_values.append(co2raw)
                             co2rawuc_values.append(co2rawuc)
                             p_values.append(p_log)
+                            fmass_values.append(flow_mass)
+                            fvol_values.append(flow_vol)
                             # Raw buffer per la mediana 60-min (un sample
                             # per chiamata, post-dedup). `flag` per-sample
                             # serve a escludere i sample di calibrazione
@@ -937,6 +1037,8 @@ def main():
                             buf_60_raw_co2raw.append(co2raw)
                             buf_60_raw_co2rawuc.append(co2rawuc)
                             buf_60_raw_p.append(p_log)
+                            buf_60_raw_fmass.append(flow_mass)
+                            buf_60_raw_fvol.append(flow_vol)
                     else:
                         # Cambio minuto: chiudi il minuto corrente e scrivi
                         # il record _min.raw, poi gli aggregati 10/30/60.
@@ -958,6 +1060,8 @@ def main():
                             cr_avg, cr_std = mean_std_missing(co2raw_values)
                             cu_avg, cu_std = mean_std_missing(co2rawuc_values)
                             p_avg,  p_std  = mean_std_missing(p_values)
+                            fm_avg, fm_std = mean_std_missing(fmass_values)
+                            fv_avg, fv_std = mean_std_missing(fvol_values)
                             flag = _auto_flag(calib_auto, valve_enabled,
                                               valve_status_file, valve_stale_s,
                                               calib_labels, measure_position)
@@ -968,7 +1072,8 @@ def main():
                                 f"{rh_avg:.2f} {rh_std:.2f} "
                                 f"{n_co2} {flag}{valve_suf} "
                                 f"{cr_avg:.2f} {cr_std:.2f} {cu_avg:.2f} {cu_std:.2f} "
-                                f"{p_avg:.2f} {p_std:.2f}\n"
+                                f"{p_avg:.2f} {p_std:.2f} "
+                                f"{fm_avg:.3f} {fm_std:.3f} {fv_avg:.3f} {fv_std:.3f}\n"
                             )
                         # Aggrega nei bucket 10/30/60 min
                         _on_minute_closed(_make_minute_record(
@@ -977,14 +1082,20 @@ def main():
                             flag, valve_enabled, valve_status_file, valve_stale_s,
                             co2raw=cr_avg, co2raw_std=cr_std,
                             co2rawuc=cu_avg, co2rawuc_std=cu_std,
-                            p=p_avg, p_std=p_std))
+                            p=p_avg, p_std=p_std,
+                            fmass=fm_avg, fmass_std=fm_std,
+                            fvol=fv_avg, fvol_std=fv_std))
 
                         _last_co2 = co2_avg if co2_avg != MISSING else None
                         _last_co2rawuc = cu_avg if cu_avg != MISSING else None
                         _last_t   = t_avg   if t_avg   != MISSING else None
                         _last_rh  = rh_avg  if rh_avg  != MISSING else None
+                        _last_fmass = fm_avg if fm_avg != MISSING else None
+                        _last_fvol  = fv_avg if fv_avg != MISSING else None
                         _write_status_json(True, _last_co2, _last_t, _last_rh,
-                                           last_co2rawuc=_last_co2rawuc)
+                                           last_co2rawuc=_last_co2rawuc,
+                                           last_flow_mass=_last_fmass,
+                                           last_flow_vol=_last_fvol)
                         current_minute = current_timestamp.replace(second=0, microsecond=0)
                         # Avvia il nuovo minuto: includi il campione corrente
                         # solo se non è un duplicato.
@@ -995,6 +1106,8 @@ def main():
                             co2raw_values   = []
                             co2rawuc_values = []
                             p_values        = []
+                            fmass_values    = []
+                            fvol_values     = []
                         else:
                             co2_values = [co2]
                             t_values   = [t]
@@ -1002,6 +1115,8 @@ def main():
                             co2raw_values   = [co2raw]
                             co2rawuc_values = [co2rawuc]
                             p_values        = [p_log]
+                            fmass_values    = [flow_mass]
+                            fvol_values     = [flow_vol]
                             # Il sample corrente appartiene già al nuovo
                             # minuto: includilo anche nel raw buffer 60-min
                             # (se il flush 60 è stato appena eseguito,
@@ -1015,6 +1130,8 @@ def main():
                             buf_60_raw_co2raw.append(co2raw)
                             buf_60_raw_co2rawuc.append(co2rawuc)
                             buf_60_raw_p.append(p_log)
+                            buf_60_raw_fmass.append(flow_mass)
+                            buf_60_raw_fvol.append(flow_vol)
             else:
                 if now.replace(second=0, microsecond=0) != current_minute:
                     files_for_min = _files_for_day(current_minute)
@@ -1030,7 +1147,8 @@ def main():
                             f"{MISSING:.2f} {MISSING:.2f} "
                             f"0 {flag}{valve_suf} "
                             f"{MISSING:.2f} {MISSING:.2f} {MISSING:.2f} {MISSING:.2f} "
-                            f"{MISSING:.2f} {MISSING:.2f}\n"
+                            f"{MISSING:.2f} {MISSING:.2f} "
+                            f"{MISSING:.3f} {MISSING:.3f} {MISSING:.3f} {MISSING:.3f}\n"
                         )
                     # Anche un minuto vuoto va nei buffer: la pooling salta
                     # i MISSING ma il minuto conta come "trascorso" per gli
@@ -1046,6 +1164,8 @@ def main():
                     co2raw_values   = []
                     co2rawuc_values = []
                     p_values        = []
+                    fmass_values    = []
+                    fvol_values     = []
         except serial.SerialException as e:
             print(f"Serial communication error: {e}. Retrying in 5 seconds...")
             _write_status_json(False)

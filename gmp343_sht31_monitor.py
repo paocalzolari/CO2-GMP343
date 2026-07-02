@@ -208,7 +208,7 @@ def read_last_raw_sample(cfg: configparser.ConfigParser, d: date_type):
     matches = [m for m in glob.glob(pattern)
                if "_p00_min." not in os.path.basename(m)]
     if not matches:
-        return (None, None, None, None, None)
+        return (None, None, None, None, None, None, None, None)
     path = max(matches, key=os.path.getmtime)
     try:
         with open(path, "rb") as f:
@@ -218,14 +218,14 @@ def read_last_raw_sample(cfg: configparser.ConfigParser, d: date_type):
             f.seek(max(0, size - chunk))
             tail = f.read().decode("utf-8", errors="ignore")
     except OSError:
-        return (None, None, None, None, None)
+        return (None, None, None, None, None, None, None, None)
     lines = [ln.strip() for ln in tail.splitlines()
              if ln.strip() and not ln.startswith("#")]
     if not lines:
-        return (None, None, None, None, None)
+        return (None, None, None, None, None, None, None, None)
     parts = lines[-1].split()
     if len(parts) < 4:
-        return (None, None, None, None, None)
+        return (None, None, None, None, None, None, None, None)
     ts_str = f"{parts[0]} {parts[1]}"
     ts = None
     for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
@@ -237,7 +237,7 @@ def read_last_raw_sample(cfg: configparser.ConfigParser, d: date_type):
     try:
         co2 = float(parts[2])
     except (ValueError, IndexError):
-        return (ts, None, None, None, None)
+        return (ts, None, None, None, None, None, None, None)
     if len(parts) >= 6:
         # v3: date time CO2 T RH flag
         try:
@@ -251,15 +251,74 @@ def read_last_raw_sample(cfg: configparser.ConfigParser, d: date_type):
     # P (BMP388): ultima colonna del formato v5 (…CO2RAW CO2RAWUC P). Sulle
     # righe vecchie (no P) l'ultimo token è un flag/CO2RAWUC: il float-guard
     # e il check MISSING evitano falsi positivi sulla riga live (sempre v5).
-    p = None
-    if len(parts) >= 9:
+    # Formato colonne in coda: … CO2RAW CO2RAWUC P [FLOWmass FLOWvol].
+    # Dal 2026-07-02 ci sono 2 colonne flusso IN CODA → la P non è più
+    # l'ultima colonna ma la terz'ultima. Distinzione per numero di colonne.
+    def _fnum(idx):
         try:
-            pv = float(parts[-1])
-            if pv != MISSING:
-                p = pv
+            v = float(parts[idx])
+            return v if v != MISSING else None
         except (ValueError, IndexError):
-            p = None
-    return (ts, co2, t, rh, flag, p)
+            return None
+    p = fmass = fvol = None
+    def _is_float(s):
+        try:
+            float(s); return True
+        except (ValueError, TypeError):
+            return False
+    # Colonne valvola presenti se parts[7] (valve_label, es. "pos1-ambient")
+    # NON è un numero (senza valvola parts[7] sarebbe CO2RAWUC, un float).
+    has_valve_cols = len(parts) >= 8 and not _is_float(parts[7])
+    n_tail = len(parts) - (8 if has_valve_cols else 6)  # colonne dopo flag/valvola
+    if n_tail >= 5:
+        # …CO2RAW CO2RAWUC P FLOWmass FLOWvol → P a -3, flusso a -2/-1
+        p = _fnum(-3); fmass = _fnum(-2); fvol = _fnum(-1)
+    elif n_tail >= 3:
+        # …CO2RAW CO2RAWUC P → P ultima colonna
+        p = _fnum(-1)
+    return (ts, co2, t, rh, flag, p, fmass, fvol)
+
+
+def read_last_min_flow(cfg: configparser.ConfigParser, d: date_type):
+    """Legge la media 1-min del flusso TSI dall'ultima riga del file `_min`.
+
+    Le colonne flusso sono le ultime 4: FLOWmass FLOWmass_std FLOWvol
+    FLOWvol_std → media massa = parts[-4], media volumetrico = parts[-2].
+    Ritorna (fmass_avg|None, fvol_avg|None); None se file/valore mancante.
+    """
+    import glob
+    ext = cfg.get("output", "extension", fallback="raw")
+    ddir = get_data_dir(cfg)
+    pattern = os.path.join(ddir, f"*_{d.strftime('%Y%m%d')}_p00_min.{ext}")
+    matches = glob.glob(pattern)
+    if not matches:
+        return (None, None)
+    path = max(matches, key=os.path.getmtime)
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 4096))
+            tail = f.read().decode("utf-8", errors="ignore")
+    except OSError:
+        return (None, None)
+    lines = [ln.strip() for ln in tail.splitlines()
+             if ln.strip() and not ln.startswith("#")]
+    if not lines:
+        return (None, None)
+    parts = lines[-1].split()
+
+    def _fnum(idx):
+        try:
+            v = float(parts[idx])
+            return v if v != MISSING else None
+        except (ValueError, IndexError):
+            return None
+    # Nuovo formato min con flusso ha >= 4 colonne extra in coda: FLOWmass
+    # FLOWmass_std FLOWvol FLOWvol_std. Guard: serve un minimo di colonne.
+    if len(parts) >= 12:
+        return (_fnum(-4), _fnum(-2))
+    return (None, None)
 
 
 def _startup_log():
@@ -318,12 +377,13 @@ def read_file(path: str, metric: str = "mean"):
     times, values, stds, counts, flags = [], [], [], [], []
     ts_t, ts_tstd, ts_rh, ts_rhstd = [], [], [], []
     ts_p = []
+    ts_fmass, ts_fvol = [], []   # flusso TSI (massa/volumetrico) — in coda
     valve_pos, valve_labels = [], []
     has_valve_cols = False
     if not path or not os.path.exists(path):
         return (times, values, stds, counts, flags,
                 ts_t, ts_tstd, ts_rh, ts_rhstd, ts_p,
-                valve_pos, valve_labels)
+                valve_pos, valve_labels, ts_fmass, ts_fvol)
     # Il formato v4 (con MEDIANE) esiste SOLO nel file 60-min. Dal 2026-06-24
     # i file 1/10/30-min hanno 4 colonne CO2RAW/CO2RAWUC IN CODA che alzano
     # il conteggio colonne: senza questo gate verrebbero scambiati per v4.
@@ -390,13 +450,30 @@ def read_file(path: str, metric: str = "mean"):
                     else:
                         vpos = -1
                         vlab = "-"
-                    # P (BMP388): formato v6 in coda. _min/10/30 finiscono con
-                    # "… P P_std" → P=p[-2]; 60-min con "… P P_std P_median" →
-                    # P=p[-3]. Guard: MISSING se non parsabile (righe pre-v6).
-                    try:
-                        p_val = float(p[-3] if is_60min_file else p[-2])
-                    except (ValueError, IndexError):
-                        p_val = MISSING
+                    # P (BMP388) + flusso TSI: dal 2026-07-02 ci sono colonne
+                    # flusso IN CODA, quindi NON si può più usare l'indice
+                    # negativo (P non è più l'ultima colonna). Si calcola la
+                    # posizione FORWARD dopo valvola + blocco CO2RAW/CO2RAWUC:
+                    #   min/10/30:  CO2RAW CO2RAW_std CO2RAWUC CO2RAWUC_std P …
+                    #               → P a tail_start+4, FLOWmass +6, FLOWvol +8
+                    #   60-min:     …(con mediane)… P a tail_start+6,
+                    #               FLOWmass +9, FLOWvol +12
+                    tail_start = valve_idx + (2 if has_valve_cols else 0)
+                    if is_60min_file:
+                        p_pos, fm_pos, fv_pos = (tail_start + 6,
+                                                 tail_start + 9, tail_start + 12)
+                    else:
+                        p_pos, fm_pos, fv_pos = (tail_start + 4,
+                                                 tail_start + 6, tail_start + 8)
+
+                    def _col(idx):
+                        try:
+                            return float(p[idx])
+                        except (ValueError, IndexError):
+                            return MISSING
+                    p_val     = _col(p_pos)
+                    fmass_val = _col(fm_pos)
+                    fvol_val  = _col(fv_pos)
                     times.append(dt)
                     values.append(co2)
                     stds.append(co2_std)
@@ -407,6 +484,8 @@ def read_file(path: str, metric: str = "mean"):
                     ts_rh.append(rh_val)
                     ts_rhstd.append(rh_std)
                     ts_p.append(p_val)
+                    ts_fmass.append(fmass_val)
+                    ts_fvol.append(fvol_val)
                     valve_pos.append(vpos)
                     valve_labels.append(vlab)
                 except ValueError:
@@ -417,7 +496,7 @@ def read_file(path: str, metric: str = "mean"):
         valve_pos, valve_labels = [], []
     return (times, values, stds, counts, flags,
             ts_t, ts_tstd, ts_rh, ts_rhstd, ts_p,
-            valve_pos, valve_labels)
+            valve_pos, valve_labels, ts_fmass, ts_fvol)
 
 
 def load_period(cfg: configparser.ConfigParser,
@@ -436,11 +515,12 @@ def load_period(cfg: configparser.ConfigParser,
     all_t, all_v, all_s, all_c, all_f = [], [], [], [], []
     all_tt, all_tstd, all_rh, all_rhstd = [], [], [], []
     all_tp = []
+    all_fm, all_fv = [], []   # flusso TSI (massa/volumetrico)
     all_vp, all_vl = [], []
     n_with_valve = 0
     for i in range(n_days):
         d = start + timedelta(days=i)
-        t, v, s, c, f, tt, tstd, rh, rhstd, tp, vp, vl = read_file(
+        t, v, s, c, f, tt, tstd, rh, rhstd, tp, vp, vl, fm, fv = read_file(
             build_filename(cfg, d, suffix), metric=metric)
         all_t.extend(t)
         all_v.extend(v)
@@ -452,6 +532,8 @@ def load_period(cfg: configparser.ConfigParser,
         all_rh.extend(rh)
         all_rhstd.extend(rhstd)
         all_tp.extend(tp)
+        all_fm.extend(fm)
+        all_fv.extend(fv)
         if vp:
             all_vp.extend(vp)
             all_vl.extend(vl)
@@ -472,6 +554,8 @@ def load_period(cfg: configparser.ConfigParser,
     rh_arr  = np.array(all_rh,    dtype=float)[idx]
     rhstd   = np.array(all_rhstd, dtype=float)[idx]
     p_arr   = np.array(all_tp,    dtype=float)[idx] if all_tp else np.array([], dtype=float)
+    fm_arr  = np.array(all_fm,    dtype=float)[idx] if all_fm else np.array([], dtype=float)
+    fv_arr  = np.array(all_fv,    dtype=float)[idx] if all_fv else np.array([], dtype=float)
     if n_with_valve > 0:
         valve_pos    = np.array(all_vp, dtype=int)[idx]
         valve_labels = np.array(all_vl)[idx]
@@ -480,7 +564,7 @@ def load_period(cfg: configparser.ConfigParser,
         valve_labels = np.array([], dtype=str)
     return (times, values, stds, counts, flags,
             t_arr, tstd, rh_arr, rhstd, p_arr,
-            valve_pos, valve_labels)
+            valve_pos, valve_labels, fm_arr, fv_arr)
 
 
 def day_xlim(d: date_type):
@@ -807,18 +891,32 @@ class GraphWidget(QWidget):
         # ricreati a ogni reload e ripuliti qui sotto.
         self._overlay_lines = []
 
-        # 3 subplots con asse X condiviso: CO2 (grande sopra), P (medio),
+        # 4 subplots con asse X condiviso: CO2 (grande sopra), P, FLUSSO TSI,
         # T+RH (piccolo sotto). Asse tempo sincronizzato (sharex) su tutti.
-        gs = self.fig.add_gridspec(3, 1, height_ratios=[3, 1, 1], hspace=0.08)
-        self.ax    = self.fig.add_subplot(gs[0])
-        self.ax_p  = self.fig.add_subplot(gs[1], sharex=self.ax)   # P (BMP388)
-        self.ax_t  = self.fig.add_subplot(gs[2], sharex=self.ax)
+        gs = self.fig.add_gridspec(4, 1, height_ratios=[3, 1, 1, 1], hspace=0.08)
+        self.ax      = self.fig.add_subplot(gs[0])
+        self.ax_p    = self.fig.add_subplot(gs[1], sharex=self.ax)   # P (BMP388)
+        self.ax_flow = self.fig.add_subplot(gs[2], sharex=self.ax)   # flusso TSI
+        self.ax_t    = self.fig.add_subplot(gs[3], sharex=self.ax)
         # Asse Y secondario (a destra) per RH sul pannello di T
         self.ax_rh = self.ax_t.twinx()
 
-        # Tick label X solo sul pannello in basso (ax_t): CO2 e P li nascondono
+        # Tick label X solo sul pannello in basso (ax_t): gli altri li nascondono
         self.ax.tick_params(labelbottom=False)
         self.ax_p.tick_params(labelbottom=False)
+        self.ax_flow.tick_params(labelbottom=False)
+
+        # ── Flusso TSI 4140 (pannello tra P e T/RH): massa + volumetrico ──
+        self.line_fmass, = self.ax_flow.plot(
+            [], [], "-", linewidth=self._trh_line_width,
+            color="#8a0a8a", zorder=2, label="mass (SLPM)")
+        self.line_fvol,  = self.ax_flow.plot(
+            [], [], "-", linewidth=self._trh_line_width,
+            color="#a83232", zorder=2, label="vol (Lpm)")
+        self.ax_flow.set_ylabel("Flow (L/min)", fontsize=9, color="#8a0a8a")
+        self.ax_flow.tick_params(axis="y", labelcolor="#8a0a8a", labelsize=8)
+        self.ax_flow.grid(True, linestyle="--", linewidth=0.3, alpha=0.6)
+        self.ax_flow.legend(loc="upper right", fontsize=7, framealpha=0.8, ncol=2)
 
         # ── P (pannello pressione, tra CO2 e T/RH) ────────────────────────
         self.line_p, = self.ax_p.plot(
@@ -1081,6 +1179,8 @@ class GraphWidget(QWidget):
             self.line_t.set_data([], [])
             self.line_rh.set_data([], [])
             self.line_p.set_data([], [])
+            self.line_fmass.set_data([], [])
+            self.line_fvol.set_data([], [])
             self.sc_measure.set_offsets(np.empty((0, 2)))
             self.sc_calib.set_offsets(np.empty((0, 2)))
             self.sc_t.set_offsets(np.empty((0, 2)))
@@ -1097,7 +1197,7 @@ class GraphWidget(QWidget):
 
         (times, values, stds, counts, flags,
          t_arr, t_std_arr, rh_arr, rh_std_arr, p_arr,
-         valve_pos, valve_labels) = result
+         valve_pos, valve_labels, fmass_arr, fvol_arr) = result
         xt = mdates.date2num(times)
         # Sostituisci MISSING con NaN per i plot (break nella linea, no Y axis esteso)
         values_plot = np.where(values == MISSING, np.nan, values)
@@ -1119,6 +1219,19 @@ class GraphWidget(QWidget):
         self.line_t.set_data(xt, t_plot)
         self.line_rh.set_data(xt, rh_plot)
         self.line_p.set_data(xt, p_plot)
+        # Flusso TSI (massa + volumetrico): MISSING → NaN per spezzare la linea
+        if fmass_arr.size == values.size:
+            fmass_plot = np.where(fmass_arr == MISSING, np.nan, fmass_arr)
+        else:
+            fmass_arr  = np.full(values.size, MISSING)
+            fmass_plot = np.full(values.size, np.nan)
+        if fvol_arr.size == values.size:
+            fvol_plot = np.where(fvol_arr == MISSING, np.nan, fvol_arr)
+        else:
+            fvol_arr  = np.full(values.size, MISSING)
+            fvol_plot = np.full(values.size, np.nan)
+        self.line_fmass.set_data(xt, fmass_plot)
+        self.line_fvol.set_data(xt, fvol_plot)
 
         # ── Scatter punti T, RH e P (filtra MISSING) ──────────────────────
         mask_t  = t_arr  != MISSING
@@ -1384,7 +1497,7 @@ class GraphWidget(QWidget):
                                 suffix=suf_w, metric=met_w)
             if res_w is None:
                 continue
-            (t_w, v_w, _, _, _, tt_w, _, rh_w, _, _, _, _) = res_w
+            (t_w, v_w, _, _, _, tt_w, _, rh_w, _, _, _, _, _, _) = res_w
             xt_w = mdates.date2num(t_w)
             v_plot  = np.where(v_w  == MISSING, np.nan, v_w)
             tt_plot = np.where(tt_w == MISSING, np.nan, tt_w)
@@ -1431,6 +1544,10 @@ class GraphWidget(QWidget):
         self.ax_t.set_ylim(*smart_ylim(t_arr,   min_range=2.0,  fallback=(15.0, 30.0)))
         self.ax_rh.set_ylim(*smart_ylim(rh_arr, min_range=10.0, fallback=(0.0, 100.0)))
         self.ax_p.set_ylim(*smart_ylim(p_arr,   min_range=2.0,  fallback=(980.0, 1040.0)))
+        # Flusso: range dai due flussi combinati (massa+vol), min_range piccolo
+        _fall = np.concatenate([a for a in (fmass_arr, fvol_arr) if a.size]) \
+                if (fmass_arr.size or fvol_arr.size) else np.array([])
+        self.ax_flow.set_ylim(*smart_ylim(_fall, min_range=0.1, fallback=(0.0, 1.0)))
 
         # ── Titolo e label flag sulla stessa riga ─────────────────────────
         site  = self.cfg.get("location", "name", fallback="")
@@ -1636,7 +1753,7 @@ class GraphWidget(QWidget):
         self._refresh_comp_label()
         today = datetime.utcnow().date()
         # Live: ultima riga del .raw (~1 Hz)
-        _, live_co2, _, _, _, _ = read_last_raw_sample(self.cfg, today)
+        _, live_co2, _, _, _, _, _, _ = read_last_raw_sample(self.cfg, today)
         if live_co2 is None or live_co2 == MISSING:
             self.lbl_chart_live.setText("--- ppm")
         else:
@@ -3100,7 +3217,13 @@ class GMP343Monitor(QMainWindow):
         mb.setCornerWidget(corner, Qt.TopRightCorner)
 
         tabs = QTabWidget()
+        self._main_tabs = tabs
         self.setCentralWidget(tabs)
+        # OTTIMIZZAZIONE CPU: quando l'utente torna sul tab Chart, forza un
+        # refresh immediato (altrimenti il grafico è stato "congelato" mentre
+        # era nascosto — vedi _tick/_tick_fast, che saltano il redraw se il
+        # grafico non è visibile).
+        tabs.currentChanged.connect(self._on_main_tab_changed)
 
         def _scrollable(widget):
             """Avvolge widget in un QScrollArea per permettere a tutto il
@@ -3203,6 +3326,11 @@ class GMP343Monitor(QMainWindow):
         col_live.addLayout(row)
         row, self.lbl_p_live   = _make_value_row("P:",   14,    "#5030a0", "hPa")
         col_live.addLayout(row)
+        # Flusso TSI 4140: massa (SLPM, misura nativa) e volumetrico (Lpm, calc.)
+        row, self.lbl_fmass_live = _make_value_row("Flow mass:", 14, "#8a0a8a", "slpm")
+        col_live.addLayout(row)
+        row, self.lbl_fvol_live  = _make_value_row("Flow vol:",  14, "#a83232", "Lpm")
+        col_live.addLayout(row)
         col_live.addStretch()
 
         # — RIGHT COLUMN: 1-min average + σ + n (stats of the average) —
@@ -3229,6 +3357,10 @@ class GMP343Monitor(QMainWindow):
         row, self.lbl_rh  = _make_value_row("RH:",  14, "#007060", "%")
         col_avg.addLayout(row)
         row, self.lbl_p   = _make_value_row("P:",   14, "#5030a0", "hPa")
+        col_avg.addLayout(row)
+        row, self.lbl_fmass = _make_value_row("Flow mass:", 14, "#8a0a8a", "slpm")
+        col_avg.addLayout(row)
+        row, self.lbl_fvol  = _make_value_row("Flow vol:",  14, "#a83232", "Lpm")
         col_avg.addLayout(row)
         col_avg.addStretch()
 
@@ -3357,7 +3489,14 @@ class GMP343Monitor(QMainWindow):
         except Exception as exc:
             self._log_tick_error("update_monitor", exc)
         try:
-            self.graph.refresh()
+            # OTTIMIZZAZIONE CPU: il redraw del grafico è la voce di CPU più
+            # pesante del monitor. Se il tab Chart non è visibile (utente su
+            # Monitor/VICI o finestra minimizzata) NON ridisegnare: i valori
+            # live/1-min della finestra Current Data sono aggiornati da
+            # _update_monitor (testo, economico). Al ritorno sul tab Chart
+            # _on_main_tab_changed forza il refresh.
+            if self.graph.isVisible():
+                self.graph.refresh()
         except Exception as exc:
             self._log_tick_error("graph.refresh", exc)
         # Reload count + GC periodico per liberare riferimenti matplotlib
@@ -3422,12 +3561,29 @@ class GMP343Monitor(QMainWindow):
             self.lbl_flag.setText(f"● {text}")
             self.lbl_flag.setStyleSheet(
                 f"color:{color};font-weight:bold;font-size:10px")
-        # Tab Grafico — flag_label in alto a destra del plot
+        # Tab Grafico — flag_label in alto a destra del plot.
+        # OTTIMIZZAZIONE CPU: prima si faceva draw_idle() dell'INTERO canvas
+        # OGNI SECONDO solo per aggiornare questa etichetta, che però cambia
+        # rarissimamente (measure↔calib). Ora ridisegniamo SOLO quando il testo
+        # o il colore cambiano davvero, E solo se il tab Chart è visibile.
         if hasattr(self, "graph") and hasattr(self.graph, "flag_label"):
-            self.graph.flag_label.set_text(text)
-            self.graph.flag_label.set_color(color)
-            self.graph.flag_label.get_bbox_patch().set_edgecolor(color)
-            self.graph.canvas.draw_idle()
+            if (text, color) != getattr(self, "_last_graph_flag", None):
+                self._last_graph_flag = (text, color)
+                self.graph.flag_label.set_text(text)
+                self.graph.flag_label.set_color(color)
+                self.graph.flag_label.get_bbox_patch().set_edgecolor(color)
+                if self.graph.isVisible():
+                    self.graph.canvas.draw_idle()
+
+    def _on_main_tab_changed(self, _idx=None):
+        """Quando si passa a un tab, se è il Chart forza subito un refresh
+        (il grafico è rimasto congelato mentre era nascosto per risparmiare CPU)."""
+        try:
+            if hasattr(self, "graph") and self.graph.isVisible():
+                self._last_graph_flag = None   # forza il redraw del flag
+                self.graph.refresh()
+        except Exception as exc:
+            self._log_tick_error("tab_changed", exc)
 
     def _update_monitor(self):
         # Timestamp
@@ -3448,7 +3604,7 @@ class GMP343Monitor(QMainWindow):
         result = load_period(self.cfg, today, 1)
 
         # Tempo reale: ultimo campione dal file .raw (indipendente da _min)
-        live_ts, live_co2, live_t, live_rh, _live_flag, live_p = read_last_raw_sample(
+        live_ts, live_co2, live_t, live_rh, _live_flag, live_p, live_fmass, live_fvol = read_last_raw_sample(
             self.cfg, today)
         dec = self.guicfg.getint("display","co2_decimals",fallback=2)
         if live_co2 is None or live_co2 == MISSING:
@@ -3469,6 +3625,21 @@ class GMP343Monitor(QMainWindow):
             self.lbl_p_live.setText("--- hPa")
         else:
             self.lbl_p_live.setText(f"{live_p:.2f} hPa")
+        # Flusso TSI live (dall'ultimo campione .raw)
+        if live_fmass is None or live_fmass == MISSING:
+            self.lbl_fmass_live.setText("--- slpm")
+        else:
+            self.lbl_fmass_live.setText(f"{live_fmass:.3f} slpm")
+        if live_fvol is None or live_fvol == MISSING:
+            self.lbl_fvol_live.setText("--- Lpm")
+        else:
+            self.lbl_fvol_live.setText(f"{live_fvol:.3f} Lpm")
+        # Flusso TSI 1-min (media dall'ultima riga del file _min)
+        fm_avg, fv_avg = read_last_min_flow(self.cfg, today)
+        self.lbl_fmass.setText("--- slpm" if fm_avg is None
+                               else f"{fm_avg:.3f} slpm")
+        self.lbl_fvol.setText("--- Lpm" if fv_avg is None
+                              else f"{fv_avg:.3f} Lpm")
 
         if result is None:
             self.lbl_co2.setText("--- ppm"); self.lbl_status.setText("")
@@ -3489,7 +3660,7 @@ class GMP343Monitor(QMainWindow):
 
         (times, values, stds, counts, flags,
          t_arr, t_std_arr, rh_arr, rh_std_arr, p_arr,
-         valve_pos, valve_labels) = result
+         valve_pos, valve_labels, _fm_arr, _fv_arr) = result
         last_co2  = float(values[-1])
         last_std  = float(stds[-1])
         last_n    = int(counts[-1])
