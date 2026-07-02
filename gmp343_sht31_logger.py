@@ -38,7 +38,28 @@ from collections import Counter
 from datetime import datetime, timezone
 import os
 import sys
+import socket
 import statistics
+
+
+def _sd_notify(state):
+    """Notifica systemd via $NOTIFY_SOCKET (WATCHDOG=1 / READY=1), zero
+    dipendenze. No-op se non lanciato da systemd con notify/watchdog.
+    Serve al watchdog di liveness: se il loop si impianta e smette di inviare
+    WATCHDOG=1, systemd killa e riavvia il servizio (Restart=always).
+    """
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    try:
+        if addr.startswith("@"):
+            addr = "\0" + addr[1:]          # abstract namespace socket
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        s.connect(addr)
+        s.sendall(state.encode())
+        s.close()
+    except Exception:
+        pass
 import configparser
 
 try:
@@ -800,6 +821,7 @@ def main():
         ser.write(CMD_START)
 
     _write_status_json(True)  # seriale aperta → strumento connesso
+    _sd_notify("READY=1")     # segnala a systemd che il logger è pronto
 
     co2_values = []
     t_values   = []
@@ -929,6 +951,10 @@ def main():
         buf_60.append(min_record)
 
     while True:
+        # Heartbeat watchdog: se il loop si impianta (nessun ping entro
+        # WatchdogSec) systemd killa+riavvia. Inviato a inizio ciclo, prima
+        # di qualsiasi lettura che potrebbe bloccarsi.
+        _sd_notify("WATCHDOG=1")
         try:
             # ── Acquisizione di un campione ───────────────────────────────────
             # comp_enabled → POLL-mode: leggi P (BMP388) e T/RH (SHT3X), inviali
