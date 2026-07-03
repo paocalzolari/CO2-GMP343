@@ -971,11 +971,30 @@ def main():
             slot_60 = this_slot60
         buf_60.append(min_record)
 
+    _sensor_reopen_at = 0.0   # prossimo tentativo di ri-apertura sensori I2C
     while True:
         # Heartbeat watchdog: se il loop si impianta (nessun ping entro
         # WatchdogSec) systemd killa+riavvia. Inviato a inizio ciclo, prima
         # di qualsiasi lettura che potrebbe bloccarsi.
         _sd_notify("WATCHDOG=1")
+
+        # Retry periodico apertura sensori I2C (ogni 30s): se SHT3X/BMP388
+        # erano assenti all'avvio (open→None) i valori restano MISSING per
+        # sempre; qui li ri-apriamo appena ricollegati, SENZA richiedere un
+        # restart del logger. Il bus SHT3X, una volta aperto, recupera da solo
+        # (read per-transazione); il BMP388 va ri-aperto (rilegge la calib).
+        if time.monotonic() >= _sensor_reopen_at:
+            _sensor_reopen_at = time.monotonic() + 30.0
+            if sht31_bus is None:
+                sht31_bus = open_sht31_bus()
+            if comp_enabled and bmp_dev is None and _HAS_COMP_MODULES:
+                bmp_dev = bmp388.open_bmp388(bus=bmp_cfg["bus"],
+                                             addr=bmp_cfg["addr"])
+                if bmp_dev is not None:
+                    print("[recovery] BMP388 ri-aperto → P live ripristinata",
+                          flush=True)
+                    if comp_cfg["feed_pressure"]:
+                        _COMP_STATUS["comp_p_source"] = "bmp388"
         try:
             # ── Acquisizione di un campione ───────────────────────────────────
             # comp_enabled → POLL-mode: leggi P (BMP388) e T/RH (SHT3X), inviali
