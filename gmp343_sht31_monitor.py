@@ -1232,6 +1232,9 @@ class GraphWidget(QWidget):
             fvol_plot = np.full(values.size, np.nan)
         self.line_fmass.set_data(xt, fmass_plot)
         self.line_fvol.set_data(xt, fvol_plot)
+        # Salva per accesso dal tooltip (flusso massa/volumetrico)
+        self._fmass_plot = fmass_plot
+        self._fvol_plot  = fvol_plot
 
         # ── Scatter punti T, RH e P (filtra MISSING) ──────────────────────
         mask_t  = t_arr  != MISSING
@@ -1777,36 +1780,51 @@ class GraphWidget(QWidget):
     # ── hover ────────────────────────────────────────────────────────────────
 
     def _on_motion(self, event):
-        if event.inaxes is not self.ax:
+        # Il tooltip appare passando su QUALSIASI pannello (CO2/P/Flusso/T-RH):
+        # i pannelli condividono l'asse X, quindi si trova il campione più
+        # vicino alla X del cursore e si mostra il readout COMPLETO.
+        panels = (self.ax, self.ax_p, self.ax_flow, self.ax_t, self.ax_rh)
+        if event.inaxes not in panels or event.xdata is None:
             self._hide_tooltip()
             return
 
-        contains, info = self.line.contains(event)
-        if not contains:
-            self._hide_tooltip()
-            return
-
-        idx = info["ind"][0]
         xd, yd = self.line.get_data()
-        xv, yv = xd[idx], yd[idx]
+        if xd is None or len(xd) == 0:
+            self._hide_tooltip()
+            return
+        xd = np.asarray(xd, dtype=float)
+        idx = int(np.argmin(np.abs(xd - event.xdata)))
+        xv = xd[idx]
+        yv = yd[idx]   # CO2 (può essere NaN se mancante a quell'idx)
 
-        # Punto evidenziato
-        self.hl_pt.set_data([xv], [yv])
-        self.hl_pt.set_visible(True)
+        # Punto evidenziato sul pannello CO2 (solo se CO2 valida)
+        if not np.isnan(yv):
+            self.hl_pt.set_data([xv], [yv])
+            self.hl_pt.set_visible(True)
+        else:
+            self.hl_pt.set_visible(False)
 
-        # Testo tooltip: CO2 + T + RH allo stesso idx
+        # Testo tooltip: Ora + CO2 + T + RH + P + Flusso (massa/vol) allo stesso idx
         t_str = mdates.num2date(xv).strftime("%H:%M:%S")
-        lines = [f"Ora:  {t_str}", f"CO₂: {yv:.2f} ppm"]
-        if hasattr(self, "_t_plot") and idx < len(self._t_plot):
-            tv = self._t_plot[idx]
-            if not np.isnan(tv):
-                lines.append(f"T:   {tv:.2f} °C")
-        if hasattr(self, "_rh_plot") and idx < len(self._rh_plot):
-            rv = self._rh_plot[idx]
-            if not np.isnan(rv):
-                lines.append(f"RH:  {rv:.2f} %")
+        lines = [f"Ora:  {t_str}"]
+        if not np.isnan(yv):
+            lines.append(f"CO₂:  {yv:.2f} ppm")
+        def _add(attr, label, unit, dec=2):
+            arr = getattr(self, attr, None)
+            if arr is not None and idx < len(arr):
+                v = arr[idx]
+                if not np.isnan(v):
+                    lines.append(f"{label} {v:.{dec}f} {unit}")
+        _add("_t_plot",     "T:   ", "°C")
+        _add("_rh_plot",    "RH:  ", "%")
+        _add("_p_plot",     "P:   ", "hPa")
+        _add("_fmass_plot", "Fm:  ", "slpm", 3)
+        _add("_fvol_plot",  "Fv:  ", "Lpm",  3)
         self.annot.set_text("\n".join(lines))
-        self.annot.xy = (xv, yv)   # freccia punta al dato
+        # freccia: punta alla CO2 se valida, altrimenti al centro Y del plot
+        y_anchor = yv if not np.isnan(yv) else np.mean(self.ax.get_ylim())
+        self.annot.xy = (xv, y_anchor)
+        xv, yv = xv, y_anchor
 
         # Posizione tooltip in fraction degli assi (0-1)
         # così non può mai uscire dalla figura
