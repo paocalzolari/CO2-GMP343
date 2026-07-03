@@ -2756,6 +2756,29 @@ class TabValve(QWidget):
         # del monitor è già la versione confermata, quindi va bene mandarla.
         QTimer.singleShot(500, self._push_schedule_to_daemon)
 
+        # AUTO-PUSH all'edit: quando l'utente modifica una cella della tabella
+        # schedule (es. la label del nome bombola), pusha lo schedule al daemon
+        # in automatico (debounce 1.5s) — così la label arriva subito in
+        # valve_status.json → .raw → striscia, senza dover premere Sync.
+        # cellChanged scatta a edit CONFERMATO (non per tasto), quindi è sicuro;
+        # il debounce coalescente evita push multipli su edit di più celle.
+        self._autopush_timer = QTimer(self)
+        self._autopush_timer.setSingleShot(True)
+        self._autopush_timer.timeout.connect(self._on_autopush)
+        try:
+            self._tab_sched._table.cellChanged.connect(
+                lambda *_: self._autopush_timer.start(1500))
+        except Exception as exc:
+            self._log.warning("auto-push schedule non agganciato: %s", exc)
+
+    def _on_autopush(self) -> None:
+        """Debounced: pusha lo schedule editato al daemon + persiste il CSV."""
+        try:
+            if self._push_schedule_to_daemon(silent=True):
+                self._tab_sched._persist()
+        except Exception as exc:
+            self._log.warning("auto-push schedule fallito: %s", exc)
+
     # ────────────────────────────────────────────── refresh stato daemon
     def _refresh_status(self) -> None:
         if not self._client.is_alive():
