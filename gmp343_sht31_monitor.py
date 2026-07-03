@@ -872,6 +872,11 @@ class GraphWidget(QWidget):
             "trh_style":       _norm_style(gcp.get("graph", "trh_style", fallback="lines")),
             "trh_point_size":  max(2, gcp.getint("graph", "trh_point_size", fallback=10)),
             "trh_line_width":  max(0.2, gcp.getfloat("graph", "trh_line_width", fallback=1.0)),
+            # P (pressione) & Flow (TSI): colori pannelli singoli
+            "color_p":         gcp.get("graph", "color_p",     fallback="#5030a0").strip(),
+            "color_fmass":     gcp.get("graph", "color_fmass", fallback="#8a0a8a").strip(),
+            "color_fvol":      gcp.get("graph", "color_fvol",  fallback="#a83232").strip(),
+            "pf_line_width":   max(0.2, gcp.getfloat("graph", "pf_line_width", fallback=1.0)),
             "windows":         wset,
             "per_window":      per_window,
         }
@@ -885,6 +890,10 @@ class GraphWidget(QWidget):
         self._trh_style      = gs_cfg["trh_style"]
         self._trh_point_size = gs_cfg["trh_point_size"]
         self._trh_line_width = gs_cfg["trh_line_width"]
+        self._color_p        = gs_cfg["color_p"]
+        self._color_fmass    = gs_cfg["color_fmass"]
+        self._color_fvol     = gs_cfg["color_fvol"]
+        self._pf_line_width  = gs_cfg["pf_line_width"]
         self._enabled_windows = gs_cfg["windows"]   # set
         self._per_window      = gs_cfg["per_window"]
         # Lista artist matplotlib creati per le finestre non-primarie;
@@ -907,27 +916,29 @@ class GraphWidget(QWidget):
         self.ax_flow.tick_params(labelbottom=False)
 
         # ── Flusso TSI 4140 (pannello tra P e T/RH): massa + volumetrico ──
+        # Colori configurabili da Settings → Appearance (color_fmass/color_fvol).
         self.line_fmass, = self.ax_flow.plot(
-            [], [], "-", linewidth=self._trh_line_width,
-            color="#8a0a8a", zorder=2, label="mass (SLPM)")
+            [], [], "-", linewidth=self._pf_line_width,
+            color=self._color_fmass, zorder=2, label="mass (SLPM)")
         self.line_fvol,  = self.ax_flow.plot(
-            [], [], "-", linewidth=self._trh_line_width,
-            color="#a83232", zorder=2, label="vol (Lpm)")
-        self.ax_flow.set_ylabel("Flow (L/min)", fontsize=9, color="#8a0a8a")
-        self.ax_flow.tick_params(axis="y", labelcolor="#8a0a8a", labelsize=8)
+            [], [], "-", linewidth=self._pf_line_width,
+            color=self._color_fvol, zorder=2, label="vol (Lpm)")
+        self.ax_flow.set_ylabel("Flow (L/min)", fontsize=9, color=self._color_fmass)
+        self.ax_flow.tick_params(axis="y", labelcolor=self._color_fmass, labelsize=8)
         self.ax_flow.grid(True, linestyle="--", linewidth=0.3, alpha=0.6)
         self.ax_flow.legend(loc="upper right", fontsize=7, framealpha=0.8, ncol=2)
 
         # ── P (pannello pressione, tra CO2 e T/RH) ────────────────────────
+        # Colore configurabile da Settings → Appearance (color_p).
         self.line_p, = self.ax_p.plot(
-            [], [], "-", linewidth=self._trh_line_width,
-            color="#5030a0", zorder=2, label="P"
+            [], [], "-", linewidth=self._pf_line_width,
+            color=self._color_p, zorder=2, label="P"
         )
         self.sc_p = self.ax_p.scatter(
-            [], [], s=self._trh_point_size, color="#5030a0", zorder=3, label="P"
+            [], [], s=self._trh_point_size, color=self._color_p, zorder=3, label="P"
         )
-        self.ax_p.set_ylabel("P (hPa)", fontsize=9, color="#5030a0")
-        self.ax_p.tick_params(axis="y", labelcolor="#5030a0", labelsize=8)
+        self.ax_p.set_ylabel("P (hPa)", fontsize=9, color=self._color_p)
+        self.ax_p.tick_params(axis="y", labelcolor=self._color_p, labelsize=8)
         self.ax_p.grid(True, linestyle="--", linewidth=0.3, alpha=0.6)
 
         # ── CO2 (pannello principale) ─────────────────────────────────────
@@ -2456,6 +2467,42 @@ class MonitorConfigDialog(QDialog, _IniMixin):
         f3.addRow("Line width (pt):", self.sp_trh_line_width)
         root.addWidget(g_trh)
 
+        # — Chart P (pressure) & Flow (TSI) — pannelli singoli, colore unico —
+        g_pf = QGroupBox("P (pressure) & Flow (TSI) chart style")
+        f_pf = QFormLayout(g_pf)
+
+        def _pf_color_button(initial_hex):
+            btn = QPushButton("    ")
+            btn.setFixedSize(60, 22)
+            btn.setStyleSheet(
+                f"background-color:{initial_hex};"
+                f"border:1px solid #888;border-radius:3px")
+            btn._hex = initial_hex
+            def pick():
+                c = QColorDialog.getColor(QColor(btn._hex), self, "Pick color")
+                if c.isValid():
+                    btn._hex = c.name()
+                    btn.setStyleSheet(
+                        f"background-color:{btn._hex};"
+                        f"border:1px solid #888;border-radius:3px")
+            btn.clicked.connect(pick)
+            return btn
+
+        self.btn_color_p = _pf_color_button(grp.get("color_p", "#5030a0"))
+        f_pf.addRow("P (pressure) color:", self.btn_color_p)
+        self.btn_color_fmass = _pf_color_button(grp.get("color_fmass", "#8a0a8a"))
+        f_pf.addRow("Flow mass color:", self.btn_color_fmass)
+        self.btn_color_fvol = _pf_color_button(grp.get("color_fvol", "#a83232"))
+        f_pf.addRow("Flow vol color:", self.btn_color_fvol)
+
+        self.sp_pf_line_width = QDoubleSpinBox()
+        self.sp_pf_line_width.setRange(0.2, 6.0)
+        self.sp_pf_line_width.setSingleStep(0.1); self.sp_pf_line_width.setDecimals(2)
+        try: self.sp_pf_line_width.setValue(float(grp.get("pf_line_width", 1.0)))
+        except (TypeError, ValueError): self.sp_pf_line_width.setValue(1.0)
+        f_pf.addRow("Line width (pt):", self.sp_pf_line_width)
+        root.addWidget(g_pf)
+
         # — Per-window overlay styles (1m / 10m / 30m / 60m) —
         # Note: la finestra "primaria" (più piccola selezionata) usa lo stile
         # CO₂/T-RH sopra; queste impostazioni sono usate per gli OVERLAY
@@ -2618,6 +2665,11 @@ class MonitorConfigDialog(QDialog, _IniMixin):
             mini["graph"]["trh_style"]      = _idx_to_style[self.cb_trh_style.currentIndex()]
             mini["graph"]["trh_point_size"] = str(self.sp_trh_point_size.value())
             mini["graph"]["trh_line_width"] = f"{self.sp_trh_line_width.value():.2f}"
+            # P (pressure) & Flow (TSI) — colori pannelli singoli
+            mini["graph"]["color_p"]        = self.btn_color_p._hex
+            mini["graph"]["color_fmass"]    = self.btn_color_fmass._hex
+            mini["graph"]["color_fvol"]     = self.btn_color_fvol._hex
+            mini["graph"]["pf_line_width"]  = f"{self.sp_pf_line_width.value():.2f}"
             # Per-window overlay styles
             _idx_to_ls = {0: "-", 1: "--", 2: ":", 3: "-."}
             for w_key, widgets in self.window_widgets.items():
