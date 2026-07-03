@@ -3729,16 +3729,27 @@ class GMP343Monitor(QMainWindow):
 
         self.lbl_t.setText(_fmt(last_t, last_t_std, "°C"))
         self.lbl_rh.setText(_fmt(last_rh, last_rh_std, "%"))
-        # P 1-min average: penultima/ultima colonna del _min (… P P_std)
+        # P 1-min average (P P_std nel _min). NON usare indice negativo: dal
+        # 2026-07-02 ci sono colonne flusso IN CODA, quindi _last[-2]/_last[-1]
+        # sarebbero FLOWvol/FLOWvol_std (bug: mostrava ~0.6 "hPa"). Si usa
+        # l'indice FORWARD dopo valvola + blocco CO2RAW/CO2RAWUC (P a
+        # tail_start+4, P_std a +5), come read_file.
         p_avg, p_sd = MISSING, MISSING
         try:
             with open(path) as _f:
                 _last = [ln for ln in _f.read().splitlines()
                          if ln and not ln.startswith("#")][-1].split()
-            if len(_last) >= 2:
-                p_avg = float(_last[-2]); p_sd = float(_last[-1])
+            def _isf(s):
+                try:
+                    float(s); return True
+                except (ValueError, TypeError):
+                    return False
+            # valvola presente se _last[11] (valve_label) NON è numerico
+            has_v = len(_last) >= 12 and not _isf(_last[11])
+            p_pos = (12 if has_v else 10) + 4
+            p_avg = float(_last[p_pos]); p_sd = float(_last[p_pos + 1])
         except Exception:
-            pass
+            p_avg, p_sd = MISSING, MISSING
         self.lbl_p.setText(_fmt(p_avg, p_sd, "hPa"))
         self.lbl_ts.setText(last_ts)
         self.lbl_file.setText(path)
