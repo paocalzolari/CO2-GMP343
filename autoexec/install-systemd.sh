@@ -39,8 +39,22 @@ echo "==> installo regole udev (serial stabili: gmp343/vici/tsi4140)"
 cp "$(dirname "$0")"/udev/*.rules /etc/udev/rules.d/ 2>/dev/null || true
 udevadm control --reload-rules && udevadm trigger --subsystem-match=tty || true
 
+# time-sync.target: co2-logger ordina l'avvio DOPO la sincronizzazione NTP
+# (vedi co2-logger.service per il perché). Serve abilitare il servizio che
+# lo espone (disabilitato di default) e limitarne l'attesa: upstream ha
+# TimeoutStartSec=infinity, che senza rete al boot bloccherebbe l'intero
+# avvio del sistema, non solo questo service.
+echo "==> installo il drop-in che limita l'attesa NTP (max 90s)"
+mkdir -p /etc/systemd/system/systemd-time-wait-sync.service.d
+cp "$SCRIPT_DIR/systemd-time-wait-sync.override.conf" \
+   /etc/systemd/system/systemd-time-wait-sync.service.d/override.conf
+chmod 644 /etc/systemd/system/systemd-time-wait-sync.service.d/override.conf
+
 echo "==> systemctl daemon-reload"
 systemctl daemon-reload
+
+echo "==> systemctl enable systemd-time-wait-sync.service (disabilitato di default)"
+systemctl enable systemd-time-wait-sync.service
 
 if [ -f "$AUTOSTART_CALIB" ]; then
     echo "==> Disabilito autostart calibrazione: $AUTOSTART_CALIB -> .disabled"

@@ -50,6 +50,17 @@ sudo systemctl start co2-logger         # ripartenza
 - `StartLimitBurst=10` in 600s → max 10 restart/10min, poi marca `failed`
 - `User=misura`, `Group=dialout` → accesso seriale senza root
 - Log via journald (non `/tmp/`)
+- `After=time-sync.target` + `Wants=time-sync.target` → il logger parte
+  dopo la sincronizzazione NTP quando possibile (Pi 5 senza RTC: dopo un
+  blackout l'orologio riparte fermo all'ultimo shutdown). `install-systemd.sh`
+  abilita anche `systemd-time-wait-sync.service` (disabilitato di default)
+  e installa un drop-in che ne limita l'attesa a 90s — upstream ha
+  `TimeoutStartSec=infinity`, che senza rete al boot bloccherebbe l'intero
+  avvio del sistema. Se il timeout scatta, il boot prosegue e il logger
+  parte comunque con l'orologio ancora indietro: la correttezza dei dati in
+  quel caso è garantita dal codice (`_last_written_minute` in
+  `gmp343_sht31_logger.py`, non riscrive mai un minuto già su file), non da
+  questa unit — è solo un'ottimizzazione per il caso comune.
 
 ### Procedura calibrazione
 

@@ -1,10 +1,34 @@
 [Unit]
 Description=GMP343 CO2 Backend Logger (headless, with watchdog)
 Documentation=file:///home/misura/programs/CO2/PROGRAMS.md
-After=network.target
+After=network.target time-sync.target
+Wants=time-sync.target
 # NB: nessun ConditionPathExists su /dev/gmp343 — il logger fa retry/reconnect
 # interno con backoff esponenziale, quindi può partire anche prima che udev
 # crei il symlink al boot.
+#
+# time-sync.target: su un Raspberry Pi 5 senza RTC, dopo un blackout il
+# sistema riparte con l'orologio fermo all'ultimo shutdown (fake-hwclock),
+# non a "ora reale" — l'NTP (systemd-timesyncd) lo corregge in pochi
+# secondi/minuti dopo il boot. Ordinare l'avvio del logger DOPO
+# time-sync.target evita quasi sempre lo scenario "clock indietro" che
+# genera righe doppie al riavvio (vedi gmp343_sht31_logger.py: fix B,
+# _last_written_minute). Perché l'ordinamento abbia effetto, su
+# Raspberry Pi OS va ABILITATO anche systemd-time-wait-sync.service (di
+# default installato ma disabilitato):
+#   sudo systemctl enable systemd-time-wait-sync.service
+#
+# ⚠️ Se l'NTP non arriva MAI (stazione isolata, nessuna rete al boot):
+# systemd-time-wait-sync.service upstream ha TimeoutStartSec=infinity, quindi
+# senza intervento aspetterebbe la sincronizzazione all'infinito, bloccando
+# l'intero boot a sysinit.target (non solo questo service). Installare
+# SEMPRE anche il drop-in che lo limita (vedi
+# autoexec/systemd-time-wait-sync.override.conf, installato da
+# install-systemd.sh): con quel limite, superato il timeout il boot
+# prosegue e co2-logger parte comunque, con l'orologio ancora indietro.
+# In quel caso la correttezza dei dati resta garantita dal Fix B lato
+# codice (non riscrive mai un minuto già presente nel file), NON da questa
+# unit — l'ordinamento è solo un'ottimizzazione per il caso comune.
 
 # Limite restart: max 10 in 10 minuti, poi systemd marca il service "failed"
 # (evita restart loop infinito su bug persistenti). Vanno qui in [Unit], non
