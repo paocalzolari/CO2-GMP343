@@ -149,6 +149,16 @@ def run_logger(tmp_path, monkeypatch, script, t0, *, tsi_delay_s=None,
     return data_dir
 
 
+def restart_logger(tmp_path, monkeypatch, first_script, t0, second_script, t1,
+                    **kw):
+    """Runs the logger twice against the SAME data dir, simulating a
+    process restart (systemd Restart=always) at wall-clock `t1`."""
+    data = run_logger(tmp_path, monkeypatch, first_script, t0, **kw)
+    (tmp_path / "config").rename(tmp_path / "config_old")
+    run_logger(tmp_path, monkeypatch, second_script, t1, **kw)
+    return data
+
+
 def samples(start, end, step_s=2.0, base=420.0):
     """Valid CO2 lines every `step_s` from start (inclusive) to end
     (exclusive), with distinct values so the dedup never drops them."""
@@ -313,6 +323,25 @@ def test_stalled_loop_writes_missing_rows_for_skipped_minutes(tmp_path,
         assert_missing_row(by_time[datetime(2026, 9, 27, 12, m)])
 
 
+def test_forward_jump_over_6h_leaves_a_persistent_marker(tmp_path,
+                                                          monkeypatch):
+    """A clock jump forward beyond MAX_GAP_FILL_MIN (NTP step, not an
+    outage) is not filled with a burst of MISSING rows, and must leave a
+    trace that outlives a single `print` line in journald: a sticky field
+    in status.json (here read directly off the module, since the test
+    harness no-ops _write_status_json)."""
+    assert gmp.MAX_GAP_FILL_MIN == 360
+    t0 = datetime(2026, 9, 27, 12, 0, 0)
+    script = (samples(t0 + timedelta(seconds=1),
+                      datetime(2026, 9, 27, 12, 0, 40))
+              + samples(datetime(2026, 9, 27, 18, 35, 0),
+                        datetime(2026, 9, 27, 18, 37, 0), base=500.0))
+    run_logger(tmp_path, monkeypatch, script, t0)
+    assert gmp._LAST_CLOCK_GAP["last_clock_gap_min"] is not None
+    assert gmp._LAST_CLOCK_GAP["last_clock_gap_min"] > gmp.MAX_GAP_FILL_MIN
+    assert gmp._LAST_CLOCK_GAP["last_clock_gap_at"] is not None
+
+
 def test_clock_step_backwards_never_duplicates_minute_rows(tmp_path,
                                                            monkeypatch):
     t0 = datetime(2026, 9, 27, 12, 4, 0)
@@ -325,6 +354,44 @@ def test_clock_step_backwards_never_duplicates_minute_rows(tmp_path,
     times = row_times(read_rows(min_file(data, "20260927")))
     assert len(times) == len(set(times)), f"duplicate minute rows: {times}"
     assert times == sorted(times), f"rows out of order: {times}"
+
+
+# ── restart across a process crash (systemd Restart=always) ───────────────
+def test_restart_same_minute_never_duplicates_the_row(tmp_path, monkeypatch):
+    """A crash+restart within the SAME minute (RestartSec=10) must not
+    produce two rows for that minute."""
+    t0 = datetime(2026, 9, 27, 12, 0, 0)
+    s1 = samples(t0 + timedelta(seconds=1), datetime(2026, 9, 27, 12, 3, 30))
+    t1 = datetime(2026, 9, 27, 12, 3, 40)
+    s2 = samples(t1, datetime(2026, 9, 27, 12, 6, 0), base=440.0)
+    data = restart_logger(tmp_path, monkeypatch, s1, t0, s2, t1)
+    times = row_times(read_rows(min_file(data, "20260927")))
+    assert len(times) == len(set(times)), f"duplicate minute rows: {times}"
+
+
+def test_restart_with_clock_behind_resumes_without_duplicating_rows(
+        tmp_path, monkeypatch):
+    """Raspberry Pi 5 reboot after a power outage: with no RTC, the system
+    clock restarts from the state saved at shutdown, i.e. BEHIND the
+    minutes already closed by the previous run, until NTP corrects it. The
+    restarted process must not rewrite/duplicate those rows on disk, and
+    must resume 1-min rows only once the (recovering) clock reaches the
+    first minute not yet written."""
+    t0 = datetime(2026, 9, 27, 12, 0, 0)
+    s1 = samples(t0 + timedelta(seconds=1), datetime(2026, 9, 27, 12, 5, 30))
+    # reboot: clock restored 3 min behind; NTP steps it forward mid-run
+    t1 = datetime(2026, 9, 27, 12, 2, 0)
+    s2 = (samples(t1 + timedelta(seconds=1), datetime(2026, 9, 27, 12, 4, 30),
+                  base=440.0)
+          + samples(datetime(2026, 9, 27, 12, 8, 1),
+                    datetime(2026, 9, 27, 12, 9, 30), base=450.0))
+    data = restart_logger(tmp_path, monkeypatch, s1, t0, s2, t1)
+    rows = read_rows(min_file(data, "20260927"))
+    times = row_times(rows)
+    assert len(times) == len(set(times)), f"duplicate minute rows: {times}"
+    assert times == sorted(times), f"rows out of order: {times}"
+    # the 5 rows written by the first run (12:00..12:04) survive untouched
+    assert times[:5] == [t0.replace(minute=m) for m in range(5)]
 
 
 # ── calibration flag and 60-min window ─────────────────────────────────────

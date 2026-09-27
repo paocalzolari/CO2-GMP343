@@ -132,6 +132,17 @@ _COMP_STATUS = {
     "comp_p_source": None,     # "fixed" | "bmp388" | None
 }
 
+# Marker persistente (in status.json, NON nel file dati) dell'ULTIMO salto in
+# avanti dell'orologio oltre MAX_GAP_FILL_MIN: quel buco viene chiuso con una
+# sola riga (non un burst di MISSING) e altrimenti sarebbe segnalato solo da
+# una print in journald, che ruota/non è sempre persistente. "Sticky" fino al
+# prossimo evento (o al riavvio): non viene azzerato ad ogni scrittura di
+# status.json come i valori live sopra.
+_LAST_CLOCK_GAP = {
+    "last_clock_gap_min": None,   # int minuti del salto, None se mai accaduto
+    "last_clock_gap_at": None,    # ISO 8601 UTC di quando è stato rilevato
+}
+
 
 def _write_status_json(instrument_connected, last_co2=None, last_t=None,
                        last_rh=None, last_co2rawuc=None,
@@ -156,6 +167,7 @@ def _write_status_json(instrument_connected, last_co2=None, last_t=None,
         "last_flow_vol_lpm": last_flow_vol,
     }
     status.update(_COMP_STATUS)
+    status.update(_LAST_CLOCK_GAP)
     try:
         os.makedirs(os.path.dirname(STATUS_JSON), exist_ok=True)
         fd, tmp = tempfile.mkstemp(
@@ -717,6 +729,32 @@ def _minute_flag(buf, current_flag):
     return current_flag()
 
 
+def _last_written_minute(avg_file):
+    """Timestamp of the last 1-min row already present in `avg_file`, or
+    None if the file has no data rows yet (fresh file / header only).
+
+    Used at startup to resume a restarted process without rewriting a
+    minute already closed before the crash: a Raspberry Pi 5 rebooting
+    after a power outage restores the system clock from the state saved
+    at shutdown (no RTC), so `datetime.utcnow()` can be BEHIND the last
+    row on disk until NTP corrects it (fonte: verifica integrità dati
+    2026-09-27, incidente Pi5 dopo blackout)."""
+    try:
+        with open(avg_file) as f:
+            last = None
+            for line in f:
+                if line.startswith("#") or not line.strip():
+                    continue
+                last = line
+        if last is None:
+            return None
+        parts = last.split()
+        return datetime.strptime(parts[0] + " " + parts[1],
+                                  "%Y-%m-%d %H:%M:%S")
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def _format_min_row(minute, st, flag, valve_suf):
     """One line of the official 1-min file (format unchanged)."""
     ts_avg = minute.strftime("%Y-%m-%d %H:%M:%S")
@@ -935,6 +973,11 @@ def main():
             ser.write(b"OPEN 0\r"); time.sleep(0.3); ser.reset_input_buffer()
         ser.write(CMD_START)
 
+    # Marker sticky per-processo (vedi definizione sopra): un nuovo avvio non
+    # eredita l'evento dell'esecuzione precedente.
+    _LAST_CLOCK_GAP["last_clock_gap_min"] = None
+    _LAST_CLOCK_GAP["last_clock_gap_at"] = None
+
     _write_status_json(True)  # seriale aperta → strumento connesso
     _sd_notify("READY=1")     # segnala a systemd che il logger è pronto
 
@@ -976,6 +1019,24 @@ def main():
 
     files_day = current_minute.date()
     raw_file, avg_file, file_10, file_30, file_60 = _files_for_day(current_minute)
+
+    # ── Resume after restart: never rewrite a minute already closed ────────
+    # See _last_written_minute() docstring: on a Pi 5 the system clock can
+    # be behind the previous run's last row until NTP syncs (systemd unit:
+    # After=time-sync.target). Without this check the loop would restart
+    # from the (stale) clock and duplicate 1-min rows already on disk.
+    _resume_after = _last_written_minute(avg_file)
+    if _resume_after is not None and _resume_after >= current_minute:
+        print(f"WARN: system clock ({current_minute}) is behind the last "
+              f"1-min row already written ({_resume_after}) — likely a "
+              f"restart before NTP sync. No 1-min row will be written again "
+              f"until the clock reaches "
+              f"{_resume_after + timedelta(minutes=1)}.", flush=True)
+        current_minute = _resume_after + timedelta(minutes=1)
+        if current_minute.date() != files_day:
+            files_day = current_minute.date()
+            raw_file, avg_file, file_10, file_30, file_60 = \
+                _files_for_day(current_minute)
 
     # Slot-aligned buffers per le aggregazioni 10/30/60 minuti.
     # Si flushano quando il minuto appena chiuso entra in un nuovo slot,
@@ -1160,9 +1221,14 @@ def main():
             if to_close:
                 gap = int((now_minute - current_minute).total_seconds() // 60)
                 if gap > MAX_GAP_FILL_MIN:
-                    print(f"ERROR: clock jumped forward {gap} min "
+                    print(f"WARNING: clock jumped forward {gap} min "
                           f"({current_minute} → {now_minute}): not filled with "
-                          f"MISSING rows", flush=True)
+                          f"MISSING rows; recorded in status.json "
+                          f"(last_clock_gap_min/last_clock_gap_at)",
+                          flush=True)
+                    _LAST_CLOCK_GAP["last_clock_gap_min"] = gap
+                    _LAST_CLOCK_GAP["last_clock_gap_at"] = \
+                        datetime.now(timezone.utc).isoformat()
                 closing = cur
                 cur = _new_sample_buffers()
                 current_minute = next_minute   # prima di scrivere: niente doppioni
