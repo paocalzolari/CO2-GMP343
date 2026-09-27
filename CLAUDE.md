@@ -178,13 +178,19 @@ Caratteristiche formato v3:
 - Timestamp `YYYY-MM-DD HH:MM:SS` (UTC)
 - SD in **ppm assoluto**, non percentuale
 - `flag` ∈ {`measure`, `calib`} — `calib` solo durante sessioni di taratura
-- Sentinella per minuto senza dati validi: `999.99 0.00 0`
+- Sentinella per minuto senza dati validi: **`-999.99`** (`MISSING`, SD `0.00`,
+  `n = 0`), scritta dal logger corrente `gmp343_sht31_logger.py` (branch
+  `main`). Decisione utente 27/09/2026: la sentinella CO₂ è `-999.99`; il
+  codice è giusto, la documentazione che diceva `999.99` era sbagliata
 - `valve_pos`: intero 1..N, sentinella `-1` se valve-scheduler non risponde
 - `valve_label`: etichetta dello step (es. `span-low`), sentinella `-` se vuota
 
-> Le sentinelle qui (`999.99` per CO₂ mancante) sono **diverse** da quelle
-> usate da o3-monitor / nox-monitor (`-99.9`). È un'eredità storica del
-> programma: non normalizzare senza coordinarsi con la pipeline a valle.
+> Il vecchio `999.99` **positivo** compare solo nei file scritti dalle
+> generazioni vecchie (`gmp343_logger-7/-8.py`, `calib-GMP343-logger-old*.py`).
+> Un lettore dello storico CO₂ tratta come mancanti entrambi (`-999.99` e
+> `999.99`), come fa già `gmp343_sht31_monitor.py`. Le sentinelle sono
+> **diverse** da quelle di o3-monitor / nox-monitor (`-99.9`, `-999`): non
+> normalizzare senza coordinarsi con la pipeline a valle.
 
 Sincronizzazione dati: cron utente esegue ogni 5 minuti
 [`autoexec/rsync-co2.sh`](autoexec/rsync-co2.sh) che spinge `~/data/`

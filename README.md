@@ -68,7 +68,8 @@ y      = 50
 [thresholds]
 low_warning    = 300
 high_warning   = 2000
-sentinel_value = 999.99
+sentinel_value = 999.99   ; vecchia sentinella positiva (file storici). Il logger
+                          ; corrente scrive -999.99 (MISSING): la GUI scarta entrambe
 
 [display]
 co2_decimals = 2
