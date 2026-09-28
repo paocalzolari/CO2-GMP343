@@ -8,6 +8,11 @@ via `co2-logger.service`).
 
 ## [Unreleased]
 
+## [1.0.0] — 2026-09-28
+
+First release under semantic versioning (tag `v1.0.0`, first release). Deploy with `git checkout v1.0.0`; rollback targets: `deployed/acq2/2026-09-28`, `deployed/acq3/2026-09-28`.
+- tags branch `main` (production of the Pi `misura`). NOT the code running on acq2 (`master`) or acq3 (`test-sht31`): the three branches diverge and deploying `main` there would change the 1-min .raw columns (decision pending).
+
 ### Fixed — independent data-integrity review (2026-09-27)
 - **P2 — righe 1-min doppie dopo un riavvio con l'orologio indietro**
   (`gmp343_sht31_logger.py`): un Raspberry Pi 5 non ha RTC, quindi dopo un
